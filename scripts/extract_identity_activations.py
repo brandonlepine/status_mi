@@ -27,6 +27,7 @@ DEFAULT_OUTPUT_DIR = Path(
     "/workspace/status_mi/results/activations/llama-3.1-8b/"
     "identity_prompts_final_token"
 )
+CHECKPOINT_FILENAME = "checkpoint.json"
 
 
 def parse_args() -> argparse.Namespace:
@@ -49,6 +50,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Overwrite existing layer files in output_dir.",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from output_dir/checkpoint.json and existing layer files.",
+    )
     return parser.parse_args()
 
 
@@ -60,14 +66,23 @@ def choose_torch_dtype() -> torch.dtype:
     return torch.float32
 
 
-def prepare_output_dir(output_dir: Path, overwrite: bool) -> None:
-    existing_layer_files = sorted(output_dir.glob("layer_*.npy")) if output_dir.exists() else []
+def prepare_output_dir(output_dir: Path, overwrite: bool, resume: bool) -> None:
+    if overwrite and resume:
+        raise ValueError("Use only one of --overwrite or --resume.")
 
-    if existing_layer_files and not overwrite:
+    existing_layer_files = sorted(output_dir.glob("layer_*.npy")) if output_dir.exists() else []
+    checkpoint_path = output_dir / CHECKPOINT_FILENAME
+
+    if existing_layer_files and not overwrite and not resume:
         examples = ", ".join(path.name for path in existing_layer_files[:5])
         raise FileExistsError(
             f"{output_dir} already contains layer files ({examples}). "
-            "Pass --overwrite to replace them."
+            "Pass --overwrite to replace them or --resume to continue."
+        )
+
+    if resume and existing_layer_files and not checkpoint_path.exists():
+        raise FileNotFoundError(
+            f"Cannot resume because {checkpoint_path} does not exist."
         )
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -75,10 +90,55 @@ def prepare_output_dir(output_dir: Path, overwrite: bool) -> None:
     if overwrite:
         for path in output_dir.glob("layer_*.npy"):
             path.unlink()
-        for filename in ("metadata.csv", "run_config.json"):
+        for filename in ("metadata.csv", "run_config.json", CHECKPOINT_FILENAME):
             path = output_dir / filename
             if path.exists():
                 path.unlink()
+
+
+def load_checkpoint(output_dir: Path) -> dict[str, int] | None:
+    checkpoint_path = output_dir / CHECKPOINT_FILENAME
+    if not checkpoint_path.exists():
+        return None
+
+    with checkpoint_path.open() as f:
+        checkpoint = json.load(f)
+
+    return {
+        "rows_written": int(checkpoint["rows_written"]),
+        "num_prompts": int(checkpoint["num_prompts"]),
+        "num_layers_saved": int(checkpoint["num_layers_saved"]),
+        "hidden_dim": int(checkpoint["hidden_dim"]),
+    }
+
+
+def write_checkpoint(
+    *,
+    output_dir: Path,
+    rows_written: int,
+    num_prompts: int,
+    num_layers_saved: int,
+    hidden_dim: int,
+    batch_size: int,
+    max_length: int,
+) -> None:
+    checkpoint = {
+        "rows_written": rows_written,
+        "num_prompts": num_prompts,
+        "num_layers_saved": num_layers_saved,
+        "hidden_dim": hidden_dim,
+        "batch_size": batch_size,
+        "max_length": max_length,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    checkpoint_path = output_dir / CHECKPOINT_FILENAME
+    tmp_path = checkpoint_path.with_suffix(".json.tmp")
+
+    with tmp_path.open("w") as f:
+        json.dump(checkpoint, f, indent=2)
+        f.write("\n")
+
+    tmp_path.replace(checkpoint_path)
 
 
 def get_input_device(model: torch.nn.Module) -> torch.device:
@@ -113,6 +173,7 @@ def extract_final_token_activations(
     output_dir: Path,
     batch_size: int,
     max_length: int,
+    resume: bool,
 ) -> tuple[int, int]:
     prompts = df["prompt"].astype(str).tolist()
     num_prompts = len(prompts)
@@ -121,7 +182,16 @@ def extract_final_token_activations(
     layer_arrays: list[np.memmap] | None = None
     num_layers_saved: int | None = None
     hidden_dim: int | None = None
-    rows_written = 0
+    checkpoint = load_checkpoint(output_dir) if resume else None
+    rows_written = checkpoint["rows_written"] if checkpoint else 0
+
+    if checkpoint:
+        if checkpoint["num_prompts"] != num_prompts:
+            raise ValueError(
+                "Checkpoint num_prompts does not match current input rows. "
+                "Use the same input/limit or restart with --overwrite."
+            )
+        print(f"Resuming from row {rows_written:,} of {num_prompts:,}")
 
     print(f"Number of prompts: {num_prompts:,}")
     print(f"Input device: {input_device}")
@@ -133,7 +203,19 @@ def extract_final_token_activations(
     else:
         print("CUDA devices: 0")
 
-    progress = tqdm(range(0, num_prompts, batch_size), desc="Extracting batches")
+    if rows_written >= num_prompts:
+        if not checkpoint:
+            raise ValueError("rows_written reached num_prompts without a checkpoint.")
+        print("Checkpoint already indicates extraction is complete.")
+        return checkpoint["num_layers_saved"], checkpoint["hidden_dim"]
+
+    progress = tqdm(
+        range(rows_written, num_prompts, batch_size),
+        desc="Extracting batches",
+        initial=rows_written,
+        total=num_prompts,
+        unit="prompt",
+    )
 
     with torch.inference_mode():
         for start in progress:
@@ -171,9 +253,14 @@ def extract_final_token_activations(
                 for layer_idx, hidden_state in enumerate(hidden_states):
                     print(f"  layer_{layer_idx:02d}: {tuple(hidden_state.shape)}")
                     layer_path = output_dir / f"layer_{layer_idx:02d}.npy"
+                    mode = "r+" if rows_written > 0 else "w+"
+                    if rows_written > 0 and not layer_path.exists():
+                        raise FileNotFoundError(
+                            f"Cannot resume because {layer_path} is missing."
+                        )
                     arr = np.lib.format.open_memmap(
                         layer_path,
-                        mode="w+",
+                        mode=mode,
                         dtype=np.float32,
                         shape=(num_prompts, hidden_dim),
                     )
@@ -200,6 +287,20 @@ def extract_final_token_activations(
 
             rows_written = end
 
+            for arr in layer_arrays:
+                arr.flush()
+
+            write_checkpoint(
+                output_dir=output_dir,
+                rows_written=rows_written,
+                num_prompts=num_prompts,
+                num_layers_saved=num_layers_saved,
+                hidden_dim=hidden_dim,
+                batch_size=batch_size,
+                max_length=max_length,
+            )
+            progress.set_postfix(rows_written=rows_written)
+
             del outputs, hidden_states, encoded, attention_mask
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -223,9 +324,11 @@ def main() -> None:
     if args.max_length <= 0:
         raise ValueError("--max_length must be positive.")
 
-    prepare_output_dir(args.output_dir, args.overwrite)
+    prepare_output_dir(args.output_dir, args.overwrite, args.resume)
 
     df = load_prompts(args.input_csv, args.limit)
+    metadata_path = args.output_dir / "metadata.csv"
+    df.to_csv(metadata_path, index=False)
 
     torch_dtype = choose_torch_dtype()
     print(f"Loading tokenizer from: {args.model_path}")
@@ -251,9 +354,9 @@ def main() -> None:
         output_dir=args.output_dir,
         batch_size=args.batch_size,
         max_length=args.max_length,
+        resume=args.resume,
     )
 
-    metadata_path = args.output_dir / "metadata.csv"
     df.to_csv(metadata_path, index=False)
 
     assert len(df) == len(pd.read_csv(metadata_path, keep_default_na=False))
@@ -280,6 +383,7 @@ def main() -> None:
     print(f"  layers: {args.output_dir / 'layer_XX.npy'}")
     print(f"  metadata: {metadata_path}")
     print(f"  run config: {run_config_path}")
+    print(f"  checkpoint: {args.output_dir / CHECKPOINT_FILENAME}")
     print(f"Saved rows: {len(df):,}")
     print(f"Saved layers: {num_layers_saved}")
     print(f"Hidden dim: {hidden_dim}")
