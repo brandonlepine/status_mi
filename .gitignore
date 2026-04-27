@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+
+# OS/editor noise
+.DS_Store
+.idea/
+.vscode/
+
+# Large local artifacts
+models/
+results/
+checkpoints/
+wandb/
+runs/
+
+# Logs and temporary files
+*.log
+tmp/
+temp/
+
+# Keep source data and generated prompt CSVs trackable unless explicitly ignored later.
+!data/mi_identity_prompts.csv
