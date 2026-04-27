@@ -209,16 +209,17 @@ def extract_final_token_activations(
         print("Checkpoint already indicates extraction is complete.")
         return checkpoint["num_layers_saved"], checkpoint["hidden_dim"]
 
+    batch_starts = range(rows_written, num_prompts, batch_size)
     progress = tqdm(
-        range(rows_written, num_prompts, batch_size),
         desc="Extracting batches",
-        initial=rows_written,
+        initial=0,
         total=num_prompts,
         unit="prompt",
     )
+    progress.update(rows_written)
 
     with torch.inference_mode():
-        for start in progress:
+        for start in batch_starts:
             end = min(start + batch_size, num_prompts)
             batch_prompts = prompts[start:end]
 
@@ -300,10 +301,13 @@ def extract_final_token_activations(
                 max_length=max_length,
             )
             progress.set_postfix(rows_written=rows_written)
+            progress.update(batch_len)
 
             del outputs, hidden_states, encoded, attention_mask
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+    progress.close()
 
     assert rows_written == num_prompts
     assert layer_arrays is not None
