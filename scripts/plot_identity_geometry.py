@@ -44,7 +44,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--layers", default=DEFAULT_LAYERS)
     parser.add_argument("--max_points_per_plot", type=int, default=15000)
     parser.add_argument("--overwrite", action="store_true")
-    parser.add_argument("--make_umap", action="store_true")
+    parser.add_argument(
+        "--make_umap",
+        action="store_true",
+        help="If umap-learn is installed, also make UMAP plots from PCA coordinates.",
+    )
     return parser.parse_args()
 
 
@@ -61,7 +65,6 @@ def prepare_output_dir(output_dir: Path, overwrite: bool) -> dict[str, Path]:
     subdirs = {
         "root": output_dir,
         "pca_by_identity": output_dir / "pca_by_identity",
-        "umap": output_dir / "umap",
     }
     for path in subdirs.values():
         path.mkdir(parents=True, exist_ok=True)
@@ -122,7 +125,7 @@ def scatter_pca(
     color_map = color_map or category_colors(df[hue_col])
     colors = plot_df[hue_col].astype(str).map(color_map)
 
-    fig, ax = plt.subplots(figsize=(8, 6))
+    fig, ax = plt.subplots(figsize=(10, 7))
     ax.scatter(plot_df["PC1"], plot_df["PC2"], c=list(colors), s=point_size, alpha=alpha, linewidths=0)
     ax.set_title(title)
     ax.set_xlabel("PC1")
@@ -154,7 +157,12 @@ def progression_plot(
     color_map = category_colors(combined[hue_col])
     n_cols = min(3, len(available_layers))
     n_rows = math.ceil(len(available_layers) / n_cols)
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 4 * n_rows), squeeze=False)
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(6 * n_cols, 4.6 * n_rows),
+        squeeze=False,
+    )
 
     for ax, layer in zip(axes.ravel(), available_layers):
         df = sample_points(pca_by_layer[layer], max_points)
@@ -186,7 +194,7 @@ def plot_pca_outputs(
         scatter_pca(
             df,
             "axis",
-            f"Prompt-level PCA by axis - Layer {layer:02d}",
+            f"Prompt-level final-token PCA by identity axis - Layer {layer:02d}",
             output_dir / f"pca_axis_layer_{layer:02d}",
             max_points=max_points,
             alpha=0.3,
@@ -194,7 +202,7 @@ def plot_pca_outputs(
         scatter_pca(
             df,
             "family",
-            f"Prompt-level PCA by family - Layer {layer:02d}",
+            f"Prompt-level final-token PCA by template family - Layer {layer:02d}",
             output_dir / f"pca_family_layer_{layer:02d}",
             max_points=max_points,
             alpha=0.3,
@@ -202,7 +210,7 @@ def plot_pca_outputs(
         plot_centroids(
             df,
             output_dir / f"pca_axis_centroids_layer_{layer:02d}",
-            f"Prompt PCA by axis with identity centroids - Layer {layer:02d}",
+            f"Final-token PCA by axis with identity centroids - Layer {layer:02d}",
             max_points,
         )
 
@@ -210,7 +218,7 @@ def plot_pca_outputs(
         pca_by_layer,
         layers,
         "axis",
-        "Prompt-level PCA by axis across layers",
+        "Prompt-level final-token PCA by identity axis across selected layers",
         output_dir / "pca_axis_layer_progression",
         max_points,
     )
@@ -218,7 +226,7 @@ def plot_pca_outputs(
         pca_by_layer,
         layers,
         "family",
-        "Prompt-level PCA by family across layers",
+        "Prompt-level final-token PCA by template family across selected layers",
         output_dir / "pca_family_layer_progression",
         max_points,
     )
@@ -237,7 +245,7 @@ def plot_centroids(
         .reset_index()
     )
 
-    fig, ax = plt.subplots(figsize=(8, 6))
+    fig, ax = plt.subplots(figsize=(10, 7))
     ax.scatter(plot_df["PC1"], plot_df["PC2"], c=list(colors), s=6, alpha=0.18, linewidths=0)
     centroid_colors = centroids["axis"].astype(str).map(color_map)
     ax.scatter(
@@ -278,7 +286,7 @@ def plot_identity_axis_pcas(
             scatter_pca(
                 axis_df,
                 hue_col,
-                f"PCA by identity - {axis} - Layer {layer:02d}",
+                f"Prompt-level final-token PCA by identity - {axis} - Layer {layer:02d}",
                 identity_dir / f"{axis}_layer_{layer:02d}",
                 max_points=max_points,
                 alpha=0.4,
@@ -290,7 +298,7 @@ def plot_identity_axis_pcas(
                 axis_layers,
                 layers,
                 "identity_id",
-                f"PCA by identity across layers - {axis}",
+                f"Prompt-level final-token PCA by identity across selected layers - {axis}",
                 identity_dir / f"{axis}_layer_progression",
                 max_points,
             )
@@ -304,21 +312,31 @@ def line_plot(
     title: str,
     ylabel: str,
     path_no_suffix: Path,
+    figsize: tuple[float, float] = (16, 6),
 ) -> None:
     if df.empty or y_col not in df.columns:
         print(f"Skipping empty plot: {title}")
         return
 
-    fig, ax = plt.subplots(figsize=(9, 5))
+    fig, ax = plt.subplots(figsize=figsize)
     if sns is not None:
-        sns.lineplot(data=df, x=x_col, y=y_col, hue=hue_col, marker="o", ax=ax)
+        sns.lineplot(
+            data=df,
+            x=x_col,
+            y=y_col,
+            hue=hue_col,
+            marker=None,
+            linewidth=2,
+            ax=ax,
+        )
     else:
         for label, group in df.groupby(hue_col, sort=True):
-            ax.plot(group[x_col], group[y_col], marker="o", label=label)
+            ax.plot(group[x_col], group[y_col], linewidth=2, label=label)
         ax.legend(frameon=False, bbox_to_anchor=(1.02, 1), loc="upper left")
     ax.set_title(title)
     ax.set_xlabel("Layer")
     ax.set_ylabel(ylabel)
+    ax.grid(alpha=0.2, linewidth=0.6)
     save_figure(fig, path_no_suffix)
 
 
@@ -333,7 +351,7 @@ def plot_probe_scores(geometry_dir: Path, output_dir: Path) -> None:
             "layer",
             "macro_f1_mean",
             "split_type",
-            "Axis probe macro F1 by layer",
+            "Axis probe performance by layer: macro F1 for final-token activations",
             "Macro F1",
             output_dir / "probe_axis_macro_f1_by_layer",
         )
@@ -342,7 +360,7 @@ def plot_probe_scores(geometry_dir: Path, output_dir: Path) -> None:
             "layer",
             "accuracy_mean",
             "split_type",
-            "Axis probe accuracy by layer",
+            "Axis probe performance by layer: accuracy for final-token activations",
             "Accuracy",
             output_dir / "probe_axis_accuracy_by_layer",
         )
@@ -354,7 +372,7 @@ def plot_probe_scores(geometry_dir: Path, output_dir: Path) -> None:
             "layer",
             "macro_f1_mean",
             "axis",
-            "Identity-within-axis probe macro F1 by layer",
+            "Identity-within-axis probe performance by layer: macro F1 for final-token activations",
             "Macro F1",
             output_dir / "probe_identity_within_axis_macro_f1_by_layer",
         )
@@ -371,22 +389,24 @@ def plot_family_stability(geometry_dir: Path, output_dir: Path) -> None:
         "layer",
         "mean_cosine",
         "axis",
-        "Mean centered family cosine by layer",
-        "Mean centered cosine",
+        "Family stability by layer: mean pairwise cosine between same-identity family means",
+        "Mean centered cosine\n(family means, centered by layer global mean)",
         output_dir / "family_stability_mean_cosine_by_layer",
+        figsize=(16, 6),
     )
     line_plot(
         df,
         "layer",
         "median_cosine",
         "axis",
-        "Median centered family cosine by layer",
-        "Median centered cosine",
+        "Family stability by layer: median pairwise cosine between same-identity family means",
+        "Median centered cosine\n(family means, centered by layer global mean)",
         output_dir / "family_stability_median_cosine_by_layer",
+        figsize=(16, 6),
     )
 
     pivot = df.pivot(index="axis", columns="layer", values="mean_cosine")
-    fig, ax = plt.subplots(figsize=(10, 6))
+    fig, ax = plt.subplots(figsize=(15, 7))
     if sns is not None:
         sns.heatmap(pivot, cmap="viridis", annot=False, ax=ax)
     else:
@@ -394,7 +414,12 @@ def plot_family_stability(geometry_dir: Path, output_dir: Path) -> None:
         fig.colorbar(im, ax=ax)
         ax.set_xticks(np.arange(len(pivot.columns)), labels=pivot.columns)
         ax.set_yticks(np.arange(len(pivot.index)), labels=pivot.index)
-    ax.set_title("Family stability mean centered cosine")
+    ax.set_title(
+        "Family stability heatmap: mean pairwise centered cosine between "
+        "same-identity family mean vectors"
+    )
+    ax.set_xlabel("Layer")
+    ax.set_ylabel("Identity axis")
     save_figure(fig, output_dir / "family_stability_heatmap")
 
 
@@ -409,18 +434,20 @@ def plot_contrasts(geometry_dir: Path, output_dir: Path) -> None:
             "layer",
             "auc_all",
             "contrast_name",
-            "Contrast AUC by layer",
-            "AUC",
+            "Contrast direction separation by layer: AUC from final-token projections",
+            "AUC for identity_a vs identity_b",
             output_dir / "contrast_auc_by_layer",
+            figsize=(17, 7),
         )
         line_plot(
             scores,
             "layer",
             "cohens_d_all",
             "contrast_name",
-            "Contrast Cohen's d by layer",
-            "Cohen's d",
+            "Contrast direction separation by layer: Cohen's d of final-token projections",
+            "Cohen's d for identity_a minus identity_b",
             output_dir / "contrast_cohens_d_by_layer",
+            figsize=(17, 7),
         )
 
     holdout = safe_read_csv(holdout_path)
@@ -436,9 +463,10 @@ def plot_contrasts(geometry_dir: Path, output_dir: Path) -> None:
                 "layer",
                 "auc_mean",
                 "contrast_name",
-                "Contrast family-holdout AUC by layer",
-                "Mean heldout-family AUC",
+                "Contrast direction family holdout by layer: mean AUC on held-out template family",
+                "Mean held-out-family AUC",
                 output_dir / "contrast_family_holdout_auc_by_layer",
+                figsize=(17, 7),
             )
 
 
@@ -467,7 +495,7 @@ def plot_umap_if_available(
         color_map = category_colors(umap_df["axis"])
         colors = umap_df["axis"].astype(str).map(color_map)
 
-        fig, ax = plt.subplots(figsize=(8, 6))
+        fig, ax = plt.subplots(figsize=(10, 7))
         ax.scatter(umap_df["UMAP1"], umap_df["UMAP2"], c=list(colors), s=6, alpha=0.3, linewidths=0)
         ax.set_title(f"UMAP by axis - Layer {layer:02d}")
         ax.set_xlabel("UMAP1")
@@ -498,6 +526,8 @@ def main() -> None:
 
     if args.make_umap:
         plot_umap_if_available(pca_by_layer, subdirs["root"], args.max_points_per_plot)
+    else:
+        print("UMAP plots not requested. Re-run with --make_umap to create figures/umap outputs.")
 
     print(f"Figures saved to: {args.output_dir}")
 

@@ -28,6 +28,7 @@ credentials.json
 # Large local artifacts
 models/
 results/
+status_mi_runpod_results/
 checkpoints/
 wandb/
 runs/
