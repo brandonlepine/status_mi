@@ -498,7 +498,6 @@ def crossval_probe(
                 class_weight="balanced",
                 solver=solver,
                 n_jobs=n_jobs,
-                multi_class="auto",
             )
             try:
                 model.fit(x[train_idx], y.iloc[train_idx])
