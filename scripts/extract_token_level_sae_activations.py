@@ -48,6 +48,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_length", type=int, default=128)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", default="bf16", choices=["bf16", "fp16", "fp32"])
+    parser.add_argument("--resume", action="store_true", help="Resume by skipping prompts already present in token_feature_activations.csv.")
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -134,7 +135,9 @@ def final_token_feature_values(final_token_root: Path, layer: int, feature_ids: 
 def select_prompt_rows(final_values: pd.DataFrame, metadata: pd.DataFrame, max_prompts_per_feature: int) -> pd.DataFrame:
     selected = []
     for (layer, feature_id), group in final_values.groupby(["layer", "feature_id"], sort=True):
-        top = group.sort_values("final_token_feature_activation", ascending=False).head(max_prompts_per_feature)
+        positive = group[group["final_token_feature_activation"] > 0].copy()
+        source = positive if not positive.empty else group
+        top = source.sort_values("final_token_feature_activation", ascending=False).head(max_prompts_per_feature)
         selected.append(top)
     if not selected:
         return pd.DataFrame(columns=["layer", "feature_id", "row_idx", "final_token_feature_activation"])
@@ -191,6 +194,41 @@ def append_layer_outputs(layer_dir: Path, token_rows: list[dict[str, object]]) -
     pd.DataFrame(token_rows).to_csv(token_path, mode="a", header=not token_path.exists(), index=False)
 
 
+def processed_prompt_ids(layer_dir: Path, feature_ids: list[int]) -> set[str]:
+    token_path = layer_dir / "token_feature_activations.csv"
+    if not token_path.exists():
+        return set()
+    try:
+        seen = pd.read_csv(token_path, usecols=["prompt_id", "feature_id"])
+    except Exception:
+        return set()
+    counts = seen.groupby("prompt_id")["feature_id"].nunique()
+    return set(counts[counts >= len(feature_ids)].index.astype(str))
+
+
+def write_top_tokens_from_token_csv(layer_dir: Path) -> None:
+    token_path = layer_dir / "token_feature_activations.csv"
+    if not token_path.exists():
+        return
+    df = pd.read_csv(token_path)
+    if df.empty:
+        return
+    if "is_special_token" in df.columns:
+        df = df[~df["is_special_token"].astype(bool)]
+    else:
+        df = df[df["token_end_char"] > df["token_start_char"]]
+    if df.empty:
+        return
+    out = (
+        df.sort_values(["feature_id", "token_feature_activation"], ascending=[True, False])
+        .groupby("feature_id", group_keys=False)
+        .head(200)
+        .rename(columns={"token_feature_activation": "activation", "prompt": "prompt_snippet"})
+    )
+    keep = ["layer", "feature_id", "prompt_id", "token_idx", "token_str", "activation", "prompt_snippet", "identity_id", "axis", "is_identity_span_token"]
+    out.reindex(columns=keep).to_csv(layer_dir / "feature_top_tokens.csv", index=False)
+
+
 def main() -> None:
     args = parse_args()
     start_all = time.perf_counter()
@@ -202,7 +240,7 @@ def main() -> None:
     layers = parse_int_list(args.layers)
     explicit_features = parse_int_list(args.features)
     metadata = pd.read_csv(args.identity_csv, keep_default_na=False).reset_index(drop=True)
-    if args.output_dir.exists() and any(args.output_dir.iterdir()) and args.overwrite:
+    if args.output_dir.exists() and any(args.output_dir.iterdir()) and args.overwrite and not args.resume:
         shutil.rmtree(args.output_dir)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     (args.output_dir / "token_level").mkdir(parents=True, exist_ok=True)
@@ -224,16 +262,23 @@ def main() -> None:
             print(f"Layer {layer:02d}: no selected features; skipping.")
             continue
         layer_dir = args.output_dir / "token_level" / f"layer_{layer:02d}"
-        if layer_dir.exists() and any(layer_dir.iterdir()) and not args.overwrite:
-            raise FileExistsError(f"{layer_dir} exists. Pass --overwrite to replace it.")
-        if layer_dir.exists() and args.overwrite:
+        if layer_dir.exists() and any(layer_dir.iterdir()) and not args.overwrite and not args.resume:
+            raise FileExistsError(f"{layer_dir} exists. Pass --overwrite to replace it or --resume to continue.")
+        if layer_dir.exists() and args.overwrite and not args.resume:
             shutil.rmtree(layer_dir)
         layer_dir.mkdir(parents=True, exist_ok=True)
         final_values = final_token_feature_values(final_token_root, layer, feature_ids)
         selected_prompts = select_prompt_rows(final_values, metadata, args.max_prompts_per_feature)
         prompt_df = selected_prompts.drop_duplicates("row_idx").sort_values("row_idx").reset_index(drop=True)
+        if args.resume:
+            done_prompts = processed_prompt_ids(layer_dir, feature_ids)
+            if done_prompts:
+                before = len(prompt_df)
+                prompt_df = prompt_df[~prompt_df["prompt_id"].astype(str).isin(done_prompts)].reset_index(drop=True)
+                print(f"Layer {layer:02d}: resume skipped {before - len(prompt_df)} already processed prompts.")
         if prompt_df.empty:
-            print(f"Layer {layer:02d}: no prompts selected; skipping.")
+            print(f"Layer {layer:02d}: no prompts left to process; rebuilding top-token summary.")
+            write_top_tokens_from_token_csv(layer_dir)
             continue
         hidden_dim = model.config.hidden_size
         sae = load_sae(args.sae_dir, layer, hidden_dim, device, dtype)
@@ -263,13 +308,23 @@ def main() -> None:
                     vals = acts[batch_pos, :valid_len, col]
                     if len(vals) == 0:
                         continue
-                    max_idx = int(vals.argmax())
-                    max_val = float(vals[max_idx])
                     token_span_flags = []
+                    content_flags = []
                     for token_idx in range(valid_len):
                         start_char, end_char = offsets[batch_pos, token_idx]
                         is_span = bool(span_start is not None and end_char > span_start and start_char < span_end)
+                        is_content = bool(end_char > start_char)
                         token_span_flags.append(is_span)
+                        content_flags.append(is_content)
+                    content_mask = np.array(content_flags, dtype=bool)
+                    if content_mask.any():
+                        content_positions = np.flatnonzero(content_mask)
+                        content_vals = vals[content_mask]
+                        max_idx = int(content_positions[int(content_vals.argmax())])
+                        max_val = float(content_vals.max())
+                    else:
+                        max_idx = int(vals.argmax())
+                        max_val = float(vals[max_idx])
                     span_vals = vals[np.array(token_span_flags, dtype=bool)] if any(token_span_flags) else np.array([], dtype=np.float32)
                     final_value = float(final_lookup.get((feature_id, int(meta.row_idx)), 0.0))
                     max_span = float(span_vals.max()) if len(span_vals) else 0.0
@@ -284,6 +339,10 @@ def main() -> None:
                         localization = "diffuse_or_unclear"
                     for token_idx in range(valid_len):
                         start_char, end_char = offsets[batch_pos, token_idx]
+                        is_special = not bool(end_char > start_char)
+                        rank_source = vals.copy()
+                        rank_source[~content_mask] = -np.inf
+                        token_rank = int((-rank_source).argsort().tolist().index(token_idx) + 1) if content_mask[token_idx] else -1
                         row = {
                             "layer": layer,
                             "feature_id": feature_id,
@@ -294,8 +353,9 @@ def main() -> None:
                             "token_start_char": int(start_char),
                             "token_end_char": int(end_char),
                             "token_feature_activation": float(vals[token_idx]),
-                            "token_rank_within_prompt": int((-vals).argsort().tolist().index(token_idx) + 1),
+                            "token_rank_within_prompt": token_rank,
                             "is_top_token_for_feature": token_idx == max_idx,
+                            "is_special_token": is_special,
                             "is_identity_span_token": token_span_flags[token_idx],
                             "identity_span_match_status": span_status,
                             "identity_id": meta.identity_id,
@@ -328,8 +388,7 @@ def main() -> None:
                     })
             append_layer_outputs(layer_dir, token_rows)
             token_rows.clear()
-        top_token_rows = sorted(top_token_rows, key=lambda row: (row["feature_id"], -row["activation"]))
-        pd.DataFrame(top_token_rows).groupby("feature_id", group_keys=False).head(200).to_csv(layer_dir / "feature_top_tokens.csv", index=False)
+        write_top_tokens_from_token_csv(layer_dir)
         (layer_dir / "run_config.json").write_text(json.dumps({
             "layer": layer,
             "features": feature_ids,

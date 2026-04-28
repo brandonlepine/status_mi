@@ -145,6 +145,12 @@ def highlight_identity(prompt: str, form: str) -> str:
 def token_heat_html(prompt_token_df: pd.DataFrame) -> str:
     if prompt_token_df.empty:
         return ""
+    if "is_special_token" in prompt_token_df.columns:
+        prompt_token_df = prompt_token_df[~prompt_token_df["is_special_token"].astype(bool)].copy()
+    else:
+        prompt_token_df = prompt_token_df[prompt_token_df["token_end_char"] > prompt_token_df["token_start_char"]].copy()
+    if prompt_token_df.empty:
+        return ""
     max_val = max(float(prompt_token_df["token_feature_activation"].max()), 1e-9)
     spans = []
     for row in prompt_token_df.sort_values("token_idx").itertuples(index=False):
@@ -173,6 +179,72 @@ def classify_label(identity_means: pd.DataFrame, token_df: pd.DataFrame) -> tupl
     if not token_df.empty and token_df["feature_localization_type"].eq("identity_span_local").mean() > 0.5:
         return "identity-token-local feature", top_axis, top_identity
     return "mixed/polysemantic feature", top_axis, top_identity
+
+
+def localization_summary(feature_token_df: pd.DataFrame) -> pd.DataFrame:
+    if feature_token_df.empty or "prompt_id" not in feature_token_df.columns:
+        return pd.DataFrame()
+    prompt_level = feature_token_df.drop_duplicates("prompt_id")
+    if prompt_level.empty or "feature_localization_type" not in prompt_level.columns:
+        return pd.DataFrame()
+    return (
+        prompt_level["feature_localization_type"]
+        .value_counts(normalize=True)
+        .rename_axis("localization_type")
+        .reset_index(name="share")
+    )
+
+
+def exemplar_prompt_table(feature_token_df: pd.DataFrame, top_n: int) -> pd.DataFrame:
+    if feature_token_df.empty:
+        return pd.DataFrame()
+    token_df = feature_token_df.copy()
+    if "is_special_token" in token_df.columns:
+        token_df = token_df[~token_df["is_special_token"].astype(bool)]
+    else:
+        token_df = token_df[token_df["token_end_char"] > token_df["token_start_char"]]
+    if token_df.empty:
+        return pd.DataFrame()
+    rows = []
+    for prompt_id, group in token_df.groupby("prompt_id", sort=False):
+        max_idx = group["token_feature_activation"].idxmax()
+        max_row = group.loc[max_idx].to_dict()
+        span = group[group["is_identity_span_token"].astype(bool)]
+        max_token = float(group["token_feature_activation"].max())
+        span_max = float(span["token_feature_activation"].max()) if not span.empty else 0.0
+        span_mean = float(span["token_feature_activation"].mean()) if not span.empty else 0.0
+        final_token = float(group["final_token_feature_activation"].iloc[0]) if "final_token_feature_activation" in group.columns else 0.0
+        if max_token > 0 and span_max >= 0.7 * max_token:
+            localization = "identity_span_local"
+        elif max_token > 0 and final_token >= 0.7 * max_token:
+            localization = "final_token_integrated"
+        elif max_token > 0:
+            localization = "template_context"
+        else:
+            localization = "diffuse_or_unclear"
+        max_row.update({
+            "prompt_id": prompt_id,
+            "final_token_feature_activation": final_token,
+            "max_token_activation": max_token,
+            "max_identity_span_activation": span_max,
+            "mean_identity_span_activation": span_mean,
+            "feature_localization_type": localization,
+        })
+        rows.append(max_row)
+    prompts = pd.DataFrame(rows)
+    prompts = prompts.sort_values(["token_feature_activation", "final_token_feature_activation"], ascending=False)
+    return prompts.head(top_n)
+
+
+def identity_span_token_table(feature_token_df: pd.DataFrame, top_n: int) -> pd.DataFrame:
+    if feature_token_df.empty:
+        return pd.DataFrame()
+    span_df = feature_token_df[feature_token_df["is_identity_span_token"].astype(bool)].copy()
+    if "is_special_token" in span_df.columns:
+        span_df = span_df[~span_df["is_special_token"].astype(bool)]
+    if span_df.empty:
+        return pd.DataFrame()
+    return span_df.sort_values("token_feature_activation", ascending=False).head(top_n)
 
 
 def save_identity_profile(card_dir: Path, layer: int, feature_id: int, identity_means: pd.DataFrame) -> str | None:
@@ -241,53 +313,58 @@ def build_card(args: argparse.Namespace, layer: int, feature_id: int, layer_dir:
         identity_means = identity_f.rename(columns={"mean_identity": "mean_activation", "freq_identity": "freq"})
     feature_token_df = token_df[token_df["feature_id"].eq(feature_id)].copy() if not token_df.empty else pd.DataFrame()
     auto_label, top_axis, top_identity = classify_label(identity_means, feature_token_df)
+    loc_summary = localization_summary(feature_token_df)
+    exemplar_df = exemplar_prompt_table(feature_token_df, args.top_prompts_per_feature)
+    span_token_df = identity_span_token_table(feature_token_df, args.top_tokens_per_feature)
     profile_img = save_identity_profile(card_dir, layer, feature_id, identity_means)
     prompt_df = metadata.copy()
     prompt_df["final_token_activation"] = feature_values
     top_prompts = prompt_df.sort_values("final_token_activation", ascending=False).head(args.top_prompts_per_feature)
     positive_logits, negative_logits, logit_note = compute_logit_effects(args, layer_dir, feature_id)
 
-    prompt_sections = []
+    exemplar_sections = []
     prompt_metrics = []
-    for row in top_prompts.itertuples(index=False):
+    for row in exemplar_df.itertuples(index=False):
         prompt_tokens = feature_token_df[feature_token_df["prompt_id"].eq(row.prompt_id)]
-        if not prompt_tokens.empty:
-            first = prompt_tokens.iloc[0]
-            snippet = token_heat_html(prompt_tokens)
-            max_token = float(first["max_token_activation"])
-            max_span = float(first["max_identity_span_activation"])
-            mean_span = float(first["mean_identity_span_activation"])
-            localization = str(first["feature_localization_type"])
-            max_token_str = str(first["token_str_of_max_activation"])
-        else:
-            snippet = highlight_identity(row.prompt, row.form_used)
-            max_token = 0.0
-            max_span = 0.0
-            mean_span = 0.0
-            localization = "token_level_missing"
-            max_token_str = ""
+        snippet = token_heat_html(prompt_tokens)
+        exemplar_sections.append(
+            "<div class='exemplar'>"
+            f"<div class='exemplar-meta'>max token <strong>{row.token_feature_activation:.3f}</strong> on <code>{html.escape(str(row.token_str))}</code> | "
+            f"final <strong>{row.final_token_feature_activation:.3f}</strong> | span max <strong>{row.max_identity_span_activation:.3f}</strong> | "
+            f"{html.escape(str(row.feature_localization_type))} | {html.escape(str(row.identity_id))} / {html.escape(str(row.family))}</div>"
+            f"<div class='tokens'>{snippet}</div>"
+            "</div>"
+        )
+    for row in exemplar_df.itertuples(index=False):
         prompt_metrics.append({
             "prompt_id": row.prompt_id,
-            "final_token_activation": float(row.final_token_activation),
-            "max_token_activation": max_token,
-            "max_identity_span_activation": max_span,
-            "mean_identity_span_activation": mean_span,
-            "token_str_of_max_activation": max_token_str,
-            "feature_localization_type": localization,
+            "final_token_activation": float(row.final_token_feature_activation),
+            "max_token_activation": float(row.max_token_activation),
+            "max_identity_span_activation": float(row.max_identity_span_activation),
+            "mean_identity_span_activation": float(row.mean_identity_span_activation),
+            "token_str_of_max_activation": str(row.token_str),
+            "feature_localization_type": str(row.feature_localization_type),
         })
-        prompt_sections.append(
-            "<tr>"
-            f"<td>{row.final_token_activation:.3f}</td><td>{max_token:.3f}</td><td>{max_span:.3f}</td>"
-            f"<td>{html.escape(localization)}</td><td>{html.escape(str(row.identity_id))}</td>"
-            f"<td>{html.escape(str(row.axis))}</td><td>{html.escape(str(row.family))}</td><td>{snippet}</td>"
-            "</tr>"
-        )
 
-    top_tokens = feature_token_df.sort_values("token_feature_activation", ascending=False).head(args.top_tokens_per_feature) if not feature_token_df.empty else pd.DataFrame()
+    top_tokens = feature_token_df.copy() if not feature_token_df.empty else pd.DataFrame()
+    if not top_tokens.empty:
+        if "is_special_token" in top_tokens.columns:
+            top_tokens = top_tokens[~top_tokens["is_special_token"].astype(bool)]
+        else:
+            top_tokens = top_tokens[top_tokens["token_end_char"] > top_tokens["token_start_char"]]
+        top_tokens = top_tokens.sort_values("token_feature_activation", ascending=False).head(args.top_tokens_per_feature)
     token_rows = "\n".join(
         f"<tr><td>{html.escape(str(row.token_str))}</td><td>{row.token_feature_activation:.3f}</td><td>{html.escape(str(row.identity_id))}</td><td>{html.escape(str(row.axis))}</td><td>{bool(row.is_identity_span_token)}</td><td>{html.escape(str(row.prompt))[:180]}</td></tr>"
         for row in top_tokens.itertuples(index=False)
     ) or "<tr><td colspan='6'>Token-level data missing.</td></tr>"
+    span_token_rows = "\n".join(
+        f"<tr><td>{html.escape(str(row.token_str))}</td><td>{row.token_feature_activation:.3f}</td><td>{html.escape(str(row.identity_id))}</td><td>{html.escape(str(row.axis))}</td><td>{html.escape(str(row.prompt))[:180]}</td></tr>"
+        for row in span_token_df.itertuples(index=False)
+    ) or "<tr><td colspan='5'>No identity-span token activations found.</td></tr>"
+    loc_rows = "\n".join(
+        f"<tr><td>{html.escape(str(row.localization_type))}</td><td>{row.share:.2%}</td></tr>"
+        for row in loc_summary.itertuples(index=False)
+    ) or "<tr><td colspan='2'>No localization summary available.</td></tr>"
     identity_rows = "\n".join(
         f"<tr><td>{html.escape(str(row.identity_id))}</td><td>{html.escape(str(row.canonical_label))}</td><td>{html.escape(str(row.axis))}</td><td>{getattr(row, 'mean_activation', 0):.4f}</td><td>{getattr(row, 'freq', 0):.3f}</td></tr>"
         for row in identity_means.sort_values("mean_activation", ascending=False).head(15).itertuples(index=False)
@@ -322,6 +399,9 @@ th {{ text-align: left; background: #f3f4f6; }}
 mark.identity, .identity-token {{ outline: 2px solid #facc15; }}
 .top-token {{ outline: 2px solid #16a34a; }}
 .token {{ border-radius: 3px; padding: 1px 2px; white-space: pre-wrap; }}
+.exemplar {{ border: 1px solid #e5e7eb; border-radius: 8px; padding: 9px; margin: 9px 0; background: #fbfdff; }}
+.exemplar-meta {{ font-size: .84rem; color: #475569; margin-bottom: 6px; }}
+.tokens {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; line-height: 1.8; font-size: .95rem; }}
 .snippet-table td:last-child {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }}
 .profile-img {{ max-width: 100%; }}
 .logit-pos {{ display: inline-block; margin: 2px; padding: 2px 5px; background: #dbeafe; color: #1e40af; border-radius: 4px; }}
@@ -343,10 +423,15 @@ mark.identity, .identity-token {{ outline: 2px solid #facc15; }}
 <table><tr><th>Identity ID</th><th>Label</th><th>Axis</th><th>Mean</th><th>Freq</th></tr>{identity_rows}</table>
 </section>
 <section class="card">
-<h2>Top Activating Prompts</h2>
-<table class="snippet-table"><tr><th>Final</th><th>Max token</th><th>Span max</th><th>Localization</th><th>Identity</th><th>Axis</th><th>Family</th><th>Prompt tokens</th></tr>{''.join(prompt_sections)}</table>
-<h2>Top Activating Tokens</h2>
+<h2>Token-Level Exemplars</h2>
+<p class="note">These are ranked by max non-special token activation, not by BOS/special-token activation.</p>
+{''.join(exemplar_sections) if exemplar_sections else '<p>No token-level exemplars available.</p>'}
+<h2>Localization Summary</h2>
+<table><tr><th>Localization type</th><th>Share of selected prompts</th></tr>{loc_rows}</table>
+<h2>Top Non-Special Activating Tokens</h2>
 <table><tr><th>Token</th><th>Activation</th><th>Identity</th><th>Axis</th><th>In identity span?</th><th>Prompt</th></tr>{token_rows}</table>
+<h2>Top Identity-Span Tokens</h2>
+<table><tr><th>Token</th><th>Activation</th><th>Identity</th><th>Axis</th><th>Prompt</th></tr>{span_token_rows}</table>
 </section>
 <section class="card">
 <h2>Contrast Selectivity</h2>
