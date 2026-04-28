@@ -6,3 +6,6 @@ transformers
 accelerate
 huggingface_hub
 safetensors
+scikit-learn
+matplotlib
+seaborn
