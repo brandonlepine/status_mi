@@ -282,7 +282,8 @@ def save_group_means(
     mean_rows = []
     meta_rows = []
 
-    for group_key, idx in metadata.groupby(group_cols, sort=True).groups.items():
+    by = group_cols[0] if len(group_cols) == 1 else group_cols
+    for group_key, idx in metadata.groupby(by, sort=True).groups.items():
         if not isinstance(group_key, tuple):
             group_key = (group_key,)
         idx_array = np.fromiter(idx, dtype=int)
@@ -333,7 +334,16 @@ def build_probe_pipeline(
     if probe_pca_dim and probe_pca_dim > 0:
         n_components = min(probe_pca_dim, n_samples - 1, min_train_size - 1, hidden_dim)
         if n_components >= 1:
-            steps.append(("pca", PCA(n_components=n_components, random_state=0)))
+            steps.append(
+                (
+                    "pca",
+                    PCA(
+                        n_components=n_components,
+                        random_state=0,
+                        svd_solver="randomized",
+                    ),
+                )
+            )
     steps.append(
         (
             "logreg",
@@ -364,7 +374,11 @@ def crossval_probe(
 
     n_splits = min(5, n_groups)
     splitter = GroupKFold(n_splits=n_splits)
-    splits = list(splitter.split(x, y, groups))
+    try:
+        splits = list(splitter.split(x, y, groups))
+    except ValueError as exc:
+        print(f"Skipping probe split ({split_type}, layer {layer}): {exc}")
+        return None
     min_train_size = min(len(train_idx) for train_idx, _ in splits)
     if min_train_size < 2:
         return None
@@ -374,8 +388,19 @@ def crossval_probe(
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", ConvergenceWarning)
+        warnings.simplefilter("ignore", RuntimeWarning)
         for train_idx, test_idx in splits:
             if y.iloc[train_idx].nunique() < 2 or y.iloc[test_idx].nunique() < 2:
+                continue
+            x_train = x[train_idx]
+            x_test = x[test_idx]
+            if not np.isfinite(x_train).all() or not np.isfinite(x_test).all():
+                print(
+                    f"Skipping non-finite probe fold ({split_type}, layer {layer})."
+                )
+                continue
+            if np.all(np.nanstd(x_train, axis=0) == 0):
+                print(f"Skipping zero-variance probe fold ({split_type}, layer {layer}).")
                 continue
             pipeline = build_probe_pipeline(
                 n_samples=len(x),
@@ -384,13 +409,13 @@ def crossval_probe(
                 probe_pca_dim=probe_pca_dim,
             )
             try:
-                pipeline.fit(x[train_idx], y.iloc[train_idx])
-                pred = pipeline.predict(x[test_idx])
+                pipeline.fit(x_train, y.iloc[train_idx])
+                pred = pipeline.predict(x_test)
+                accuracies.append(accuracy_score(y.iloc[test_idx], pred))
+                macro_f1s.append(f1_score(y.iloc[test_idx], pred, average="macro"))
             except Exception as exc:
                 print(f"Skipping failed probe fold ({split_type}, layer {layer}): {exc}")
                 continue
-            accuracies.append(accuracy_score(y.iloc[test_idx], pred))
-            macro_f1s.append(f1_score(y.iloc[test_idx], pred, average="macro"))
 
     if not accuracies:
         return None
@@ -415,14 +440,18 @@ def run_probes(
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
     axis_rows = []
     for group_col in ["template_id", "family"]:
-        result = crossval_probe(
-            x=x,
-            y=metadata["axis"],
-            groups=metadata[group_col],
-            split_type=f"group_by_{group_col}",
-            layer=layer,
-            probe_pca_dim=probe_pca_dim,
-        )
+        try:
+            result = crossval_probe(
+                x=x,
+                y=metadata["axis"],
+                groups=metadata[group_col],
+                split_type=f"group_by_{group_col}",
+                layer=layer,
+                probe_pca_dim=probe_pca_dim,
+            )
+        except Exception as exc:
+            print(f"Skipping axis probe ({group_col}, layer {layer}): {exc}")
+            result = None
         if result:
             axis_rows.append(result)
 
@@ -431,14 +460,18 @@ def run_probes(
         if axis_meta["identity_id"].nunique() < 2:
             continue
         idx = axis_meta.index.to_numpy()
-        result = crossval_probe(
-            x=x[idx],
-            y=axis_meta["identity_id"].reset_index(drop=True),
-            groups=axis_meta["template_id"].reset_index(drop=True),
-            split_type="group_by_template_id",
-            layer=layer,
-            probe_pca_dim=probe_pca_dim,
-        )
+        try:
+            result = crossval_probe(
+                x=x[idx],
+                y=axis_meta["identity_id"].reset_index(drop=True),
+                groups=axis_meta["template_id"].reset_index(drop=True),
+                split_type="group_by_template_id",
+                layer=layer,
+                probe_pca_dim=probe_pca_dim,
+            )
+        except Exception as exc:
+            print(f"Skipping identity-within-axis probe ({axis}, layer {layer}): {exc}")
+            result = None
         if result:
             result["axis"] = axis
             identity_rows.append(result)
