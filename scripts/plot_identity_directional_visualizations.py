@@ -127,6 +127,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--contrasts", type=Path, default=None)
     parser.add_argument("--max_points_per_plot", type=int, default=20000)
     parser.add_argument("--random_seed", type=int, default=42)
+    parser.add_argument(
+        "--plots_only",
+        action="store_true",
+        help="Regenerate summary plots from existing CSV outputs without recomputing activations.",
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -507,6 +512,9 @@ def plot_layer_curves(metrics_path: Path, holdout_path: Path, output_dir: Path) 
                 ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left", frameon=False)
             ax.set_title(filename.replace("_", " ").title())
             ax.set_ylabel(ylabel)
+            if y_col in {"auc", "accuracy_midpoint"}:
+                ax.axhline(0.5, color="black", linestyle=":", linewidth=1, alpha=0.6)
+                ax.set_ylim(0.45, 1.02)
             save_fig(fig, output_dir / "figures" / "layer_curves" / filename)
 
     holdout = pd.read_csv(holdout_path) if holdout_path.exists() else pd.DataFrame()
@@ -519,15 +527,32 @@ def plot_layer_curves(metrics_path: Path, holdout_path: Path, output_dir: Path) 
             for name, group in summary.groupby("residualization"):
                 ax.plot(group["layer"], group["mean"], label=name)
             ax.legend(frameon=False)
-        ax.set_title("Mean family-holdout AUC by layer")
-        ax.set_ylabel("Mean heldout AUC")
+        ax.axhline(0.5, color="black", linestyle=":", linewidth=1, alpha=0.6)
+        ax.set_ylim(0.45, 1.02)
+        ax.set_title("Mean family-holdout AUC by layer, averaged across contrasts")
+        ax.set_ylabel("Mean held-out-family AUC")
         save_fig(fig, output_dir / "figures" / "family_holdout" / "mean_family_holdout_auc_by_layer")
         for residualization, resid_df in holdout.groupby("residualization", sort=True):
             for contrast_name, contrast_df in resid_df.groupby("contrast_name", sort=True):
                 curve = contrast_df.groupby("layer")["auc"].agg(mean="mean", sd="std").reset_index()
                 fig, ax = plt.subplots(figsize=(10, 5))
-                ax.errorbar(curve["layer"], curve["mean"], yerr=curve["sd"].fillna(0), linewidth=2)
-                ax.set_title(f"{contrast_name}: family-holdout AUC ({residualization})")
+                sd = curve["sd"].fillna(0).to_numpy()
+                mean = curve["mean"].to_numpy()
+                lower = np.minimum(sd, np.maximum(mean - 0.0, 0.0))
+                upper = np.minimum(sd, np.maximum(1.0 - mean, 0.0))
+                ax.errorbar(
+                    curve["layer"],
+                    curve["mean"],
+                    yerr=np.vstack([lower, upper]),
+                    linewidth=2,
+                    capsize=3,
+                )
+                ax.axhline(0.5, color="black", linestyle=":", linewidth=1, alpha=0.6)
+                ax.set_ylim(0.45, 1.02)
+                ax.set_title(
+                    f"{contrast_name}: family-holdout AUC ({residualization})\n"
+                    "Mean +/- SD across held-out template families, clipped to valid AUC range"
+                )
                 ax.set_xlabel("Layer")
                 ax.set_ylabel("AUC")
                 save_fig(fig, output_dir / "figures" / "family_holdout" / residualization / f"{contrast_name}_family_holdout_auc_by_layer")
@@ -708,6 +733,21 @@ def main() -> None:
     invalid = [item for item in residualizations if item not in RESIDUALIZATION_GROUPS]
     if invalid:
         raise ValueError(f"Unknown residualizations: {invalid}")
+    if args.plots_only:
+        (args.output_dir / "figures").mkdir(parents=True, exist_ok=True)
+        print("Regenerating summary plots from existing directional CSV outputs.")
+        plot_layer_curves(
+            args.output_dir / "metrics" / "directional_metrics.csv",
+            args.output_dir / "metrics" / "directional_family_holdout_metrics.csv",
+            args.output_dir,
+        )
+        plot_direction_cosine_summary(
+            args.output_dir / "metrics" / "direction_cosines_long.csv",
+            args.output_dir,
+        )
+        print(f"Plot-only regeneration complete: {args.output_dir / 'figures'}")
+        return
+
     dirs = prepare_dirs(args.output_dir, args.overwrite)
     metadata = load_metadata(args.activation_dir)
     contrasts = load_contrasts(args.contrasts, metadata)
@@ -718,6 +758,7 @@ def main() -> None:
         "residualizations": residualizations,
         "max_points_per_plot": args.max_points_per_plot,
         "random_seed": args.random_seed,
+        "plots_only": args.plots_only,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
     (args.output_dir / "run_config.json").write_text(json.dumps(run_config, indent=2) + "\n")
