@@ -17,7 +17,6 @@ from sklearn.exceptions import ConvergenceWarning
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 from sklearn.model_selection import GroupKFold
-from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from tqdm.auto import tqdm
 
@@ -130,6 +129,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_pca_points", type=int, default=None)
     parser.add_argument("--pca_components", type=int, default=10)
     parser.add_argument("--probe_pca_dim", type=int, default=256)
+    parser.add_argument(
+        "--skip_probes",
+        action="store_true",
+        help="Skip logistic probe analyses and compute only PCA/means/stability/contrasts.",
+    )
     parser.add_argument("--random_seed", type=int, default=42)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
@@ -248,8 +252,21 @@ def run_pca(
         raise ValueError("Need at least two rows to compute PCA.")
 
     x_scaled = StandardScaler().fit_transform(x_sample)
-    pca = PCA(n_components=n_components, random_state=random_seed)
-    pcs = pca.fit_transform(x_scaled)
+    total_variance = float(np.var(x_scaled, axis=0).sum())
+    if total_variance <= 0 or not np.isfinite(total_variance):
+        pcs = np.zeros((len(x_sample), n_components), dtype=np.float32)
+        explained_variance_ratio = np.zeros(n_components, dtype=np.float32)
+    else:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            pca = PCA(n_components=n_components, random_state=random_seed)
+            pcs = pca.fit_transform(x_scaled)
+            explained_variance_ratio = np.nan_to_num(
+                pca.explained_variance_ratio_,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
 
     pca_df = metadata.iloc[indices][METADATA_COLUMNS].copy()
     pca_df.insert(0, "original_row_idx", indices)
@@ -262,9 +279,9 @@ def run_pca(
         {
             "layer": layer,
             "pc": np.arange(1, n_components + 1),
-            "explained_variance_ratio": pca.explained_variance_ratio_,
+            "explained_variance_ratio": explained_variance_ratio,
             "cumulative_explained_variance": np.cumsum(
-                pca.explained_variance_ratio_
+                explained_variance_ratio
             ),
         }
     )
@@ -327,34 +344,51 @@ def run_means(
     return identity_family_means, identity_family_meta
 
 
-def build_probe_pipeline(
-    n_samples: int, hidden_dim: int, min_train_size: int, probe_pca_dim: int
-) -> Pipeline:
-    steps = [("scaler", StandardScaler())]
+def make_probe_features(
+    x: np.ndarray, probe_pca_dim: int, random_seed: int, layer: int
+) -> np.ndarray | None:
+    """Build fast probe features once per layer.
+
+    This intentionally fits the unsupervised scaler/PCA once on the full layer so
+    cross-validation only tests supervised label recovery. It avoids rerunning a
+    costly randomized SVD for every probe fold.
+    """
+    if not np.isfinite(x).all():
+        print(f"Skipping probes for layer {layer}: activations contain non-finite values.")
+        return None
+
+    total_variance = float(np.var(x, axis=0).sum())
+    if total_variance <= 0 or not np.isfinite(total_variance):
+        print(f"Skipping probes for layer {layer}: activations have zero variance.")
+        return None
+
+    x_scaled = StandardScaler().fit_transform(x)
+    if not np.isfinite(x_scaled).all():
+        print(f"Skipping probes for layer {layer}: scaled activations are non-finite.")
+        return None
+
     if probe_pca_dim and probe_pca_dim > 0:
-        n_components = min(probe_pca_dim, n_samples - 1, min_train_size - 1, hidden_dim)
-        if n_components >= 1:
-            steps.append(
-                (
-                    "pca",
-                    PCA(
-                        n_components=n_components,
-                        random_state=0,
-                        svd_solver="randomized",
-                    ),
+        n_components = min(probe_pca_dim, x_scaled.shape[0] - 1, x_scaled.shape[1])
+        if n_components >= 1 and n_components < x_scaled.shape[1]:
+            print(f"  Probe PCA: reducing {x_scaled.shape[1]} -> {n_components} dims")
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                pca = PCA(
+                    n_components=n_components,
+                    random_state=random_seed,
+                    svd_solver="randomized",
                 )
-            )
-    steps.append(
-        (
-            "logreg",
-            LogisticRegression(
-                max_iter=2000,
-                class_weight="balanced",
-                solver="lbfgs",
-            ),
-        )
+                x_scaled = pca.fit_transform(x_scaled)
+
+    return np.asarray(np.nan_to_num(x_scaled), dtype=np.float32)
+
+
+def build_probe_model() -> LogisticRegression:
+    return LogisticRegression(
+        max_iter=2000,
+        class_weight="balanced",
+        solver="lbfgs",
     )
-    return Pipeline(steps)
 
 
 def crossval_probe(
@@ -363,7 +397,6 @@ def crossval_probe(
     groups: pd.Series,
     split_type: str,
     layer: int,
-    probe_pca_dim: int,
 ) -> dict[str, float | int | str] | None:
     y = y.reset_index(drop=True)
     groups = groups.reset_index(drop=True)
@@ -379,10 +412,6 @@ def crossval_probe(
     except ValueError as exc:
         print(f"Skipping probe split ({split_type}, layer {layer}): {exc}")
         return None
-    min_train_size = min(len(train_idx) for train_idx, _ in splits)
-    if min_train_size < 2:
-        return None
-
     accuracies = []
     macro_f1s = []
 
@@ -399,18 +428,13 @@ def crossval_probe(
                     f"Skipping non-finite probe fold ({split_type}, layer {layer})."
                 )
                 continue
-            if np.all(np.nanstd(x_train, axis=0) == 0):
+            if np.all(np.std(x_train, axis=0) == 0):
                 print(f"Skipping zero-variance probe fold ({split_type}, layer {layer}).")
                 continue
-            pipeline = build_probe_pipeline(
-                n_samples=len(x),
-                hidden_dim=x.shape[1],
-                min_train_size=min_train_size,
-                probe_pca_dim=probe_pca_dim,
-            )
+            model = build_probe_model()
             try:
-                pipeline.fit(x_train, y.iloc[train_idx])
-                pred = pipeline.predict(x_test)
+                model.fit(x_train, y.iloc[train_idx])
+                pred = model.predict(x_test)
                 accuracies.append(accuracy_score(y.iloc[test_idx], pred))
                 macro_f1s.append(f1_score(y.iloc[test_idx], pred, average="macro"))
             except Exception as exc:
@@ -437,17 +461,21 @@ def run_probes(
     metadata: pd.DataFrame,
     layer: int,
     probe_pca_dim: int,
+    random_seed: int,
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    x_probe = make_probe_features(x, probe_pca_dim, random_seed, layer)
+    if x_probe is None:
+        return [], []
+
     axis_rows = []
     for group_col in ["template_id", "family"]:
         try:
             result = crossval_probe(
-                x=x,
+                x=x_probe,
                 y=metadata["axis"],
                 groups=metadata[group_col],
                 split_type=f"group_by_{group_col}",
                 layer=layer,
-                probe_pca_dim=probe_pca_dim,
             )
         except Exception as exc:
             print(f"Skipping axis probe ({group_col}, layer {layer}): {exc}")
@@ -462,12 +490,11 @@ def run_probes(
         idx = axis_meta.index.to_numpy()
         try:
             result = crossval_probe(
-                x=x[idx],
+                x=x_probe[idx],
                 y=axis_meta["identity_id"].reset_index(drop=True),
                 groups=axis_meta["template_id"].reset_index(drop=True),
                 split_type="group_by_template_id",
                 layer=layer,
-                probe_pca_dim=probe_pca_dim,
             )
         except Exception as exc:
             print(f"Skipping identity-within-axis probe ({axis}, layer {layer}): {exc}")
@@ -667,6 +694,7 @@ def write_run_config(
         "max_pca_points": args.max_pca_points,
         "pca_components": args.pca_components,
         "probe_pca_dim": args.probe_pca_dim,
+        "skip_probes": args.skip_probes,
         "random_seed": args.random_seed,
         "num_rows": len(metadata),
         "hidden_dim": hidden_dim,
@@ -719,12 +747,19 @@ def main() -> None:
         print("  Means")
         run_means(x=x, metadata=metadata, layer=layer, subdirs=subdirs)
 
-        print("  Probes")
-        axis_rows, identity_rows = run_probes(
-            x=x, metadata=metadata, layer=layer, probe_pca_dim=args.probe_pca_dim
-        )
-        axis_probe_rows.extend(axis_rows)
-        identity_probe_rows.extend(identity_rows)
+        if args.skip_probes:
+            print("  Probes skipped")
+        else:
+            print("  Probes")
+            axis_rows, identity_rows = run_probes(
+                x=x,
+                metadata=metadata,
+                layer=layer,
+                probe_pca_dim=args.probe_pca_dim,
+                random_seed=args.random_seed,
+            )
+            axis_probe_rows.extend(axis_rows)
+            identity_probe_rows.extend(identity_rows)
 
         print("  Family stability")
         family_df = run_family_stability(
