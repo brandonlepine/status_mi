@@ -147,6 +147,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_plot_points", type=int, default=15000)
     parser.add_argument("--make_umap", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Reuse existing per-layer outputs when present instead of recomputing them.",
+    )
     parser.add_argument("--random_seed", type=int, default=42)
     return parser.parse_args()
 
@@ -170,11 +175,14 @@ def parse_selected_layers(layer_arg: str) -> list[int]:
     return [int(part.strip()) for part in layer_arg.split(",") if part.strip()]
 
 
-def prepare_output_dir(output_dir: Path, overwrite: bool) -> dict[str, Path]:
+def prepare_output_dir(output_dir: Path, overwrite: bool, resume: bool) -> dict[str, Path]:
+    if overwrite and resume:
+        raise ValueError("Use only one of --overwrite or --resume.")
     if output_dir.exists() and any(output_dir.iterdir()):
-        if not overwrite:
+        if not overwrite and not resume:
             raise FileExistsError(f"{output_dir} exists. Pass --overwrite to replace it.")
-        shutil.rmtree(output_dir)
+        if overwrite:
+            shutil.rmtree(output_dir)
 
     subdirs = {
         "pca_residualized": output_dir / "pca_residualized",
@@ -351,7 +359,11 @@ def run_pca(
     else:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", RuntimeWarning)
-            pca = PCA(n_components=n_components, random_state=random_seed)
+            pca = PCA(
+                n_components=n_components,
+                random_state=random_seed,
+                svd_solver="randomized",
+            )
             pcs = pca.fit_transform(x_scaled)
             evr = np.nan_to_num(pca.explained_variance_ratio_)
 
@@ -1006,6 +1018,7 @@ def write_run_config(args: argparse.Namespace, layers: list[int], metadata: pd.D
         "pca_components": args.pca_components,
         "max_plot_points": args.max_plot_points,
         "make_umap": args.make_umap,
+        "resume": args.resume,
         "random_seed": args.random_seed,
         "num_rows": len(metadata),
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -1015,22 +1028,121 @@ def write_run_config(args: argparse.Namespace, layers: list[int], metadata: pd.D
         f.write("\n")
 
 
+def read_existing_layer_csvs(output_dir: Path) -> tuple[
+    list[dict[str, object]],
+    list[dict[str, object]],
+    list[dict[str, object]],
+    list[dict[str, object]],
+    list[dict[str, object]],
+    list[dict[str, object]],
+]:
+    """Load existing incremental outputs for --resume."""
+    variance_rows: list[dict[str, object]] = []
+    axis_probe_rows: list[dict[str, object]] = []
+    identity_probe_rows: list[dict[str, object]] = []
+    surface_probe_rows: list[dict[str, object]] = []
+    contrast_full_rows: list[dict[str, object]] = []
+    contrast_holdout_rows: list[dict[str, object]] = []
+
+    for path, rows in [
+        (output_dir / "variance_decomposition.csv", variance_rows),
+        (output_dir / "probes" / "axis_probe_residualized_scores.csv", axis_probe_rows),
+        (
+            output_dir / "probes" / "identity_within_axis_probe_residualized_scores.csv",
+            identity_probe_rows,
+        ),
+        (output_dir / "probes" / "surface_form_probe_scores.csv", surface_probe_rows),
+        (output_dir / "contrasts" / "contrast_full_residualized_scores.csv", contrast_full_rows),
+        (
+            output_dir / "contrasts" / "contrast_family_holdout_residualized_scores.csv",
+            contrast_holdout_rows,
+        ),
+    ]:
+        df = safe_read_csv(path)
+        if df is not None and not df.empty:
+            rows.extend(df.to_dict("records"))
+
+    return (
+        variance_rows,
+        axis_probe_rows,
+        identity_probe_rows,
+        surface_probe_rows,
+        contrast_full_rows,
+        contrast_holdout_rows,
+    )
+
+
+def write_incremental_outputs(
+    output_dir: Path,
+    variance_rows: list[dict[str, object]],
+    axis_probe_rows: list[dict[str, object]],
+    identity_probe_rows: list[dict[str, object]],
+    surface_probe_rows: list[dict[str, object]],
+    contrast_full_rows: list[dict[str, object]],
+    contrast_holdout_rows: list[dict[str, object]],
+) -> None:
+    probes_dir = output_dir / "probes"
+    contrasts_dir = output_dir / "contrasts"
+    probes_dir.mkdir(parents=True, exist_ok=True)
+    contrasts_dir.mkdir(parents=True, exist_ok=True)
+
+    pd.DataFrame(variance_rows).drop_duplicates().to_csv(
+        output_dir / "variance_decomposition.csv", index=False
+    )
+    pd.DataFrame(axis_probe_rows, columns=PROBE_COLUMNS).drop_duplicates().to_csv(
+        probes_dir / "axis_probe_residualized_scores.csv", index=False
+    )
+    pd.DataFrame(identity_probe_rows, columns=PROBE_COLUMNS).drop_duplicates().to_csv(
+        probes_dir / "identity_within_axis_probe_residualized_scores.csv", index=False
+    )
+    pd.DataFrame(surface_probe_rows, columns=PROBE_COLUMNS).drop_duplicates().to_csv(
+        probes_dir / "surface_form_probe_scores.csv", index=False
+    )
+    pd.DataFrame(contrast_holdout_rows, columns=CONTRAST_COLUMNS).drop_duplicates().to_csv(
+        contrasts_dir / "contrast_family_holdout_residualized_scores.csv", index=False
+    )
+    pd.DataFrame(contrast_full_rows, columns=CONTRAST_COLUMNS).drop_duplicates().to_csv(
+        contrasts_dir / "contrast_full_residualized_scores.csv", index=False
+    )
+
+
 def main() -> None:
     args = parse_args()
     metadata = load_metadata(args.activation_dir)
     layers = parse_layers(args.layers, args.activation_dir)
     selected_layers = parse_selected_layers(args.selected_layers_for_plots)
-    prepare_output_dir(args.output_dir, args.overwrite)
+    prepare_output_dir(args.output_dir, args.overwrite, args.resume)
 
-    variance_rows = []
-    axis_probe_rows = []
-    identity_probe_rows = []
-    surface_probe_rows = []
-    contrast_full_rows = []
-    contrast_holdout_rows = []
+    if args.resume:
+        (
+            variance_rows,
+            axis_probe_rows,
+            identity_probe_rows,
+            surface_probe_rows,
+            contrast_full_rows,
+            contrast_holdout_rows,
+        ) = read_existing_layer_csvs(args.output_dir)
+    else:
+        variance_rows = []
+        axis_probe_rows = []
+        identity_probe_rows = []
+        surface_probe_rows = []
+        contrast_full_rows = []
+        contrast_holdout_rows = []
     pca_evr_by_resid: dict[str, list[pd.DataFrame]] = {
         residualization: [] for residualization in RESIDUALIZATIONS
     }
+    if args.resume:
+        for residualization in RESIDUALIZATIONS:
+            evr_path = (
+                args.output_dir
+                / "pca_residualized"
+                / residualization
+                / "pca_explained_variance.csv"
+            )
+            evr_df = safe_read_csv(evr_path)
+            if evr_df is not None and not evr_df.empty:
+                pca_evr_by_resid[residualization].append(evr_df)
 
     for layer in tqdm(layers, desc="Diagnostic layers"):
         print(f"\nLayer {layer:02d}")
@@ -1067,6 +1179,25 @@ def main() -> None:
             full_rows, holdout_rows = run_contrasts(x, metadata, layer, residualization)
             contrast_full_rows.extend(full_rows)
             contrast_holdout_rows.extend(holdout_rows)
+
+        for residualization, evr_frames in pca_evr_by_resid.items():
+            if evr_frames:
+                pd.concat(evr_frames, ignore_index=True).drop_duplicates().to_csv(
+                    args.output_dir
+                    / "pca_residualized"
+                    / residualization
+                    / "pca_explained_variance.csv",
+                    index=False,
+                )
+        write_incremental_outputs(
+            args.output_dir,
+            variance_rows,
+            axis_probe_rows,
+            identity_probe_rows,
+            surface_probe_rows,
+            contrast_full_rows,
+            contrast_holdout_rows,
+        )
 
     pd.DataFrame(variance_rows).to_csv(
         args.output_dir / "variance_decomposition.csv", index=False
