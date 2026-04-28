@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+import time
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
@@ -142,10 +143,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--layers", default=None)
     parser.add_argument("--selected_layers_for_plots", default="0,8,16,24,32")
-    parser.add_argument("--probe_pca_dim", type=int, default=256)
+    parser.add_argument("--probe_pca_dim", type=int, default=64)
     parser.add_argument("--pca_components", type=int, default=10)
     parser.add_argument("--max_plot_points", type=int, default=15000)
     parser.add_argument("--make_umap", action="store_true")
+    parser.add_argument("--skip_probes", action="store_true")
+    parser.add_argument("--skip_axis_probes", action="store_true")
+    parser.add_argument("--skip_identity_within_axis_probes", action="store_true")
+    parser.add_argument("--skip_surface_form_probes", action="store_true")
+    parser.add_argument("--skip_template_id_probe", action="store_true")
+    parser.add_argument("--run_template_id_probe", action="store_true")
+    parser.add_argument("--skip_umap", action="store_true")
+    parser.add_argument("--skip_plots", action="store_true")
+    parser.add_argument("--only_variance", action="store_true")
+    parser.add_argument("--only_pca", action="store_true")
+    parser.add_argument("--only_contrasts", action="store_true")
+    parser.add_argument("--n_splits", type=int, default=3)
+    parser.add_argument("--max_probe_rows", type=int, default=None)
+    parser.add_argument("--solver", default="saga")
+    parser.add_argument("--max_iter", type=int, default=500)
+    parser.add_argument("--n_jobs", type=int, default=-1)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument(
         "--resume",
@@ -173,6 +190,10 @@ def parse_layers(layer_arg: str | None, activation_dir: Path) -> list[int]:
 
 def parse_selected_layers(layer_arg: str) -> list[int]:
     return [int(part.strip()) for part in layer_arg.split(",") if part.strip()]
+
+
+def elapsed(start: float) -> str:
+    return f"{time.perf_counter() - start:.1f}s"
 
 
 def prepare_output_dir(output_dir: Path, overwrite: bool, resume: bool) -> dict[str, Path]:
@@ -384,7 +405,10 @@ def run_pca(
 
 
 def make_probe_features(
-    x: np.ndarray, probe_pca_dim: int, random_seed: int, label: str
+    x: np.ndarray,
+    probe_pca_dim: int,
+    random_seed: int,
+    label: str,
 ) -> np.ndarray | None:
     if not np.isfinite(x).all():
         print(f"Skipping probes for {label}: non-finite activations.")
@@ -405,6 +429,35 @@ def make_probe_features(
     return np.asarray(np.nan_to_num(x_scaled), dtype=np.float32)
 
 
+def sample_probe_rows(
+    x: np.ndarray,
+    metadata: pd.DataFrame,
+    target: pd.Series,
+    max_probe_rows: int | None,
+    random_seed: int,
+    label: str,
+) -> tuple[np.ndarray, pd.DataFrame, pd.Series]:
+    if max_probe_rows is None or len(metadata) <= max_probe_rows:
+        print(f"Probe sampling {label}: using all {len(metadata):,} rows")
+        return x, metadata.reset_index(drop=True), target.reset_index(drop=True)
+    if max_probe_rows <= 0:
+        raise ValueError("--max_probe_rows must be positive when provided.")
+
+    sample = (
+        metadata.assign(_target=target.to_numpy())
+        .groupby("_target", group_keys=False, sort=False)
+        .sample(frac=1, random_state=random_seed)
+        .groupby("_target", group_keys=False, sort=False)
+        .head(max(1, int(np.ceil(max_probe_rows / target.nunique()))))
+    )
+    if len(sample) > max_probe_rows:
+        sample = sample.sample(n=max_probe_rows, random_state=random_seed)
+    sample = sample.sort_index()
+    idx = sample.index.to_numpy()
+    print(f"Probe sampling {label}: {len(metadata):,} -> {len(idx):,} rows")
+    return x[idx], metadata.iloc[idx].reset_index(drop=True), target.iloc[idx].reset_index(drop=True)
+
+
 def crossval_probe(
     x: np.ndarray,
     y: pd.Series,
@@ -413,13 +466,19 @@ def crossval_probe(
     residualization: str,
     split_type: str,
     task: str,
+    n_splits: int,
+    solver: str,
+    max_iter: int,
+    n_jobs: int,
     axis: str | None = None,
 ) -> dict[str, object] | None:
     y = y.reset_index(drop=True)
     groups = groups.reset_index(drop=True)
     if y.nunique() < 2 or groups.nunique() < 2:
         return None
-    n_splits = min(5, groups.nunique())
+    n_splits = min(n_splits, groups.nunique())
+    if n_splits < 2:
+        return None
     try:
         splits = list(GroupKFold(n_splits=n_splits).split(x, y, groups))
     except ValueError as exc:
@@ -435,9 +494,11 @@ def crossval_probe(
             if y.iloc[train_idx].nunique() < 2 or y.iloc[test_idx].nunique() < 2:
                 continue
             model = LogisticRegression(
-                max_iter=2000,
+                max_iter=max_iter,
                 class_weight="balanced",
-                solver="lbfgs",
+                solver=solver,
+                n_jobs=n_jobs,
+                multi_class="auto",
             )
             try:
                 model.fit(x[train_idx], y.iloc[train_idx])
@@ -471,55 +532,123 @@ def run_identity_probes(
     metadata: pd.DataFrame,
     layer: int,
     residualization: str,
+    args: argparse.Namespace,
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
     axis_rows = []
-    for group_col in ["template_id", "family"]:
-        result = crossval_probe(
+    if not args.skip_axis_probes:
+        x_axis, meta_axis, y_axis = sample_probe_rows(
             x_probe,
+            metadata,
             metadata["axis"],
-            metadata[group_col],
-            layer,
-            residualization,
-            f"group_by_{group_col}",
-            "axis_prediction",
+            args.max_probe_rows,
+            args.random_seed,
+            f"axis layer={layer} residualization={residualization}",
         )
-        if result:
-            axis_rows.append(result)
+        for group_col in tqdm(["template_id", "family"], desc="axis probe splits", leave=False):
+            print(
+                "Starting axis probes: "
+                f"layer={layer} residualization={residualization} "
+                f"split={group_col} n={len(meta_axis):,} dim={x_axis.shape[1]} "
+                f"classes={y_axis.nunique()}"
+            )
+            start = time.perf_counter()
+            result = crossval_probe(
+                x_axis,
+                y_axis,
+                meta_axis[group_col],
+                layer,
+                residualization,
+                f"group_by_{group_col}",
+                "axis_prediction",
+                n_splits=args.n_splits,
+                solver=args.solver,
+                max_iter=args.max_iter,
+                n_jobs=args.n_jobs,
+            )
+            print(f"Finished axis probes in {elapsed(start)}")
+            if result:
+                axis_rows.append(result)
 
     identity_rows = []
-    for axis, axis_meta in metadata.groupby("axis", sort=True):
-        if axis_meta["identity_id"].nunique() < 2:
-            continue
-        idx = axis_meta.index.to_numpy()
-        result = crossval_probe(
-            x_probe[idx],
-            axis_meta["identity_id"].reset_index(drop=True),
-            axis_meta["template_id"].reset_index(drop=True),
-            layer,
-            residualization,
-            "group_by_template_id",
-            "identity_within_axis_prediction",
-            axis=axis,
-        )
-        if result:
-            identity_rows.append(result)
+    if not args.skip_identity_within_axis_probes:
+        axis_groups = list(metadata.groupby("axis", sort=True))
+        for axis, axis_meta in tqdm(axis_groups, desc="identity probes by axis", leave=False):
+            if axis_meta["identity_id"].nunique() < 2:
+                continue
+            idx = axis_meta.index.to_numpy()
+            x_axis = x_probe[idx]
+            y_axis = axis_meta["identity_id"].reset_index(drop=True)
+            meta_axis = axis_meta.reset_index(drop=True)
+            x_axis, meta_axis, y_axis = sample_probe_rows(
+                x_axis,
+                meta_axis,
+                y_axis,
+                args.max_probe_rows,
+                args.random_seed,
+                f"identity axis={axis} layer={layer} residualization={residualization}",
+            )
+            print(
+                "Starting identity-within-axis probes: "
+                f"layer={layer} residualization={residualization} axis={axis} "
+                f"n={len(meta_axis):,} dim={x_axis.shape[1]} classes={y_axis.nunique()}"
+            )
+            start = time.perf_counter()
+            result = crossval_probe(
+                x_axis,
+                y_axis,
+                meta_axis["template_id"],
+                layer,
+                residualization,
+                "group_by_template_id",
+                "identity_within_axis_prediction",
+                n_splits=args.n_splits,
+                solver=args.solver,
+                max_iter=args.max_iter,
+                n_jobs=args.n_jobs,
+                axis=axis,
+            )
+            print(f"Finished identity-within-axis probes in {elapsed(start)}")
+            if result:
+                identity_rows.append(result)
     return axis_rows, identity_rows
 
 
 def run_surface_probes(
-    x_probe: np.ndarray, metadata: pd.DataFrame, layer: int
+    x_probe: np.ndarray, metadata: pd.DataFrame, layer: int, args: argparse.Namespace
 ) -> list[dict[str, object]]:
     rows = []
-    for task_col in ["required_form", "family", "template_id"]:
-        result = crossval_probe(
+    task_cols = ["required_form", "family"]
+    if args.run_template_id_probe and not args.skip_template_id_probe:
+        task_cols.append("template_id")
+    for task_col in tqdm(task_cols, desc="surface probes", leave=False):
+        x_task, meta_task, y_task = sample_probe_rows(
             x_probe,
+            metadata,
             metadata[task_col],
-            metadata["identity_id"],
+            args.max_probe_rows,
+            args.random_seed,
+            f"surface task={task_col} layer={layer}",
+        )
+        print(
+            "Starting surface-form probe: "
+            f"layer={layer} task={task_col} n={len(meta_task):,} "
+            f"dim={x_task.shape[1]} classes={y_task.nunique()}"
+        )
+        start = time.perf_counter()
+        result = crossval_probe(
+            x_task,
+            y_task,
+            meta_task["identity_id"],
             layer,
             "raw",
             "group_by_identity_id",
             f"{task_col}_prediction",
+            n_splits=args.n_splits,
+            solver=args.solver,
+            max_iter=args.max_iter,
+            n_jobs=args.n_jobs,
         )
+        print(f"Finished surface-form probe in {elapsed(start)}")
         if result:
             rows.append(result)
     return rows
@@ -577,7 +706,7 @@ def run_contrasts(
     holdout_rows = []
     global_mean = x.mean(axis=0, keepdims=True)
 
-    for identity_a, identity_b in CONTRASTS:
+    for identity_a, identity_b in tqdm(CONTRASTS, desc="contrasts", leave=False):
         if identity_a not in identity_set or identity_b not in identity_set:
             continue
         contrast_name = f"{identity_a}_vs_{identity_b}"
@@ -1016,6 +1145,22 @@ def write_run_config(args: argparse.Namespace, layers: list[int], metadata: pd.D
         "selected_layers_for_plots": parse_selected_layers(args.selected_layers_for_plots),
         "probe_pca_dim": args.probe_pca_dim,
         "pca_components": args.pca_components,
+        "n_splits": args.n_splits,
+        "max_probe_rows": args.max_probe_rows,
+        "solver": args.solver,
+        "max_iter": args.max_iter,
+        "n_jobs": args.n_jobs,
+        "skip_probes": args.skip_probes,
+        "skip_axis_probes": args.skip_axis_probes,
+        "skip_identity_within_axis_probes": args.skip_identity_within_axis_probes,
+        "skip_surface_form_probes": args.skip_surface_form_probes,
+        "skip_template_id_probe": args.skip_template_id_probe,
+        "run_template_id_probe": args.run_template_id_probe,
+        "skip_umap": args.skip_umap,
+        "skip_plots": args.skip_plots,
+        "only_variance": args.only_variance,
+        "only_pca": args.only_pca,
+        "only_contrasts": args.only_contrasts,
         "max_plot_points": args.max_plot_points,
         "make_umap": args.make_umap,
         "resume": args.resume,
@@ -1146,39 +1291,101 @@ def main() -> None:
 
     for layer in tqdm(layers, desc="Diagnostic layers"):
         print(f"\nLayer {layer:02d}")
+        layer_start = time.perf_counter()
+        start = time.perf_counter()
         x_raw = load_layer(args.activation_dir, layer, len(metadata))
-        variance_rows.extend(variance_decomposition_layer(x_raw, metadata, layer))
+        print(f"Loaded layer {layer:02d} in {elapsed(start)} shape={x_raw.shape}")
 
-        for residualization, group_col in RESIDUALIZATIONS.items():
+        layer_variance = float(np.var(x_raw))
+        if np.isclose(layer_variance, 0.0):
+            print(
+                f"Layer {layer:02d} has approximately zero variance "
+                f"(var={layer_variance:.3e}); skipping downstream diagnostics."
+            )
+            start = time.perf_counter()
+            variance_rows.extend(variance_decomposition_layer(x_raw, metadata, layer))
+            print(f"Variance decomposition finished in {elapsed(start)}")
+            write_incremental_outputs(
+                args.output_dir,
+                variance_rows,
+                axis_probe_rows,
+                identity_probe_rows,
+                surface_probe_rows,
+                contrast_full_rows,
+                contrast_holdout_rows,
+            )
+            continue
+
+        start = time.perf_counter()
+        variance_rows.extend(variance_decomposition_layer(x_raw, metadata, layer))
+        print(f"Variance decomposition finished in {elapsed(start)}")
+
+        if args.only_variance:
+            write_incremental_outputs(
+                args.output_dir,
+                variance_rows,
+                axis_probe_rows,
+                identity_probe_rows,
+                surface_probe_rows,
+                contrast_full_rows,
+                contrast_holdout_rows,
+            )
+            continue
+
+        start = time.perf_counter()
+        residualized_variants = {}
+        for residualization, group_col in tqdm(
+            RESIDUALIZATIONS.items(),
+            desc=f"residualizing layer {layer:02d}",
+            leave=False,
+        ):
+            residualized_variants[residualization] = residualize(x_raw, metadata, group_col)
+        print(f"Residualization finished in {elapsed(start)}")
+
+        for residualization, x in tqdm(
+            residualized_variants.items(),
+            desc=f"residualization types layer {layer:02d}",
+            leave=False,
+        ):
             print(f"  {residualization}")
-            x = residualize(x_raw, metadata, group_col)
-            pca_dir = args.output_dir / "pca_residualized" / residualization
-            pca_evr_by_resid[residualization].append(
-                run_pca(
-                    x,
-                    metadata,
-                    layer,
-                    pca_dir,
-                    args.pca_components,
-                    args.random_seed,
-                )
-            )
-            probe_features = make_probe_features(
-                x, args.probe_pca_dim, args.random_seed, f"{residualization} layer {layer}"
-            )
-            if probe_features is not None:
-                axis_rows, identity_rows = run_identity_probes(
-                    probe_features, metadata, layer, residualization
-                )
-                axis_probe_rows.extend(axis_rows)
-                identity_probe_rows.extend(identity_rows)
-                if residualization == "raw":
-                    surface_probe_rows.extend(
-                        run_surface_probes(probe_features, metadata, layer)
+            if not args.only_contrasts:
+                start = time.perf_counter()
+                pca_dir = args.output_dir / "pca_residualized" / residualization
+                pca_evr_by_resid[residualization].append(
+                    run_pca(
+                        x,
+                        metadata,
+                        layer,
+                        pca_dir,
+                        args.pca_components,
+                        args.random_seed,
                     )
-            full_rows, holdout_rows = run_contrasts(x, metadata, layer, residualization)
-            contrast_full_rows.extend(full_rows)
-            contrast_holdout_rows.extend(holdout_rows)
+                )
+                print(f"  PCA finished in {elapsed(start)}")
+
+            if not args.only_pca and not args.only_contrasts and not args.skip_probes:
+                start = time.perf_counter()
+                probe_features = make_probe_features(
+                    x, args.probe_pca_dim, args.random_seed, f"{residualization} layer {layer}"
+                )
+                if probe_features is not None:
+                    axis_rows, identity_rows = run_identity_probes(
+                        probe_features, metadata, layer, residualization, args
+                    )
+                    axis_probe_rows.extend(axis_rows)
+                    identity_probe_rows.extend(identity_rows)
+                    if residualization == "raw" and not args.skip_surface_form_probes:
+                        surface_probe_rows.extend(
+                            run_surface_probes(probe_features, metadata, layer, args)
+                        )
+                print(f"  Probes finished in {elapsed(start)}")
+
+            if not args.only_pca and not args.only_variance:
+                start = time.perf_counter()
+                full_rows, holdout_rows = run_contrasts(x, metadata, layer, residualization)
+                contrast_full_rows.extend(full_rows)
+                contrast_holdout_rows.extend(holdout_rows)
+                print(f"  Contrasts finished in {elapsed(start)}")
 
         for residualization, evr_frames in pca_evr_by_resid.items():
             if evr_frames:
@@ -1198,6 +1405,7 @@ def main() -> None:
             contrast_full_rows,
             contrast_holdout_rows,
         )
+        print(f"Layer {layer:02d} complete in {elapsed(layer_start)}")
 
     pd.DataFrame(variance_rows).to_csv(
         args.output_dir / "variance_decomposition.csv", index=False
@@ -1232,23 +1440,31 @@ def main() -> None:
         contrasts_dir / "contrast_full_residualized_scores.csv", index=False
     )
 
-    print("\nPlotting diagnostics")
-    plot_variance_decomposition(args.output_dir)
-    plot_probe_diagnostics(args.output_dir)
-    plot_contrast_diagnostics(args.output_dir)
-    plot_axis_specific_pca(
-        args.output_dir,
-        selected_layers,
-        args.max_plot_points,
-        args.random_seed,
-    )
-    if args.make_umap:
+    if not args.skip_plots:
+        start = time.perf_counter()
+        print("\nPlotting diagnostics")
+        plot_variance_decomposition(args.output_dir)
+        plot_probe_diagnostics(args.output_dir)
+        plot_contrast_diagnostics(args.output_dir)
+        plot_axis_specific_pca(
+            args.output_dir,
+            selected_layers,
+            args.max_plot_points,
+            args.random_seed,
+        )
+        print(f"Static plots finished in {elapsed(start)}")
+
+    if args.make_umap and not args.skip_umap and not args.skip_plots:
+        start = time.perf_counter()
         plot_axis_specific_umap(
             args.output_dir,
             selected_layers,
             args.max_plot_points,
             args.random_seed,
         )
+        print(f"UMAP plots finished in {elapsed(start)}")
+    elif args.skip_umap:
+        print("UMAP skipped due to --skip_umap.")
 
     print("Alias/lexical holdout skipped: no alias-expanded prompts detected.")
 
@@ -1256,5 +1472,20 @@ def main() -> None:
     print(f"\nDiagnostics complete: {args.output_dir}")
 
 
+# Recommended fast command:
+#
+# python /workspace/status_mi/scripts/analyze_identity_geometry_diagnostics.py \
+#   --activation_dir /workspace/status_mi/results/activations/llama-3.1-8b/identity_prompts_final_token/ \
+#   --geometry_dir /workspace/status_mi/results/geometry/llama-3.1-8b/identity_prompts_final_token/ \
+#   --output_dir /workspace/status_mi/results/geometry/llama-3.1-8b/identity_prompts_final_token/diagnostics_fast/ \
+#   --layers 8,16,24,32 \
+#   --selected_layers_for_plots 8,16,24,32 \
+#   --skip_umap \
+#   --skip_identity_within_axis_probes \
+#   --skip_template_id_probe \
+#   --probe_pca_dim 64 \
+#   --max_probe_rows 5000 \
+#   --n_splits 3 \
+#   --overwrite
 if __name__ == "__main__":
     main()
