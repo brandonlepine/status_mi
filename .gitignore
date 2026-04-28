@@ -40,3 +40,4 @@ temp/
 
 # Keep source data and generated prompt CSVs trackable unless explicitly ignored later.
 !data/mi_identity_prompts.csv
+status_mi_runpod_figures_latest/
