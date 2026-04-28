@@ -490,6 +490,7 @@ def crossval_probe(
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", ConvergenceWarning)
         warnings.simplefilter("ignore", RuntimeWarning)
+        warnings.simplefilter("ignore", FutureWarning)
         for train_idx, test_idx in splits:
             if y.iloc[train_idx].nunique() < 2 or y.iloc[test_idx].nunique() < 2:
                 continue

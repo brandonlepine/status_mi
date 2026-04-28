@@ -29,6 +29,9 @@ credentials.json
 models/
 results/
 status_mi_runpod_results/
+status_mi_runpod_diagnostics_fast/
+status_mi_runpod_diagnostics_fast_figures/
+status_mi_runpod_figures_latest/
 checkpoints/
 wandb/
 runs/
