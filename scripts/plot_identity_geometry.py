@@ -8,6 +8,7 @@ import math
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 import numpy as np
 import pandas as pd
 from pandas.errors import EmptyDataError
@@ -35,6 +36,18 @@ AXES_TO_PLOT = [
     "religion",
     "nationality",
 ]
+OKABE_ITO = [
+    "#0072B2",  # blue
+    "#E69F00",  # orange
+    "#009E73",  # bluish green
+    "#CC79A7",  # reddish purple
+    "#56B4E9",  # sky blue
+    "#D55E00",  # vermillion
+    "#F0E442",  # yellow
+    "#000000",  # black
+]
+MARKERS = ["o", "s", "^", "D", "P", "X", "v", "<", ">", "*", "h", "8"]
+LINESTYLES = ["-", "--", "-.", ":"]
 
 
 def parse_args() -> argparse.Namespace:
@@ -49,6 +62,9 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="If umap-learn is installed, also make UMAP plots from PCA coordinates.",
     )
+    parser.add_argument("--umap_neighbors", type=int, default=30)
+    parser.add_argument("--umap_min_dist", type=float, default=0.1)
+    parser.add_argument("--umap_metric", default="cosine")
     return parser.parse_args()
 
 
@@ -96,11 +112,63 @@ def sample_points(df: pd.DataFrame, max_points: int, seed: int = 42) -> pd.DataF
     return df.sample(n=max_points, random_state=seed)
 
 
-def category_colors(values: pd.Series) -> dict[str, tuple[float, float, float, float]]:
+def category_colors(values: pd.Series) -> dict[str, str]:
     categories = sorted(values.astype(str).unique())
-    cmap_name = "tab20" if len(categories) <= 20 else "hsv"
-    cmap = plt.get_cmap(cmap_name, max(len(categories), 1))
-    return {category: cmap(i) for i, category in enumerate(categories)}
+    return {category: OKABE_ITO[i % len(OKABE_ITO)] for i, category in enumerate(categories)}
+
+
+def category_markers(values: pd.Series) -> dict[str, str]:
+    categories = sorted(values.astype(str).unique())
+    return {category: MARKERS[i % len(MARKERS)] for i, category in enumerate(categories)}
+
+
+def category_linestyles(values: pd.Series) -> dict[str, str]:
+    categories = sorted(values.astype(str).unique())
+    return {category: LINESTYLES[i % len(LINESTYLES)] for i, category in enumerate(categories)}
+
+
+def add_category_legend(
+    ax: plt.Axes,
+    labels: list[str],
+    color_map: dict[str, str],
+    marker_map: dict[str, str] | None = None,
+    linestyle_map: dict[str, str] | None = None,
+    max_legend_items: int = 60,
+) -> None:
+    if len(labels) > max_legend_items:
+        ax.text(
+            1.02,
+            1.0,
+            f"{len(labels)} categories\nlegend omitted",
+            transform=ax.transAxes,
+            va="top",
+            fontsize=8,
+        )
+        return
+
+    handles = []
+    for label in labels:
+        handles.append(
+            Line2D(
+                [0],
+                [0],
+                color=color_map[label],
+                marker=marker_map[label] if marker_map else None,
+                linestyle=linestyle_map[label] if linestyle_map else "",
+                linewidth=2 if linestyle_map else 0,
+                markersize=6,
+                label=label,
+            )
+        )
+    ncol = 1 if len(labels) <= 20 else 2
+    ax.legend(
+        handles=handles,
+        bbox_to_anchor=(1.02, 1),
+        loc="upper left",
+        frameon=False,
+        fontsize=8,
+        ncol=ncol,
+    )
 
 
 def save_figure(fig: plt.Figure, path_no_suffix: Path) -> None:
@@ -116,27 +184,38 @@ def scatter_pca(
     title: str,
     path_no_suffix: Path,
     max_points: int,
-    color_map: dict[str, tuple[float, float, float, float]] | None = None,
+    color_map: dict[str, str] | None = None,
     alpha: float = 0.3,
     point_size: float = 8,
     show_legend: bool = True,
 ) -> None:
     plot_df = sample_points(df, max_points)
     color_map = color_map or category_colors(df[hue_col])
-    colors = plot_df[hue_col].astype(str).map(color_map)
+    marker_map = category_markers(df[hue_col])
 
     fig, ax = plt.subplots(figsize=(10, 7))
-    ax.scatter(plot_df["PC1"], plot_df["PC2"], c=list(colors), s=point_size, alpha=alpha, linewidths=0)
+    for label, group in plot_df.groupby(hue_col, sort=True):
+        label = str(label)
+        ax.scatter(
+            group["PC1"],
+            group["PC2"],
+            c=color_map[label],
+            marker=marker_map[label],
+            s=point_size,
+            alpha=alpha,
+            linewidths=0,
+        )
     ax.set_title(title)
     ax.set_xlabel("PC1")
     ax.set_ylabel("PC2")
 
-    if show_legend and df[hue_col].nunique() <= 20:
-        handles = [
-            plt.Line2D([0], [0], marker="o", linestyle="", color=color, label=label)
-            for label, color in color_map.items()
-        ]
-        ax.legend(handles=handles, bbox_to_anchor=(1.02, 1), loc="upper left", frameon=False)
+    if show_legend:
+        add_category_legend(
+            ax,
+            sorted(df[hue_col].astype(str).unique()),
+            color_map,
+            marker_map=marker_map,
+        )
 
     save_figure(fig, path_no_suffix)
 
@@ -155,6 +234,7 @@ def progression_plot(
 
     combined = pd.concat([pca_by_layer[layer] for layer in available_layers], ignore_index=True)
     color_map = category_colors(combined[hue_col])
+    marker_map = category_markers(combined[hue_col])
     n_cols = min(3, len(available_layers))
     n_rows = math.ceil(len(available_layers) / n_cols)
     fig, axes = plt.subplots(
@@ -166,8 +246,17 @@ def progression_plot(
 
     for ax, layer in zip(axes.ravel(), available_layers):
         df = sample_points(pca_by_layer[layer], max_points)
-        colors = df[hue_col].astype(str).map(color_map)
-        ax.scatter(df["PC1"], df["PC2"], c=list(colors), s=6, alpha=0.3, linewidths=0)
+        for label, group in df.groupby(hue_col, sort=True):
+            label = str(label)
+            ax.scatter(
+                group["PC1"],
+                group["PC2"],
+                c=color_map[label],
+                marker=marker_map[label],
+                s=6,
+                alpha=0.3,
+                linewidths=0,
+            )
         ax.set_title(f"Layer {layer:02d}")
         ax.set_xlabel("PC1")
         ax.set_ylabel("PC2")
@@ -176,6 +265,12 @@ def progression_plot(
         ax.axis("off")
 
     fig.suptitle(title)
+    add_category_legend(
+        axes.ravel()[min(len(available_layers), len(axes.ravel())) - 1],
+        sorted(combined[hue_col].astype(str).unique()),
+        color_map,
+        marker_map=marker_map,
+    )
     save_figure(fig, path_no_suffix)
 
 
@@ -238,7 +333,7 @@ def plot_centroids(
 ) -> None:
     plot_df = sample_points(df, max_points)
     color_map = category_colors(df["axis"])
-    colors = plot_df["axis"].astype(str).map(color_map)
+    marker_map = category_markers(df["axis"])
     centroids = (
         df.groupby(["identity_id", "axis"], sort=True)[["PC1", "PC2"]]
         .mean()
@@ -246,20 +341,38 @@ def plot_centroids(
     )
 
     fig, ax = plt.subplots(figsize=(10, 7))
-    ax.scatter(plot_df["PC1"], plot_df["PC2"], c=list(colors), s=6, alpha=0.18, linewidths=0)
-    centroid_colors = centroids["axis"].astype(str).map(color_map)
-    ax.scatter(
-        centroids["PC1"],
-        centroids["PC2"],
-        c=list(centroid_colors),
-        s=45,
-        alpha=0.95,
-        edgecolors="black",
-        linewidths=0.4,
-    )
+    for axis, group in plot_df.groupby("axis", sort=True):
+        axis = str(axis)
+        ax.scatter(
+            group["PC1"],
+            group["PC2"],
+            c=color_map[axis],
+            marker=marker_map[axis],
+            s=6,
+            alpha=0.18,
+            linewidths=0,
+        )
+    for axis, group in centroids.groupby("axis", sort=True):
+        axis = str(axis)
+        ax.scatter(
+            group["PC1"],
+            group["PC2"],
+            c=color_map[axis],
+            marker=marker_map[axis],
+            s=55,
+            alpha=0.95,
+            edgecolors="black",
+            linewidths=0.5,
+        )
     ax.set_title(title)
     ax.set_xlabel("PC1")
     ax.set_ylabel("PC2")
+    add_category_legend(
+        ax,
+        sorted(df["axis"].astype(str).unique()),
+        color_map,
+        marker_map=marker_map,
+    )
     save_figure(fig, path_no_suffix)
 
 
@@ -282,7 +395,7 @@ def plot_identity_axis_pcas(
             if axis_df.empty:
                 continue
             axis_layers[layer] = axis_df
-            hue_col = "canonical_label" if axis_df["canonical_label"].nunique() <= 30 else "identity_id"
+            hue_col = "canonical_label" if axis_df["canonical_label"].nunique() <= 60 else "identity_id"
             scatter_pca(
                 axis_df,
                 hue_col,
@@ -291,7 +404,7 @@ def plot_identity_axis_pcas(
                 max_points=max_points,
                 alpha=0.4,
                 point_size=10,
-                show_legend=axis_df[hue_col].nunique() <= 20,
+                show_legend=axis_df[hue_col].nunique() <= 60,
             )
         if axis_layers:
             progression_plot(
@@ -319,24 +432,30 @@ def line_plot(
         return
 
     fig, ax = plt.subplots(figsize=figsize)
-    if sns is not None:
-        sns.lineplot(
-            data=df,
-            x=x_col,
-            y=y_col,
-            hue=hue_col,
-            marker=None,
+    color_map = category_colors(df[hue_col])
+    linestyle_map = category_linestyles(df[hue_col])
+    for label, group in df.groupby(hue_col, sort=True):
+        label = str(label)
+        group = group.sort_values(x_col)
+        ax.plot(
+            group[x_col],
+            group[y_col],
+            color=color_map[label],
+            linestyle=linestyle_map[label],
             linewidth=2,
-            ax=ax,
+            label=label,
         )
-    else:
-        for label, group in df.groupby(hue_col, sort=True):
-            ax.plot(group[x_col], group[y_col], linewidth=2, label=label)
-        ax.legend(frameon=False, bbox_to_anchor=(1.02, 1), loc="upper left")
     ax.set_title(title)
     ax.set_xlabel("Layer")
     ax.set_ylabel(ylabel)
     ax.grid(alpha=0.2, linewidth=0.6)
+    add_category_legend(
+        ax,
+        sorted(df[hue_col].astype(str).unique()),
+        color_map,
+        linestyle_map=linestyle_map,
+        max_legend_items=40,
+    )
     save_figure(fig, path_no_suffix)
 
 
@@ -474,6 +593,9 @@ def plot_umap_if_available(
     pca_by_layer: dict[int, pd.DataFrame],
     output_dir: Path,
     max_points: int,
+    n_neighbors: int,
+    min_dist: float,
+    metric: str,
 ) -> None:
     try:
         import umap  # type: ignore
@@ -488,19 +610,91 @@ def plot_umap_if_available(
         if len(pc_cols) < 2:
             continue
         plot_df = sample_points(df, max_points)
-        coords = umap.UMAP(random_state=42).fit_transform(plot_df[pc_cols].to_numpy())
+        reducer = umap.UMAP(
+            n_neighbors=n_neighbors,
+            min_dist=min_dist,
+            metric=metric,
+            random_state=None,
+            n_jobs=-1,
+        )
+        coords = reducer.fit_transform(plot_df[pc_cols].to_numpy())
         umap_df = plot_df.copy()
         umap_df["UMAP1"] = coords[:, 0]
         umap_df["UMAP2"] = coords[:, 1]
-        color_map = category_colors(umap_df["axis"])
-        colors = umap_df["axis"].astype(str).map(color_map)
 
+        for hue_col, suffix, title_label in [
+            ("axis", "axis", "identity axis"),
+            ("family", "family", "template family"),
+        ]:
+            color_map = category_colors(umap_df[hue_col])
+            marker_map = category_markers(umap_df[hue_col])
+            fig, ax = plt.subplots(figsize=(10, 7))
+            for label, group in umap_df.groupby(hue_col, sort=True):
+                label = str(label)
+                ax.scatter(
+                    group["UMAP1"],
+                    group["UMAP2"],
+                    c=color_map[label],
+                    marker=marker_map[label],
+                    s=7,
+                    alpha=0.35,
+                    linewidths=0,
+                )
+            ax.set_title(
+                f"UMAP of prompt-level PCA coordinates by {title_label} - "
+                f"Layer {layer:02d}"
+            )
+            ax.set_xlabel("UMAP1")
+            ax.set_ylabel("UMAP2")
+            add_category_legend(
+                ax,
+                sorted(umap_df[hue_col].astype(str).unique()),
+                color_map,
+                marker_map=marker_map,
+            )
+            save_figure(fig, umap_dir / f"umap_{suffix}_layer_{layer:02d}")
+
+        centroids = (
+            umap_df.groupby(["identity_id", "axis"], sort=True)[["UMAP1", "UMAP2"]]
+            .mean()
+            .reset_index()
+        )
+        color_map = category_colors(umap_df["axis"])
+        marker_map = category_markers(umap_df["axis"])
         fig, ax = plt.subplots(figsize=(10, 7))
-        ax.scatter(umap_df["UMAP1"], umap_df["UMAP2"], c=list(colors), s=6, alpha=0.3, linewidths=0)
-        ax.set_title(f"UMAP by axis - Layer {layer:02d}")
+        for axis, group in umap_df.groupby("axis", sort=True):
+            axis = str(axis)
+            ax.scatter(
+                group["UMAP1"],
+                group["UMAP2"],
+                c=color_map[axis],
+                marker=marker_map[axis],
+                s=5,
+                alpha=0.15,
+                linewidths=0,
+            )
+        for axis, group in centroids.groupby("axis", sort=True):
+            axis = str(axis)
+            ax.scatter(
+                group["UMAP1"],
+                group["UMAP2"],
+                c=color_map[axis],
+                marker=marker_map[axis],
+                s=55,
+                alpha=0.95,
+                edgecolors="black",
+                linewidths=0.5,
+            )
+        ax.set_title(f"UMAP by axis with identity centroids - Layer {layer:02d}")
         ax.set_xlabel("UMAP1")
         ax.set_ylabel("UMAP2")
-        save_figure(fig, umap_dir / f"umap_axis_layer_{layer:02d}")
+        add_category_legend(
+            ax,
+            sorted(umap_df["axis"].astype(str).unique()),
+            color_map,
+            marker_map=marker_map,
+        )
+        save_figure(fig, umap_dir / f"umap_axis_centroids_layer_{layer:02d}")
 
 
 def main() -> None:
@@ -525,7 +719,14 @@ def main() -> None:
     plot_contrasts(args.geometry_dir, subdirs["root"])
 
     if args.make_umap:
-        plot_umap_if_available(pca_by_layer, subdirs["root"], args.max_points_per_plot)
+        plot_umap_if_available(
+            pca_by_layer,
+            subdirs["root"],
+            args.max_points_per_plot,
+            n_neighbors=args.umap_neighbors,
+            min_dist=args.umap_min_dist,
+            metric=args.umap_metric,
+        )
     else:
         print("UMAP plots not requested. Re-run with --make_umap to create figures/umap outputs.")
 
