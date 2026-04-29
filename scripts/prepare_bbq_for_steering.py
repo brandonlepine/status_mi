@@ -117,10 +117,21 @@ MANUAL_ALIASES = {
     "low socioeconomic status": "ses_low_income",
     "low income": "ses_low_income",
     "poor": "ses_low_income",
+    "lowses": "ses_low_income",
     "rich": "ses_rich",
     "high socioeconomic status": "ses_high_socioeconomic_status",
+    "highses": "ses_high_socioeconomic_status",
     "upper class": "ses_upper_class",
     "lower class": "ses_lower_class",
+    "old": "age_old",
+    "nonold": "age_nonold",
+    "non old": "age_nonold",
+    "african": "race_black",
+    "arab": "race_arab",
+    "asia pacific": "nationality_asia_pacific",
+    "asiapacific": "nationality_asia_pacific",
+    "africa": "nationality_african",
+    "europe": "nationality_european",
 }
 
 
@@ -253,26 +264,107 @@ def identity_for(label: object, aliases: dict[str, str]) -> tuple[str, str, str]
     for alias, identity_id in aliases.items():
         if alias.replace(" ", "") == compact:
             return identity_id, "alias", label_norm
+    for component in identity_components(label):
+        if component in aliases:
+            return aliases[component], "component_alias", label_norm
     return "", "unmapped", label_norm
+
+
+def identity_components(label: object) -> list[str]:
+    """Split BBQ compound labels such as F-Black and lowSES-Hispanic."""
+    raw = str(label or "").strip()
+    pieces = [raw]
+    pieces.extend(re.split(r"[-_/+]", raw))
+    normalized = []
+    for piece in pieces:
+        norm = norm_text(piece)
+        if norm:
+            normalized.append(norm)
+        compact = norm.replace(" ", "")
+        if compact and compact != norm:
+            normalized.append(compact)
+    component_aliases = {
+        "f": "female",
+        "m": "male",
+        "nonold": "nonold",
+        "lowses": "lowses",
+        "highses": "highses",
+    }
+    normalized.extend(component_aliases.get(item, item) for item in list(normalized))
+    return list(dict.fromkeys(normalized))
+
+
+def identity_component_ids(label: object, aliases: dict[str, str]) -> set[str]:
+    ids = set()
+    for component in identity_components(label):
+        identity_id = aliases.get(component)
+        if identity_id:
+            ids.add(identity_id)
+    return ids
+
+
+def identity_axis(identity_id: str) -> str:
+    if identity_id.startswith("disability_"):
+        return "disability_status"
+    if identity_id.startswith(("gender_", "sex_")):
+        return "gender_identity"
+    if identity_id.startswith("appearance_"):
+        return "physical_appearance"
+    if identity_id.startswith("race_"):
+        return "race_ethnicity"
+    if identity_id.startswith("religion_"):
+        return "religion"
+    if identity_id.startswith("sexuality_"):
+        return "sexual_orientation"
+    if identity_id.startswith("ses_"):
+        return "socioeconomic_status"
+    if identity_id.startswith("nationality_"):
+        return "nationality"
+    if identity_id.startswith("age_"):
+        return "age"
+    return identity_id.split("_", 1)[0] if "_" in identity_id else ""
+
+
+def choose_identity_for_role(answer_row: dict[str, Any], preferred_ids: set[str] | None = None, preferred_axis: str | None = None) -> str:
+    component_ids = set(answer_row.get("component_identity_ids", []))
+    identity_id = str(answer_row.get("identity_id", ""))
+    candidates = [identity_id] + sorted(component_ids)
+    candidates = [candidate for candidate in candidates if candidate and candidate != "unknown"]
+    if preferred_ids:
+        for candidate in candidates:
+            if candidate in preferred_ids:
+                return candidate
+    if preferred_axis:
+        for candidate in candidates:
+            if identity_axis(candidate) == preferred_axis:
+                return candidate
+    return candidates[0] if candidates else ""
 
 
 def find_answer_indices(answer_info: dict[str, Any], stereotyped_groups: list[str], aliases: dict[str, str]) -> dict[str, Any]:
     answer_rows = []
     stereo_norms = {norm_text(item) for item in stereotyped_groups}
     stereo_ids = {identity_for(item, aliases)[0] for item in stereotyped_groups if identity_for(item, aliases)[0]}
+    for item in stereotyped_groups:
+        stereo_ids.update(identity_component_ids(item, aliases))
     for idx in range(3):
         key = f"ans{idx}"
         info = answer_info.get(key, ["", ""])
         answer_text = info[0] if isinstance(info, list) and info else ""
         group_label = info[1] if isinstance(info, list) and len(info) > 1 else answer_text
         identity_id, map_status, normalized = identity_for(group_label, aliases)
+        component_ids = identity_component_ids(group_label, aliases) | identity_component_ids(answer_text, aliases)
         is_unknown = identity_id == "unknown" or norm_text(answer_text) in UNKNOWN_ALIASES
-        is_stereo = normalized in stereo_norms or identity_id in stereo_ids
+        is_stereo = normalized in stereo_norms or identity_id in stereo_ids or bool(component_ids & stereo_ids)
+        if not is_stereo:
+            answer_components = set(identity_components(group_label)) | set(identity_components(answer_text))
+            is_stereo = bool(answer_components & stereo_norms)
         answer_rows.append({
             "idx": idx,
             "answer_text": answer_text,
             "group_label": group_label,
             "identity_id": identity_id,
+            "component_identity_ids": sorted(component_ids),
             "map_status": map_status,
             "is_unknown": is_unknown,
             "is_stereo": is_stereo,
@@ -282,15 +374,18 @@ def find_answer_indices(answer_info: dict[str, Any], stereotyped_groups: list[st
     nonstereo = next((r["idx"] for r in answer_rows if not r["is_stereo"] and not r["is_unknown"]), None)
     target = answer_rows[stereo] if stereo is not None else {}
     nontarget = answer_rows[nonstereo] if nonstereo is not None else {}
+    target_identity_id = choose_identity_for_role(target, preferred_ids=stereo_ids)
+    target_axis = identity_axis(target_identity_id)
+    nontarget_identity_id = choose_identity_for_role(nontarget, preferred_axis=target_axis)
     return {
         "answer_rows": answer_rows,
         "unknown_answer_idx": unknown,
         "stereotyped_answer_idx": stereo,
         "nonstereotyped_answer_idx": nonstereo,
-        "target_identity_id": target.get("identity_id", ""),
+        "target_identity_id": target_identity_id,
         "target_identity_label": target.get("group_label", ""),
         "target_answer_idx": stereo,
-        "nontarget_identity_id": nontarget.get("identity_id", ""),
+        "nontarget_identity_id": nontarget_identity_id,
         "nontarget_identity_label": nontarget.get("group_label", ""),
         "nontarget_answer_idx": nonstereo,
     }
