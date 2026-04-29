@@ -28,7 +28,10 @@ credentials.json
 # Large local artifacts
 models/
 results/
-data/bbq/
+data/bbq/*
+!data/bbq/data/
+!data/bbq/data/*.jsonl
+data/bbq/.git/
 status_mi_runpod_results/
 status_mi_runpod_diagnostics_fast/
 status_mi_runpod_diagnostics_fast_figures/
