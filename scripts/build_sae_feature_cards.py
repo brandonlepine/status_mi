@@ -473,9 +473,10 @@ def build_card(args: argparse.Namespace, layer: int, feature_id: int, layer_dir:
 <title>Layer {layer} residual SAE feature {feature_id}</title>
 <style>
 body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; margin: 0; background: #f6f7f9; color: #1f2933; }}
-.page {{ max-width: 1500px; margin: 0 auto; padding: 24px; }}
-.grid {{ display: grid; grid-template-columns: 1.05fr 1.65fr 0.9fr; gap: 16px; align-items: start; }}
+.page {{ max-width: 1600px; margin: 0 auto; padding: 24px; }}
+.grid {{ display: grid; grid-template-columns: minmax(420px, 1fr) minmax(420px, 1fr); gap: 16px; align-items: start; }}
 .card {{ background: white; border: 1px solid #d8dee4; border-radius: 10px; padding: 14px; box-shadow: 0 1px 2px rgba(0,0,0,.04); }}
+.hero {{ margin: 16px 0; }}
 h1 {{ margin: 0 0 4px 0; }}
 h2 {{ font-size: 1.05rem; margin-top: 18px; }}
 table {{ border-collapse: collapse; width: 100%; font-size: 0.86rem; }}
@@ -498,6 +499,12 @@ mark.identity, .identity-token {{ outline: 2px solid #facc15; }}
 <body><div class="page">
 <h1>Layer {layer} residual SAE feature {feature_id}</h1>
 <p><strong>{html.escape(auto_label)}</strong></p>
+<section class="card hero">
+<h2>Token-Level Exemplars</h2>
+<p class="note">These are generated from model <code>outputs.hidden_states[{layer}]</code>, encoded through the layer-{layer} residual SAE. Rows are ranked by max non-special token activation. Green intensity = token activation; yellow outline = identity span.</p>
+{exemplar_img_html}
+{''.join(exemplar_sections) if exemplar_sections else '<p>No token-level exemplars available. The token-level CSV was missing, empty, or did not include this feature.</p>'}
+</section>
 <div class="grid">
 <section class="card">
 <h2>Hook Validation</h2>
@@ -509,10 +516,6 @@ mark.identity, .identity-token {{ outline: 2px solid #facc15; }}
 <table><tr><th>Identity ID</th><th>Label</th><th>Axis</th><th>Mean</th><th>Freq</th></tr>{identity_rows}</table>
 </section>
 <section class="card">
-<h2>Token-Level Exemplars</h2>
-<p class="note">These are ranked by max non-special token activation, not by BOS/special-token activation.</p>
-{exemplar_img_html}
-{''.join(exemplar_sections) if exemplar_sections else '<p>No token-level exemplars available.</p>'}
 <h2>Localization Summary</h2>
 <table><tr><th>Localization type</th><th>Share of selected prompts</th></tr>{loc_rows}</table>
 <h2>Top Non-Special Activating Tokens</h2>
