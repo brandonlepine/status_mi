@@ -263,6 +263,85 @@ def save_identity_profile(card_dir: Path, layer: int, feature_id: int, identity_
     return filename
 
 
+def save_token_exemplar_figure(output_dir: Path, layer: int, feature_id: int, feature_token_df: pd.DataFrame, exemplar_df: pd.DataFrame) -> str | None:
+    if feature_token_df.empty or exemplar_df.empty:
+        return None
+    figure_dir = output_dir / "token_exemplars" / f"layer_{layer:02d}"
+    figure_dir.mkdir(parents=True, exist_ok=True)
+    prompts = exemplar_df["prompt_id"].astype(str).tolist()
+    plot_df = feature_token_df[feature_token_df["prompt_id"].astype(str).isin(prompts)].copy()
+    if plot_df.empty:
+        return None
+    if "is_special_token" in plot_df.columns:
+        plot_df = plot_df[~plot_df["is_special_token"].astype(bool)]
+    else:
+        plot_df = plot_df[plot_df["token_end_char"] > plot_df["token_start_char"]]
+    if plot_df.empty:
+        return None
+
+    max_act = max(float(plot_df["token_feature_activation"].max()), 1e-9)
+    n_rows = min(len(prompts), 12)
+    fig, ax = plt.subplots(figsize=(18, max(5.5, n_rows * 0.9)))
+    ax.axis("off")
+    y = 1.0
+    row_gap = 0.085
+    for prompt_id in prompts[:n_rows]:
+        row_tokens = plot_df[plot_df["prompt_id"].astype(str).eq(prompt_id)].sort_values("token_idx")
+        if row_tokens.empty:
+            continue
+        meta = row_tokens.iloc[0]
+        label = f"{meta.identity_id} | final={float(meta.final_token_feature_activation):.2f} | max={float(row_tokens['token_feature_activation'].max()):.2f}"
+        ax.text(0.01, y, label, transform=ax.transAxes, fontsize=8, color="#475569", va="top")
+        x = 0.01
+        token_y = y - 0.032
+        for token in row_tokens.itertuples(index=False):
+            text = str(token.token_str).replace("\n", "\\n")
+            if text == "":
+                continue
+            alpha = min(0.92, max(0.06, float(token.token_feature_activation) / max_act))
+            edge = "#facc15" if bool(token.is_identity_span_token) else "#d1d5db"
+            linewidth = 1.8 if bool(token.is_identity_span_token) else 0.5
+            if bool(token.is_top_token_for_feature):
+                edge = "#111827"
+                linewidth = 2.0
+            ax.text(
+                x,
+                token_y,
+                text,
+                transform=ax.transAxes,
+                fontsize=9,
+                family="monospace",
+                va="top",
+                bbox={
+                    "boxstyle": "round,pad=0.18",
+                    "facecolor": (0.18, 0.80, 0.44, alpha),
+                    "edgecolor": edge,
+                    "linewidth": linewidth,
+                },
+            )
+            x += min(0.12, max(0.024, len(text) * 0.012))
+            if x > 0.94:
+                x = 0.01
+                token_y -= 0.032
+        y -= row_gap
+        if token_y < y:
+            y = token_y - 0.035
+        if y < 0.04:
+            break
+    ax.set_title(
+        f"Layer {layer} SAE feature {feature_id}: token-level activation exemplars\n"
+        "Green intensity = token activation; yellow outline = identity span; black outline = max token in prompt",
+        fontsize=12,
+        loc="left",
+    )
+    fig.tight_layout()
+    stem = figure_dir / f"feature_{feature_id:05d}_token_exemplars"
+    fig.savefig(stem.with_suffix(".png"), dpi=220)
+    fig.savefig(stem.with_suffix(".pdf"))
+    plt.close(fig)
+    return str(stem.with_suffix(".png").relative_to(output_dir))
+
+
 def compute_logit_effects(args: argparse.Namespace, layer_dir: Path, feature_id: int) -> tuple[list[dict[str, object]], list[dict[str, object]], str]:
     if not args.compute_logit_lens:
         return [], [], "Not computed."
@@ -317,6 +396,7 @@ def build_card(args: argparse.Namespace, layer: int, feature_id: int, layer_dir:
     exemplar_df = exemplar_prompt_table(feature_token_df, args.top_prompts_per_feature)
     span_token_df = identity_span_token_table(feature_token_df, args.top_tokens_per_feature)
     profile_img = save_identity_profile(card_dir, layer, feature_id, identity_means)
+    exemplar_img = save_token_exemplar_figure(args.output_dir, layer, feature_id, feature_token_df, exemplar_df)
     prompt_df = metadata.copy()
     prompt_df["final_token_activation"] = feature_values
     top_prompts = prompt_df.sort_values("final_token_activation", ascending=False).head(args.top_prompts_per_feature)
@@ -381,6 +461,11 @@ def build_card(args: argparse.Namespace, layer: int, feature_id: int, layer_dir:
     neg_rows = "\n".join(f"<span class='logit-neg'>{html.escape(item['token'])} ({item['score']:.2f})</span>" for item in negative_logits) or "Not computed."
     hook_html = html.escape(json.dumps(hook_summary, default=str)[:1200])
     profile_html = f"<img src='{profile_img}' class='profile-img'>" if profile_img else "<p>No profile image.</p>"
+    exemplar_img_html = (
+        f"<a href='../{exemplar_img}'><img src='../{exemplar_img}' class='exemplar-img'></a>"
+        if exemplar_img else
+        "<p>No token-exemplar figure available.</p>"
+    )
     card_html = f"""<!doctype html>
 <html>
 <head>
@@ -404,6 +489,7 @@ mark.identity, .identity-token {{ outline: 2px solid #facc15; }}
 .tokens {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; line-height: 1.8; font-size: .95rem; }}
 .snippet-table td:last-child {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }}
 .profile-img {{ max-width: 100%; }}
+.exemplar-img {{ max-width: 100%; border: 1px solid #d8dee4; border-radius: 8px; background: white; }}
 .logit-pos {{ display: inline-block; margin: 2px; padding: 2px 5px; background: #dbeafe; color: #1e40af; border-radius: 4px; }}
 .logit-neg {{ display: inline-block; margin: 2px; padding: 2px 5px; background: #fee2e2; color: #991b1b; border-radius: 4px; }}
 .note {{ color: #64748b; font-size: .9rem; }}
@@ -425,6 +511,7 @@ mark.identity, .identity-token {{ outline: 2px solid #facc15; }}
 <section class="card">
 <h2>Token-Level Exemplars</h2>
 <p class="note">These are ranked by max non-special token activation, not by BOS/special-token activation.</p>
+{exemplar_img_html}
 {''.join(exemplar_sections) if exemplar_sections else '<p>No token-level exemplars available.</p>'}
 <h2>Localization Summary</h2>
 <table><tr><th>Localization type</th><th>Share of selected prompts</th></tr>{loc_rows}</table>
@@ -456,6 +543,7 @@ mark.identity, .identity-token {{ outline: 2px solid #facc15; }}
         "summary_stats": stats_row,
         "hook_summary": hook_summary,
         "prompt_metrics": prompt_metrics,
+        "token_exemplar_figure": exemplar_img,
         "top_identities": identity_means.sort_values("mean_activation", ascending=False).head(20).to_dict("records"),
         "top_tokens": top_tokens.head(args.top_tokens_per_feature).to_dict("records") if not top_tokens.empty else [],
         "positive_logits": positive_logits,
@@ -463,7 +551,7 @@ mark.identity, .identity-token {{ outline: 2px solid #facc15; }}
         "logit_note": logit_note,
     }
     json_path.write_text(json.dumps(payload, indent=2, default=str) + "\n")
-    return {"layer": layer, "feature_id": feature_id, "auto_label": auto_label, "top_axis": top_axis, "top_identity": top_identity, "card": str(html_path.relative_to(args.output_dir)), "max_activation": stats_row.get("max_activation", np.nan), "activation_frequency": stats_row.get("activation_frequency", np.nan)}
+    return {"layer": layer, "feature_id": feature_id, "auto_label": auto_label, "top_axis": top_axis, "top_identity": top_identity, "card": str(html_path.relative_to(args.output_dir)), "token_exemplar_figure": exemplar_img, "max_activation": stats_row.get("max_activation", np.nan), "activation_frequency": stats_row.get("activation_frequency", np.nan)}
 
 
 def load_hook_summary(output_dir: Path, layer: int) -> dict[str, object]:
