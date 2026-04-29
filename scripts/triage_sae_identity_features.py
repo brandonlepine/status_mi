@@ -7,6 +7,7 @@ import argparse
 import html
 import json
 import math
+import os
 import shutil
 import warnings
 from datetime import datetime, timezone
@@ -63,6 +64,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min_sharedness_score_shared", type=float, default=0.5)
     parser.add_argument("--top_n_per_contrast", type=int, default=50)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--html_only",
+        action="store_true",
+        help="Regenerate triage_index.html from an existing feature_triage.csv without recomputing metrics.",
+    )
     return parser.parse_args()
 
 
@@ -149,7 +155,7 @@ def read_feature_top_tokens(token_level_dir: Path, layer: int) -> pd.DataFrame:
     return pd.DataFrame()
 
 
-def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+def normalize_columns(df: pd.DataFrame, warn_missing_keys: bool = True) -> pd.DataFrame:
     if df.empty:
         return df
     out = df.copy()
@@ -171,7 +177,7 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
         if col in out.columns:
             out[col] = pd.to_numeric(out[col], errors="coerce")
     missing = [col for col in ["layer", "feature_id"] if col not in out.columns]
-    if missing:
+    if missing and warn_missing_keys:
         warnings.warn(f"Table is missing expected columns {missing}; available columns: {list(out.columns)}")
     return out
 
@@ -526,7 +532,7 @@ def aggregate_shared_loadings(shared_dir: Path, layers: list[int]) -> pd.DataFra
         df = safe_read_csv(path)
         if df.empty:
             continue
-        df = normalize_columns(df)
+        df = normalize_columns(df, warn_missing_keys=False)
         df["_shared_metric_source"] = path.name
         frames.append(df)
     if not frames:
@@ -767,7 +773,7 @@ def feature_card_link(output_dir: Path, layer: int, feature_id: int) -> str:
     ]
     for path in candidates:
         if path.exists():
-            return html.escape(str(path.relative_to(output_dir)))
+            return html.escape(os.path.relpath(path, start=output_dir))
     return ""
 
 
@@ -830,6 +836,14 @@ function applyFilters() {{
 def main() -> None:
     args = parse_args()
     layers = parse_layers(args.layers)
+    if args.html_only:
+        triage_path = args.output_dir / "feature_triage.csv"
+        if not triage_path.exists():
+            raise FileNotFoundError(f"Cannot use --html_only because {triage_path} does not exist.")
+        triage = pd.read_csv(triage_path, low_memory=False)
+        write_html(triage, args.output_dir)
+        print(f"HTML summary regenerated: {args.output_dir / 'triage_index.html'}")
+        return
     prepare_output(args.output_dir, args.overwrite)
     config = vars(args).copy()
     config["analysis_dir"] = str(args.analysis_dir)
