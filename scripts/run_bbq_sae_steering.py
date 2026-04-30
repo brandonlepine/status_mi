@@ -68,6 +68,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--intervention_modes", default="add_vector", help="Comma-separated add_vector,ablate_projection.")
     parser.add_argument("--include_unmapped", action="store_true")
     parser.add_argument("--no_normalize_features", action="store_true")
+    parser.add_argument("--max_feature_sets", type=int, default=None, help="Optional cap for quick smoke tests.")
+    parser.add_argument("--disable_controls", action="store_true", help="Skip sign-flip/random controls for quick smoke tests.")
     parser.add_argument("--max_examples", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--save_every_examples", type=int, default=25)
@@ -344,10 +346,40 @@ def make_random_feature_vector(sae, n_features: int, normalize: bool, device: to
     return (vec.to(device) / vec.norm().clamp_min(1e-9), random_ids)
 
 
-def completed_jobs(path: Path) -> set[str]:
+def completed_jobs(path: Path, logger: logging.Logger | None = None) -> set[str]:
     if not path.exists():
         return set()
-    return {json.loads(line)["job_id"] for line in path.read_text().splitlines() if line.strip()}
+    done = set()
+    bad_lines = []
+    for line_no, line in enumerate(path.read_text().splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+            job = payload.get("job_id")
+            if job:
+                done.add(str(job))
+            else:
+                bad_lines.append((line_no, line))
+        except json.JSONDecodeError:
+            bad_lines.append((line_no, line))
+    if bad_lines:
+        backup = path.with_suffix(path.suffix + ".malformed")
+        backup.write_text("\n".join(f"{line_no}: {line}" for line_no, line in bad_lines) + "\n")
+        clean_lines = []
+        for line in path.read_text().splitlines():
+            if not line.strip():
+                continue
+            try:
+                payload = json.loads(line)
+                if payload.get("job_id"):
+                    clean_lines.append(json.dumps(payload))
+            except json.JSONDecodeError:
+                continue
+        path.write_text("\n".join(clean_lines) + ("\n" if clean_lines else ""))
+        if logger:
+            logger.warning("Ignored %d malformed completed-job lines; backed them up to %s", len(bad_lines), backup)
+    return done
 
 
 def job_id(parts: list[object]) -> str:
@@ -437,11 +469,16 @@ def main() -> None:
         prepared = prepared.head(args.max_examples).copy()
     feature_sets = load_feature_sets(args.triage_csv, layers, modes, top_ks)
     feature_sets = [fs for fs in feature_sets if fs.layer in layers]
+    if args.max_feature_sets:
+        feature_sets = feature_sets[: args.max_feature_sets]
     expected = len(prepared) * len(feature_sets) * len(alphas) * len(positions) * len(intervention_modes)
     logger.info("Prepared examples: %d; feature sets: %d; expected steering jobs: %d", len(prepared), len(feature_sets), expected)
     if expected == 0:
         raise ValueError("No steering jobs to run.")
     pd.DataFrame([fs.__dict__ for fs in feature_sets]).to_csv(args.output_dir / "steering_manifest.csv", index=False)
+    done_path = args.output_dir / "completed_jobs.jsonl"
+    done = completed_jobs(done_path, logger) if args.resume else set()
+    logger.info("Resume metadata loaded before model weights: %d completed jobs", len(done))
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, use_fast=True)
     if tokenizer.pad_token is None:
@@ -450,8 +487,6 @@ def main() -> None:
     model.eval()
     hidden_dim = model.config.hidden_size
     score_fn = score_answer_logprob if args.scoring_mode == "answer_logprob" else score_first_token
-    done_path = args.output_dir / "completed_jobs.jsonl"
-    done = completed_jobs(done_path) if args.resume else set()
     part_rows: list[dict[str, object]] = []
     part_idx = len(list((args.output_dir / "results_parts").glob("part_*")))
     sae_cache = {}
@@ -515,7 +550,7 @@ def main() -> None:
                             part_idx += 1
                             part_rows = []
                 # Sign-flip control for the same feature set at final token only.
-                if "final_prompt_token" in positions:
+                if not args.disable_controls and "final_prompt_token" in positions:
                     jid = job_id([row_s["bbq_uid"], fs.layer, fs.set_id, alpha, "final_prompt_token", "sign_flip", args.scoring_mode])
                     if jid not in done:
                         pos = positions_for(tokenizer, prompt, row_s, 512, "final_prompt_token")
