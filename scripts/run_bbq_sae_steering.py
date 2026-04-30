@@ -67,6 +67,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--intervention_positions", default="final_prompt_token,target_identity_last_token,nontarget_identity_last_token,stereotype_language_last_token")
     parser.add_argument("--intervention_modes", default="add_vector", help="Comma-separated add_vector,ablate_projection.")
     parser.add_argument("--include_unmapped", action="store_true")
+    parser.add_argument(
+        "--axis_match_mode",
+        default="matched_only",
+        choices=["matched_only", "all"],
+        help="matched_only runs feature sets only on BBQ examples from the same identity axis. Use all only for explicit wrong-axis control sweeps.",
+    )
     parser.add_argument("--no_normalize_features", action="store_true")
     parser.add_argument("--max_feature_sets", type=int, default=None, help="Optional cap for quick smoke tests.")
     parser.add_argument("--disable_controls", action="store_true", help="Skip sign-flip/random controls for quick smoke tests.")
@@ -134,6 +140,61 @@ def feature_sign(row: pd.Series) -> float:
     return 1.0
 
 
+AXIS_PREFIX_MAP = {
+    "disability": "disability_status",
+    "gender": "gender_identity",
+    "sex": "gender_identity",
+    "appearance": "physical_appearance",
+    "race": "race_ethnicity",
+    "religion": "religion",
+    "sexuality": "sexual_orientation",
+    "ses": "socioeconomic_status",
+    "nationality": "nationality",
+    "age": "age",
+}
+
+
+def axis_from_identity(identity_id: object) -> str:
+    text = str(identity_id or "")
+    return AXIS_PREFIX_MAP.get(text.split("_", 1)[0], "")
+
+
+def axis_from_contrast(contrast_name: object) -> str:
+    contrast = str(contrast_name or "")
+    if "_vs_" not in contrast:
+        return ""
+    return axis_from_identity(contrast.split("_vs_", 1)[0])
+
+
+def feature_axis_from_row(row: pd.Series) -> str:
+    contrast_axis = axis_from_contrast(row.get("contrast_name", ""))
+    if contrast_axis:
+        return contrast_axis
+    for col in ["axis", "top_axis", "axis_mapped"]:
+        value = str(row.get(col, "") or "")
+        if value and value != "nan":
+            return value
+    return ""
+
+
+def feature_set_matches_axis(feature_set: FeatureSet, axis: object) -> bool:
+    axis_text = str(axis or "")
+    return bool(axis_text and feature_set.axis and axis_text == feature_set.axis)
+
+
+def filter_feature_sets_for_prepared(feature_sets: list[FeatureSet], prepared: pd.DataFrame, axis_match_mode: str) -> list[FeatureSet]:
+    if axis_match_mode == "all" or "axis_mapped" not in prepared.columns:
+        return feature_sets
+    axes = {str(axis) for axis in prepared["axis_mapped"].dropna().unique() if str(axis)}
+    return [fs for fs in feature_sets if fs.axis in axes]
+
+
+def eligible_prepared_for_feature_set(prepared: pd.DataFrame, feature_set: FeatureSet, axis_match_mode: str) -> pd.DataFrame:
+    if axis_match_mode == "all" or "axis_mapped" not in prepared.columns:
+        return prepared
+    return prepared[prepared["axis_mapped"].astype(str).eq(feature_set.axis)].copy()
+
+
 def load_feature_sets(triage_path: Path, layers: list[int], modes: set[str], top_ks: list[int]) -> list[FeatureSet]:
     triage = pd.read_csv(triage_path, low_memory=False)
     if "keep_for_intervention" in triage.columns:
@@ -160,7 +221,7 @@ def load_feature_sets(triage_path: Path, layers: list[int], modes: set[str], top
                 signs=[feature_sign(row_s)],
                 roles=[str(row_s.get("provisional_role", ""))],
                 contrast_name=str(row_s.get("contrast_name", "")),
-                axis=str(row_s.get("top_axis", "")),
+                axis=feature_axis_from_row(row_s),
             ))
     if "per_contrast_topk" in modes:
         for (layer, contrast), group in sorted_kept.dropna(subset=["contrast_name"]).groupby(["layer", "contrast_name"], sort=True):
@@ -168,11 +229,13 @@ def load_feature_sets(triage_path: Path, layers: list[int], modes: set[str], top
                 for k in top_ks:
                     top = role_group.head(k)
                     if not top.empty:
-                        sets.append(FeatureSet(int(layer), "per_contrast_topk", f"L{int(layer):02d}_{contrast}_{role}_top{k}", top["feature_id"].astype(int).tolist(), [feature_sign(r) for _, r in top.iterrows()], top["provisional_role"].astype(str).tolist(), str(contrast), str(top["top_axis"].iloc[0])))
+                        axis = axis_from_contrast(contrast) or str(top["top_axis"].iloc[0])
+                        sets.append(FeatureSet(int(layer), "per_contrast_topk", f"L{int(layer):02d}_{contrast}_{role}_top{k}", top["feature_id"].astype(int).tolist(), [feature_sign(r) for _, r in top.iterrows()], top["provisional_role"].astype(str).tolist(), str(contrast), axis))
             for k in top_ks:
                 top = group.head(k)
                 if not top.empty:
-                    sets.append(FeatureSet(int(layer), "per_contrast_topk", f"L{int(layer):02d}_{contrast}_combined_top{k}", top["feature_id"].astype(int).tolist(), [feature_sign(r) for _, r in top.iterrows()], top["provisional_role"].astype(str).tolist(), str(contrast), str(top["top_axis"].iloc[0])))
+                    axis = axis_from_contrast(contrast) or str(top["top_axis"].iloc[0])
+                    sets.append(FeatureSet(int(layer), "per_contrast_topk", f"L{int(layer):02d}_{contrast}_combined_top{k}", top["feature_id"].astype(int).tolist(), [feature_sign(r) for _, r in top.iterrows()], top["provisional_role"].astype(str).tolist(), str(contrast), axis))
     if "role_bundle" in modes:
         for (layer, axis, role), group in sorted_kept.groupby(["layer", "top_axis", "provisional_role"], sort=True):
             if str(axis):
@@ -469,13 +532,32 @@ def main() -> None:
         prepared = prepared.head(args.max_examples).copy()
     feature_sets = load_feature_sets(args.triage_csv, layers, modes, top_ks)
     feature_sets = [fs for fs in feature_sets if fs.layer in layers]
+    before_axis_filter = len(feature_sets)
+    feature_sets = filter_feature_sets_for_prepared(feature_sets, prepared, args.axis_match_mode)
     if args.max_feature_sets:
         feature_sets = feature_sets[: args.max_feature_sets]
-    expected = len(prepared) * len(feature_sets) * len(alphas) * len(positions) * len(intervention_modes)
-    logger.info("Prepared examples: %d; feature sets: %d; expected steering jobs: %d", len(prepared), len(feature_sets), expected)
+    eligible_counts = {
+        fs.set_id: len(eligible_prepared_for_feature_set(prepared, fs, args.axis_match_mode))
+        for fs in feature_sets
+    }
+    expected = sum(eligible_counts.values()) * len(alphas) * len(positions) * len(intervention_modes)
+    logger.info(
+        "Prepared examples: %d; feature sets: %d/%d after axis_match_mode=%s; expected main steering jobs: %d",
+        len(prepared),
+        len(feature_sets),
+        before_axis_filter,
+        args.axis_match_mode,
+        expected,
+    )
+    if args.axis_match_mode == "matched_only":
+        logger.info("Prepared axes: %s", sorted(prepared["axis_mapped"].dropna().astype(str).unique()) if "axis_mapped" in prepared.columns else "unknown")
+        logger.info("Feature-set axes retained: %s", sorted({fs.axis for fs in feature_sets}))
     if expected == 0:
-        raise ValueError("No steering jobs to run.")
-    pd.DataFrame([fs.__dict__ for fs in feature_sets]).to_csv(args.output_dir / "steering_manifest.csv", index=False)
+        raise ValueError(
+            "No steering jobs to run after axis matching. Use --axis_match_mode all only if you intentionally want wrong-axis controls."
+        )
+    manifest = pd.DataFrame([fs.__dict__ | {"eligible_examples": eligible_counts.get(fs.set_id, 0)} for fs in feature_sets])
+    manifest.to_csv(args.output_dir / "steering_manifest.csv", index=False)
     done_path = args.output_dir / "completed_jobs.jsonl"
     done = completed_jobs(done_path, logger) if args.resume else set()
     logger.info("Resume metadata loaded before model weights: %d completed jobs", len(done))
@@ -497,7 +579,11 @@ def main() -> None:
         if fs.layer not in sae_cache:
             sae_cache[fs.layer] = load_sae(args.sae_dir, fs.layer, hidden_dim, device, dtype)
         sae = sae_cache[fs.layer]
-        for _, row in tqdm(prepared.iterrows(), total=len(prepared), desc=fs.set_id[:40], leave=False):
+        fs_prepared = eligible_prepared_for_feature_set(prepared, fs, args.axis_match_mode)
+        if fs_prepared.empty:
+            logger.warning("Skipping %s because no prepared examples match feature axis %s", fs.set_id, fs.axis)
+            continue
+        for _, row in tqdm(fs_prepared.iterrows(), total=len(fs_prepared), desc=fs.set_id[:40], leave=False):
             row_s = pd.Series(row)
             answers = [str(row_s.get(f"ans{i}", "")) for i in range(3)]
             prompt = str(row_s["prompt"])
@@ -537,7 +623,7 @@ def main() -> None:
                             "nonstereotyped_answer_idx": row_s.get("nonstereotyped_answer_idx", np.nan),
                             "unknown_answer_idx": row_s.get("unknown_answer_idx", np.nan),
                             "correct_answer_idx": row_s.get("correct_answer_idx", np.nan),
-                            "control_type": "wrong_axis_features" if fs.control_type == "kept_feature" and fs.axis and str(row_s.get("axis_mapped", "")) and fs.axis != str(row_s.get("axis_mapped", "")) else fs.control_type,
+                            "control_type": "wrong_axis_features" if fs.control_type == "kept_feature" and not feature_set_matches_axis(fs, row_s.get("axis_mapped", "")) else fs.control_type,
                             "runtime_seconds": time.perf_counter() - start,
                         }
                         out.update(row_metrics(base, inter, row_s))
