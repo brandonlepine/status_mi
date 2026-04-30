@@ -506,6 +506,33 @@ def write_part(rows: list[dict[str, object]], output_dir: Path, part_idx: int) -
         return path
 
 
+def count_pending_main_jobs(
+    prepared: pd.DataFrame,
+    feature_sets: list[FeatureSet],
+    eligible_counts: dict[str, int],
+    alphas: list[float],
+    positions: list[str],
+    intervention_modes: list[str],
+    scoring_mode: str,
+    done: set[str],
+    axis_match_mode: str,
+) -> int:
+    pending = 0
+    for fs in feature_sets:
+        if eligible_counts.get(fs.set_id, 0) == 0:
+            continue
+        fs_prepared = eligible_prepared_for_feature_set(prepared, fs, axis_match_mode)
+        for _, row in fs_prepared.iterrows():
+            uid = row["bbq_uid"]
+            for alpha in alphas:
+                for pos_name in positions:
+                    for mode in intervention_modes:
+                        jid = job_id([uid, fs.layer, fs.set_id, alpha, pos_name, mode, scoring_mode])
+                        if jid not in done:
+                            pending += 1
+    return pending
+
+
 def main() -> None:
     args = parse_args()
     logger = setup(args.output_dir, args.overwrite, args.resume)
@@ -561,6 +588,18 @@ def main() -> None:
     done_path = args.output_dir / "completed_jobs.jsonl"
     done = completed_jobs(done_path, logger) if args.resume else set()
     logger.info("Resume metadata loaded before model weights: %d completed jobs", len(done))
+    pending_main_jobs = count_pending_main_jobs(
+        prepared,
+        feature_sets,
+        eligible_counts,
+        alphas,
+        positions,
+        intervention_modes,
+        args.scoring_mode,
+        done,
+        args.axis_match_mode,
+    )
+    logger.info("Pending main steering jobs after resume filtering: %d", pending_main_jobs)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, use_fast=True)
     if tokenizer.pad_token is None:
@@ -575,77 +614,102 @@ def main() -> None:
     vector_cache = {}
     n_done = 0
 
-    for fs in tqdm(feature_sets, desc="feature sets"):
-        if fs.layer not in sae_cache:
-            sae_cache[fs.layer] = load_sae(args.sae_dir, fs.layer, hidden_dim, device, dtype)
-        sae = sae_cache[fs.layer]
-        fs_prepared = eligible_prepared_for_feature_set(prepared, fs, args.axis_match_mode)
-        if fs_prepared.empty:
-            logger.warning("Skipping %s because no prepared examples match feature axis %s", fs.set_id, fs.axis)
-            continue
-        for _, row in tqdm(fs_prepared.iterrows(), total=len(fs_prepared), desc=fs.set_id[:40], leave=False):
-            row_s = pd.Series(row)
-            answers = [str(row_s.get(f"ans{i}", "")) for i in range(3)]
-            prompt = str(row_s["prompt"])
-            base = score_fn(model, tokenizer, prompt, answers, 512)
-            for alpha in alphas:
-                for pos_name in positions:
-                    pos = positions_for(tokenizer, prompt, row_s, 512, pos_name)
-                    for mode in intervention_modes:
-                        jid = job_id([row_s["bbq_uid"], fs.layer, fs.set_id, alpha, pos_name, mode, args.scoring_mode])
-                        if jid in done:
-                            continue
-                        start = time.perf_counter()
-                        vector_key = (fs.set_id, fs.layer, "kept")
-                        if vector_key not in vector_cache:
-                            vector_cache[vector_key] = make_vector(sae, fs, not args.no_normalize_features, device)
-                        vector = vector_cache[vector_key]
-                        hook_fn = lambda v=vector, p=pos, a=alpha, m=mode: install_hook(model, fs.layer, v, p, a, m)
-                        inter = score_fn(model, tokenizer, prompt, answers, 512, hook_fn=hook_fn)
-                        out = {
-                            "bbq_uid": row_s["bbq_uid"],
-                            "layer": fs.layer,
-                            "alpha": alpha,
-                            "intervention_mode": mode,
-                            "intervention_position": pos_name,
-                            "feature_set_mode": fs.mode,
-                            "feature_set_id": fs.set_id,
-                            "feature_ids_json": json.dumps(fs.feature_ids),
-                            "feature_signs_json": json.dumps(fs.signs),
-                            "feature_roles_json": json.dumps(fs.roles),
-                            "mapped_contrast_name": row_s.get("mapped_contrast_name", ""),
-                            "feature_contrast_name": fs.contrast_name,
-                            "axis_mapped": row_s.get("axis_mapped", ""),
-                            "category_raw": row_s.get("category_raw", ""),
-                            "context_condition": row_s.get("context_condition", ""),
-                            "question_polarity": row_s.get("question_polarity", ""),
-                            "stereotyped_answer_idx": row_s.get("stereotyped_answer_idx", np.nan),
-                            "nonstereotyped_answer_idx": row_s.get("nonstereotyped_answer_idx", np.nan),
-                            "unknown_answer_idx": row_s.get("unknown_answer_idx", np.nan),
-                            "correct_answer_idx": row_s.get("correct_answer_idx", np.nan),
-                            "control_type": "wrong_axis_features" if fs.control_type == "kept_feature" and not feature_set_matches_axis(fs, row_s.get("axis_mapped", "")) else fs.control_type,
-                            "runtime_seconds": time.perf_counter() - start,
-                        }
-                        out.update(row_metrics(base, inter, row_s))
-                        part_rows.append(out)
-                        done_path.open("a").write(json.dumps({"job_id": jid, "completed_at": datetime.now(timezone.utc).isoformat()}) + "\n")
-                        done.add(jid)
-                        n_done += 1
-                        if len(part_rows) >= min(args.save_every_examples, 500):
-                            write_part(part_rows, args.output_dir, part_idx)
-                            part_idx += 1
-                            part_rows = []
-                # Sign-flip control for the same feature set at final token only.
-                if not args.disable_controls and "final_prompt_token" in positions:
-                    jid = job_id([row_s["bbq_uid"], fs.layer, fs.set_id, alpha, "final_prompt_token", "sign_flip", args.scoring_mode])
-                    if jid not in done:
-                        pos = positions_for(tokenizer, prompt, row_s, 512, "final_prompt_token")
-                        vector = -make_vector(sae, fs, not args.no_normalize_features, device)
-                        inter = score_fn(model, tokenizer, prompt, answers, 512, hook_fn=lambda v=vector, p=pos, a=alpha: install_hook(model, fs.layer, v, p, a, "add_vector"))
-                        out = {"bbq_uid": row_s["bbq_uid"], "layer": fs.layer, "alpha": alpha, "intervention_mode": "add_vector", "intervention_position": "final_prompt_token", "feature_set_mode": fs.mode, "feature_set_id": fs.set_id, "feature_ids_json": json.dumps(fs.feature_ids), "feature_signs_json": json.dumps([-s for s in fs.signs]), "feature_roles_json": json.dumps(fs.roles), "mapped_contrast_name": row_s.get("mapped_contrast_name", ""), "feature_contrast_name": fs.contrast_name, "axis_mapped": row_s.get("axis_mapped", ""), "category_raw": row_s.get("category_raw", ""), "context_condition": row_s.get("context_condition", ""), "question_polarity": row_s.get("question_polarity", ""), "stereotyped_answer_idx": row_s.get("stereotyped_answer_idx", np.nan), "nonstereotyped_answer_idx": row_s.get("nonstereotyped_answer_idx", np.nan), "unknown_answer_idx": row_s.get("unknown_answer_idx", np.nan), "correct_answer_idx": row_s.get("correct_answer_idx", np.nan), "control_type": "sign_flip", "runtime_seconds": 0.0}
-                        out.update(row_metrics(base, inter, row_s))
-                        part_rows.append(out)
-                        done_path.open("a").write(json.dumps({"job_id": jid, "completed_at": datetime.now(timezone.utc).isoformat()}) + "\n")
+    with tqdm(total=pending_main_jobs, desc="main steering jobs", unit="job", dynamic_ncols=True) as job_bar:
+        for fs_index, fs in enumerate(feature_sets, start=1):
+            fs_prepared = eligible_prepared_for_feature_set(prepared, fs, args.axis_match_mode)
+            if fs_prepared.empty:
+                logger.warning("Skipping %s because no prepared examples match feature axis %s", fs.set_id, fs.axis)
+                continue
+            logger.info(
+                "Feature set %d/%d: %s | axis=%s | mode=%s | features=%d | examples=%d",
+                fs_index,
+                len(feature_sets),
+                fs.set_id,
+                fs.axis,
+                fs.mode,
+                len(fs.feature_ids),
+                len(fs_prepared),
+            )
+            if fs.layer not in sae_cache:
+                logger.info("Loading SAE for layer %02d", fs.layer)
+                sae_cache[fs.layer] = load_sae(args.sae_dir, fs.layer, hidden_dim, device, dtype)
+            sae = sae_cache[fs.layer]
+            for example_index, (_, row) in enumerate(fs_prepared.iterrows(), start=1):
+                row_s = pd.Series(row)
+                answers = [str(row_s.get(f"ans{i}", "")) for i in range(3)]
+                prompt = str(row_s["prompt"])
+                base = score_fn(model, tokenizer, prompt, answers, 512)
+                for alpha in alphas:
+                    for pos_name in positions:
+                        pos = positions_for(tokenizer, prompt, row_s, 512, pos_name)
+                        for mode in intervention_modes:
+                            jid = job_id([row_s["bbq_uid"], fs.layer, fs.set_id, alpha, pos_name, mode, args.scoring_mode])
+                            if jid in done:
+                                continue
+                            job_bar.set_postfix(
+                                {
+                                    "fs": f"{fs_index}/{len(feature_sets)}",
+                                    "ex": f"{example_index}/{len(fs_prepared)}",
+                                    "axis": fs.axis,
+                                    "alpha": alpha,
+                                    "pos": pos_name,
+                                    "role": fs.roles[0] if fs.roles else "",
+                                },
+                                refresh=False,
+                            )
+                            start = time.perf_counter()
+                            vector_key = (fs.set_id, fs.layer, "kept")
+                            if vector_key not in vector_cache:
+                                vector_cache[vector_key] = make_vector(sae, fs, not args.no_normalize_features, device)
+                            vector = vector_cache[vector_key]
+                            hook_fn = lambda v=vector, p=pos, a=alpha, m=mode: install_hook(model, fs.layer, v, p, a, m)
+                            inter = score_fn(model, tokenizer, prompt, answers, 512, hook_fn=hook_fn)
+                            out = {
+                                "bbq_uid": row_s["bbq_uid"],
+                                "layer": fs.layer,
+                                "alpha": alpha,
+                                "intervention_mode": mode,
+                                "intervention_position": pos_name,
+                                "feature_set_mode": fs.mode,
+                                "feature_set_id": fs.set_id,
+                                "feature_ids_json": json.dumps(fs.feature_ids),
+                                "feature_signs_json": json.dumps(fs.signs),
+                                "feature_roles_json": json.dumps(fs.roles),
+                                "mapped_contrast_name": row_s.get("mapped_contrast_name", ""),
+                                "feature_contrast_name": fs.contrast_name,
+                                "axis_mapped": row_s.get("axis_mapped", ""),
+                                "category_raw": row_s.get("category_raw", ""),
+                                "context_condition": row_s.get("context_condition", ""),
+                                "question_polarity": row_s.get("question_polarity", ""),
+                                "stereotyped_answer_idx": row_s.get("stereotyped_answer_idx", np.nan),
+                                "nonstereotyped_answer_idx": row_s.get("nonstereotyped_answer_idx", np.nan),
+                                "unknown_answer_idx": row_s.get("unknown_answer_idx", np.nan),
+                                "correct_answer_idx": row_s.get("correct_answer_idx", np.nan),
+                                "control_type": "wrong_axis_features" if fs.control_type == "kept_feature" and not feature_set_matches_axis(fs, row_s.get("axis_mapped", "")) else fs.control_type,
+                                "runtime_seconds": time.perf_counter() - start,
+                            }
+                            out.update(row_metrics(base, inter, row_s))
+                            part_rows.append(out)
+                            done_path.open("a").write(json.dumps({"job_id": jid, "completed_at": datetime.now(timezone.utc).isoformat()}) + "\n")
+                            done.add(jid)
+                            n_done += 1
+                            job_bar.update(1)
+                            if len(part_rows) >= min(args.save_every_examples, 500):
+                                part_path = write_part(part_rows, args.output_dir, part_idx)
+                                logger.info("Checkpoint saved: %s (%d rows)", part_path, len(part_rows))
+                                part_idx += 1
+                                part_rows = []
+                    # Sign-flip control for the same feature set at final token only.
+                    if not args.disable_controls and "final_prompt_token" in positions:
+                        jid = job_id([row_s["bbq_uid"], fs.layer, fs.set_id, alpha, "final_prompt_token", "sign_flip", args.scoring_mode])
+                        if jid not in done:
+                            pos = positions_for(tokenizer, prompt, row_s, 512, "final_prompt_token")
+                            vector = -make_vector(sae, fs, not args.no_normalize_features, device)
+                            inter = score_fn(model, tokenizer, prompt, answers, 512, hook_fn=lambda v=vector, p=pos, a=alpha: install_hook(model, fs.layer, v, p, a, "add_vector"))
+                            out = {"bbq_uid": row_s["bbq_uid"], "layer": fs.layer, "alpha": alpha, "intervention_mode": "add_vector", "intervention_position": "final_prompt_token", "feature_set_mode": fs.mode, "feature_set_id": fs.set_id, "feature_ids_json": json.dumps(fs.feature_ids), "feature_signs_json": json.dumps([-s for s in fs.signs]), "feature_roles_json": json.dumps(fs.roles), "mapped_contrast_name": row_s.get("mapped_contrast_name", ""), "feature_contrast_name": fs.contrast_name, "axis_mapped": row_s.get("axis_mapped", ""), "category_raw": row_s.get("category_raw", ""), "context_condition": row_s.get("context_condition", ""), "question_polarity": row_s.get("question_polarity", ""), "stereotyped_answer_idx": row_s.get("stereotyped_answer_idx", np.nan), "nonstereotyped_answer_idx": row_s.get("nonstereotyped_answer_idx", np.nan), "unknown_answer_idx": row_s.get("unknown_answer_idx", np.nan), "correct_answer_idx": row_s.get("correct_answer_idx", np.nan), "control_type": "sign_flip", "runtime_seconds": 0.0}
+                            out.update(row_metrics(base, inter, row_s))
+                            part_rows.append(out)
+                            done_path.open("a").write(json.dumps({"job_id": jid, "completed_at": datetime.now(timezone.utc).isoformat()}) + "\n")
                     for control_name in ["random_direction_norm_matched", "random_feature_matched"]:
                         jid = job_id([row_s["bbq_uid"], fs.layer, fs.set_id, alpha, "final_prompt_token", control_name, args.scoring_mode])
                         if jid in done:
