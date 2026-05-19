@@ -7,6 +7,7 @@ import argparse
 import html
 import json
 import logging
+import re
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -80,6 +81,39 @@ def as_bool(value: object) -> bool:
     return str(value).strip().lower() in {"true", "1", "yes"}
 
 
+LOW_INFORMATION_TOKENS = {
+    ".", ",", ":", ";", "?", "!", "-", "--", "—", "–", "'", '"', "`", "``", "''",
+    "(", ")", "[", "]", "{", "}", "/", "\\", "|",
+}
+LOW_INFORMATION_WORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "been", "being", "but", "by", "for",
+    "from", "had", "has", "have", "he", "her", "hers", "him", "his", "i", "in", "is",
+    "it", "its", "me", "my", "of", "on", "or", "our", "ours", "she", "that", "the",
+    "their", "theirs", "them", "they", "this", "to", "was", "we", "were", "with",
+    "you", "your", "who", "what", "when", "where", "why", "how", "which", "one",
+    "other", "another", "person", "people", "someone", "somebody",
+}
+
+
+def normalize_token_text(token: object) -> str:
+    text = str(token or "")
+    text = text.replace("Ġ", "").replace("▁", "").strip()
+    return text
+
+
+def is_low_information_token(token: object) -> bool:
+    text = normalize_token_text(token)
+    if not text:
+        return True
+    if text.lower() in LOW_INFORMATION_WORDS:
+        return True
+    if text in LOW_INFORMATION_TOKENS:
+        return True
+    if re.fullmatch(r"[\W_]+", text):
+        return True
+    return False
+
+
 def content_tokens(group: pd.DataFrame) -> pd.DataFrame:
     if group.empty or not {"token_start_char", "token_end_char"}.issubset(group.columns):
         return group.copy()
@@ -89,6 +123,24 @@ def content_tokens(group: pd.DataFrame) -> pd.DataFrame:
     ].copy()
     special = out["token_str"].astype(str).str.contains(r"<\|.*\|>", regex=True, na=False) if "token_str" in out.columns else pd.Series(False, index=out.index)
     return out[~special].copy()
+
+
+def rankable_tokens(group: pd.DataFrame) -> pd.DataFrame:
+    out = content_tokens(group)
+    if out.empty or "token_str" not in out.columns:
+        return out
+    role_flags = pd.Series(False, index=out.index)
+    for col in [
+        "is_target_identity_token",
+        "is_nontarget_identity_token",
+        "is_stereotype_language_token",
+        "is_answer_option_token",
+        "is_final_prompt_token",
+    ]:
+        if col in out.columns:
+            role_flags = role_flags | bool_col(out, col)
+    low_info = out["token_str"].map(is_low_information_token)
+    return out[role_flags | ~low_info].copy()
 
 
 def token_role(row: pd.Series) -> str:
@@ -184,8 +236,10 @@ def highlighted_prompt(prompt: str, group: pd.DataFrame) -> str:
 
 def card_html(layer: int, feature_id: int, group: pd.DataFrame, prepared: pd.DataFrame, meta: dict[str, object], summary: dict[str, object], top_prompts: int, top_tokens: int) -> str:
     group = content_tokens(group)
+    rank_group = rankable_tokens(group)
     behavior = classify_behavior(group)
-    prompt_scores = group.groupby("bbq_uid")["feature_activation"].max().sort_values(ascending=False).head(top_prompts) if not group.empty else pd.Series(dtype=float)
+    prompt_score_source = rank_group if not rank_group.empty else group
+    prompt_scores = prompt_score_source.groupby("bbq_uid")["feature_activation"].max().sort_values(ascending=False).head(top_prompts) if not prompt_score_source.empty else pd.Series(dtype=float)
     prepared_lookup = prepared.set_index("bbq_uid").to_dict("index")
     examples = []
     for uid, score in prompt_scores.items():
@@ -207,7 +261,7 @@ def card_html(layer: int, feature_id: int, group: pd.DataFrame, prepared: pd.Dat
             "</section>"
         )
     top_token_rows = []
-    top_token_df = group.sort_values("feature_activation", ascending=False).head(top_tokens).copy()
+    top_token_df = rank_group.sort_values("feature_activation", ascending=False).head(top_tokens).copy()
     for _, row in top_token_df.iterrows():
         top_token_rows.append(
             f"<tr><td>{html.escape(str(row.get('token_str', '')))}</td><td>{float(row.get('feature_activation', 0)):.4f}</td>"
@@ -231,7 +285,7 @@ body{{font-family:-apple-system,BlinkMacSystemFont,sans-serif;margin:24px;color:
 table{{border-collapse:collapse;width:100%;margin:8px 0}} th,td{{border:1px solid #ddd;padding:6px;vertical-align:top}} th{{background:#f1f5f9}} .metric-table th{{width:220px;text-align:left}} .explain{{color:#475569;font-size:13px}} .legend span{{display:inline-block;margin:4px 10px 4px 0;padding:3px 6px;border-radius:4px;background:#f8fafc}} .note{{color:#475569;line-height:1.45}}
 </style></head><body>
 <h1>BBQ SAE Feature Card: layer {layer}, feature {feature_id}</h1>
-<p class="note">These cards summarize SAE activations on BBQ prompts. They do not show steering results or repeated trials. Green background intensity is token activation relative to the maximum content-token activation within that displayed example. Colored outlines indicate token role.</p>
+<p class="note">These cards summarize SAE activations on BBQ prompts. They do not show steering results or repeated trials. Green background intensity is token activation relative to the maximum content-token activation within that displayed example. Colored outlines indicate token role. Top-token and top-example ranking exclude special tokens, punctuation-only tokens, and common stopwords unless the token has an interpretable role such as identity, stereotype-language, answer-option, or final-token.</p>
 <div class="legend"><b>Token role legend:</b>
 <span class="target_identity">target identity</span>
 <span class="nontarget_identity">non-target identity</span>
@@ -291,7 +345,7 @@ def main() -> None:
             summary_meta = summary_rows.iloc[0].to_dict() if not summary_rows.empty else {}
             behavior = classify_behavior(group)
             path.write_text(card_html(layer, int(feature_id), group, prepared, meta, summary_meta, args.top_prompts_per_feature, args.top_tokens_per_feature))
-            content_group = content_tokens(group)
+            content_group = rankable_tokens(group)
             index_rows.append({
                 "feature_id": int(feature_id),
                 "layer": layer,
