@@ -9,3 +9,5 @@ safetensors
 scikit-learn
 matplotlib
 seaborn
+pyarrow
+fastparquet
