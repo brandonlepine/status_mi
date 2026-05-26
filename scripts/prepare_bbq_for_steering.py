@@ -146,6 +146,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save_every_examples", type=int, default=1000)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--few_shot_pool",
+        type=Path,
+        default=None,
+        help=(
+            "Optional path to a JSON file produced by scripts/build_few_shot_pool.py. "
+            "When set, the pool exemplars are excluded from the prepared rows and a "
+            "formatted prefix is prepended to every remaining prompt. The prefix is "
+            "also recorded in the new 'few_shot_prefix' column for inspection."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -242,8 +253,8 @@ def read_bbq_files(bbq_dir: Path, categories: str | None, logger: logging.Logger
     return rows
 
 
-def prompt_for(row: dict[str, Any]) -> str:
-    return (
+def prompt_for(row: dict[str, Any], few_shot_prefix: str = "") -> str:
+    body = (
         f"Context:\n{row.get('context', '')}\n\n"
         f"Question:\n{row.get('question', '')}\n\n"
         "Answer choices:\n"
@@ -252,6 +263,30 @@ def prompt_for(row: dict[str, Any]) -> str:
         f"C. {row.get('ans2', '')}\n\n"
         "Answer:"
     )
+    return f"{few_shot_prefix}{body}" if few_shot_prefix else body
+
+
+def load_few_shot_pool(path: Path) -> tuple[str, set[tuple[str, int]]]:
+    """Return (formatted prefix, set of (source_file, example_id) to exclude).
+
+    Each exemplar in the pool already carries a rendered `exemplar_block`. The
+    prefix concatenates those blocks with a `---` separator and ends with one
+    more separator so the live prompt follows cleanly on a new line.
+    """
+    with path.open() as f:
+        pool = json.load(f)
+    exemplars = pool.get("exemplars", [])
+    if not exemplars:
+        raise ValueError(f"Few-shot pool at {path} is empty.")
+
+    sep = "\n\n---\n\n"
+    blocks = [ex["exemplar_block"] for ex in exemplars]
+    prefix = sep.join(blocks) + sep
+
+    exclude_keys: set[tuple[str, int]] = {
+        (ex["source_file"], int(ex["example_id"])) for ex in exemplars
+    }
+    return prefix, exclude_keys
 
 
 def identity_for(label: object, aliases: dict[str, str]) -> tuple[str, str, str]:
@@ -428,6 +463,30 @@ def main() -> None:
     aliases, identity_meta = load_identity_aliases(args.identity_forms_csv)
     contrasts = load_contrasts(args.triage_csv)
     raw_rows = read_bbq_files(args.bbq_data_dir, args.categories, logger)
+
+    few_shot_prefix = ""
+    few_shot_exclude: set[tuple[str, int]] = set()
+    if args.few_shot_pool is not None:
+        few_shot_prefix, few_shot_exclude = load_few_shot_pool(args.few_shot_pool)
+        logger.info(
+            "Loaded few-shot pool from %s: %d exemplars; %d (source_file, example_id) keys excluded.",
+            args.few_shot_pool, len(few_shot_exclude), len(few_shot_exclude),
+        )
+        before = len(raw_rows)
+        raw_rows = [
+            (p, r) for p, r in raw_rows
+            if (p.name, int(r.get("example_id", -1))) not in few_shot_exclude
+        ]
+        dropped = before - len(raw_rows)
+        if dropped != len(few_shot_exclude):
+            logger.warning(
+                "Few-shot exclusion expected to drop %d rows but dropped %d. "
+                "Check that pool example_ids correspond to rows present in --bbq_data_dir.",
+                len(few_shot_exclude), dropped,
+            )
+        else:
+            logger.info("Excluded %d few-shot exemplar rows from output.", dropped)
+
     if args.max_examples:
         raw_rows = raw_rows[: args.max_examples]
     logger.info("Loaded %d BBQ rows from %s", len(raw_rows), args.bbq_data_dir)
@@ -473,7 +532,8 @@ def main() -> None:
             "label": row.get("label", math.nan),
             "answer_info_json": json.dumps(answer_info, ensure_ascii=False),
             "stereotyped_groups_json": json.dumps(stereotyped_groups, ensure_ascii=False),
-            "prompt": prompt_for(row),
+            "prompt": prompt_for(row, few_shot_prefix),
+            "few_shot_prefix": few_shot_prefix,
             "unknown_answer_idx": answer_indices["unknown_answer_idx"],
             "stereotyped_answer_idx": answer_indices["stereotyped_answer_idx"],
             "nonstereotyped_answer_idx": answer_indices["nonstereotyped_answer_idx"],
