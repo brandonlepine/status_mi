@@ -1,8 +1,8 @@
 # Step 18 — `scripts/prepare_bbq_for_steering.py`
 
 **Stage:** 4 — BBQ steering and feature-level causal analysis
-**Runs after:** [Step 17 — `triage_sae_identity_features.py`](17_triage_sae_identity_features.md) (consumes `intervention_candidate_features_triaged.csv`)
-**Feeds into:** [Step 19 — `extract_bbq_token_level_sae_activations.py`](19_extract_bbq_token_level_sae_activations.md), [Step 20 — `run_bbq_sae_steering.py`](20_run_bbq_sae_steering.md), [Step 21 — `build_bbq_sae_feature_cards.py`](21_build_bbq_sae_feature_cards.md), [Step 22 — `analyze_bbq_steering_results.py`](22_analyze_bbq_steering_results.md), [Step 23 — `analyze_bbq_feature_level_causal_effects.py`](23_analyze_bbq_feature_level_causal_effects.md).
+**Runs after:** [Step 17 — `triage_sae_identity_features.py`](17_triage_sae_identity_features.md) (consumes `intervention_candidate_features_triaged.csv`); optionally [Step 18a — `build_few_shot_pool.py`](18a_build_few_shot_pool.md) (consumed via `--few_shot_pool`).
+**Feeds into:** [Step 18b — `diagnose_bbq_baseline.py`](18b_diagnose_bbq_baseline.md), [Step 19 — `extract_bbq_token_level_sae_activations.py`](19_extract_bbq_token_level_sae_activations.md), [Step 20 — `run_bbq_sae_steering.py`](20_run_bbq_sae_steering.md), [Step 21 — `build_bbq_sae_feature_cards.py`](21_build_bbq_sae_feature_cards.md), [Step 22 — `analyze_bbq_steering_results.py`](22_analyze_bbq_steering_results.md), [Step 23 — `analyze_bbq_feature_level_causal_effects.py`](23_analyze_bbq_feature_level_causal_effects.md).
 
 ## Purpose
 Convert raw BBQ JSONL benchmark rows into a steering-ready dataset by (a) normalizing each BBQ example's `category` to a project identity axis, (b) mapping the three `ans0/1/2` group labels to project `identity_id`s, (c) identifying the `unknown`, `stereotyped`, and `nonstereotyped` answer indices, (d) aligning the resulting `(target, nontarget, axis)` triple to an SAE contrast name from the triage CSV, and (e) emitting a fully-formed model prompt. Everything downstream — token-level extraction, steering, and feature-level causal analysis — is keyed off the `bbq_uid` and the `axis_mapped` / `mapped_contrast_name` / `mapped_contrast_confidence` columns this script writes.
@@ -11,9 +11,10 @@ Convert raw BBQ JSONL benchmark rows into a steering-ready dataset by (a) normal
 - `data/bbq/data/*.jsonl` — one file per BBQ category. Per-row fields used: `example_id`, `question_index`, `question_polarity` (`neg`/`nonneg`), `context_condition` (`ambig`/`disambig`), `category`, `answer_info` (mapping `ans0/1/2` → `[text, group_label]`), `additional_metadata.stereotyped_groups`, `context`, `question`, `ans0/1/2`, `label`.
 - `data/bbq_identity_normalized_forms.csv` — identity alias source. The script reads canonical forms (`canonical_label`, `adj_form`, `noun_form`, ..., `has_form`) and the semicolon-delimited `aliases` column to build a `text → identity_id` table; `MANUAL_ALIASES` is layered on top.
 - `results/.../triage/intervention_candidate_features_triaged.csv` — used only to derive the `contrast_name → axis` map so BBQ pairs can be matched to available SAE contrast directions.
+- *Optional:* `data/bbq/few_shot_pool.json` from [Step 18a](18a_build_few_shot_pool.md), passed via `--few_shot_pool`. When set, the pool's example_ids are excluded from output and the formatted prefix is prepended to every prompt.
 
 ## Outputs
-- `prepared/bbq_prepared_examples.csv` and `.parquet` — one row per BBQ example with `bbq_uid`, `axis_mapped`, `context_condition`, `question_polarity`, `prompt`, `unknown_answer_idx`, `stereotyped_answer_idx`, `nonstereotyped_answer_idx`, `target_identity_id`, `nontarget_identity_id`, `mapped_contrast_name`, `mapped_contrast_confidence` (∈ `{exact, alias, fallback_axis, unmapped}`), `polarity_role`, and a `notes` semicolon list.
+- `prepared/bbq_prepared_examples.csv` and `.parquet` — one row per BBQ example with `bbq_uid`, `axis_mapped`, `context_condition`, `question_polarity`, `prompt`, `few_shot_prefix` (empty when `--few_shot_pool` is not set, otherwise the formatted prefix that was prepended to `prompt`), `unknown_answer_idx`, `stereotyped_answer_idx`, `nonstereotyped_answer_idx`, `target_identity_id`, `nontarget_identity_id`, `mapped_contrast_name`, `mapped_contrast_confidence` (∈ `{exact, alias, fallback_axis, unmapped}`), `polarity_role`, and a `notes` semicolon list.
 - `prepared/bbq_mapping_diagnostics.csv` — rows with `notes` (missing-unknown, missing-stereotype, unmapped-contrast).
 - `prepared/bbq_contrast_mapping.csv` — the SAE-contrast registry derived from triage.
 - `prepared/bbq_prepare_summary.csv` — mapping-confidence counts and per-category coverage; logs a warning when overall mapping rate < 70%.
@@ -44,13 +45,23 @@ Convert raw BBQ JSONL benchmark rows into a steering-ready dataset by (a) normal
 
 ## Issues & Opportunities
 
-### 1.2 [MAJOR] — Base model vs. a multiple-choice QA benchmark
+### 1.2 [MAJOR] — Base model vs. a multiple-choice QA benchmark (PARTIAL FIX LANDED 2026-05-26)
 
-**What's wrong:** This script builds a zero-shot, `"Answer:"`-terminated prompt that is then scored against the `meta-llama/Llama-3.1-8B` *base* model (chosen so the OpenMOSS LlamaScope SAEs apply). Base models are weak at, and largely off-distribution for, BBQ-style multiple-choice QA. There is a real risk that the model places ~1–2% total probability mass on `{ans0, ans1, ans2}` and ~98% on free-form continuation text, in which case the entire steering signal is measured in a degenerate regime.
+**Status:** Code landed in two commits. What remains is to run both prompt modes on RunPod and decide based on the diff.
+
+- [Step 18a — `build_few_shot_pool.py`](18a_build_few_shot_pool.md) writes `data/bbq/few_shot_pool.json` (K=4, seeded, stratified across (ambig/disambig × neg/nonneg), distinct categories).
+- This script accepts `--few_shot_pool data/bbq/few_shot_pool.json`. When set, the four exemplar `(source_file, example_id)` keys are excluded from the prepared rows and a ~1.5kB formatted prefix is prepended to every remaining prompt. The prefix is also recorded in the new `few_shot_prefix` column so it can be audited or stripped.
+- [Step 18b — `diagnose_bbq_baseline.py`](18b_diagnose_bbq_baseline.md) consumes the prepared parquet and measures all three audit-required diagnostics: (i) total mass on the three options (both letters and answer-text first tokens), (ii) BBQ accuracy + polarity-signed bias score, (iii) argmax-vs-greedy agreement rate. Run it on both zero-shot and few-shot outputs and diff the JSONs.
+
+**What's wrong (original audit):** This script builds a zero-shot, `"Answer:"`-terminated prompt that is then scored against the `meta-llama/Llama-3.1-8B` *base* model (chosen so the OpenMOSS LlamaScope SAEs apply). Base models are weak at, and largely off-distribution for, BBQ-style multiple-choice QA. There is a real risk that the model places ~1–2% total probability mass on `{ans0, ans1, ans2}` and ~98% on free-form continuation text, in which case the entire steering signal is measured in a degenerate regime.
 
 **Why it matters:** Every downstream "bias margin", "stereotype preference delta", and "feature is causally implicated" claim presumes the model actually treats the three options as the answer space. If it does not, the deltas are noise on a small slice of probability.
 
-**Targeted fix:** Add a baseline diagnostic to `bbq_prepare_summary.csv` (or a sibling script) that, on a sample of the prepared prompts, reports (i) total `p(ans0) + p(ans1) + p(ans2)` mass, (ii) standard BBQ accuracy + bias score in this format, (iii) how often the per-option argmax matches the model's greedy continuation. Consider adding an alternative `prompt_for_fewshot` mode that prepends 3–5 BBQ exemplars and storing it in a parallel column so a few-shot run is possible without rewriting the dataset.
+**Remaining work:**
+- Run [Step 18b](18b_diagnose_bbq_baseline.md) on the zero-shot and few-shot prepared parquets on RunPod (see the [side-by-side invocation order](18b_diagnose_bbq_baseline.md#suggested-invocation-order-zero-shot-vs-few-shot-side-by-side)).
+- Decide which prompt mode to use for steering based on the diff (decision rule and metric table are in [Step 18b](18b_diagnose_bbq_baseline.md)).
+- Re-prepare with the chosen mode, then rerun [Step 19](19_extract_bbq_token_level_sae_activations.md) and [Step 20](20_run_bbq_sae_steering.md).
+- Record the chosen mode and headline numbers in the methods writeup as the audit-required "baseline precondition" section.
 
 ### 3.4 [MAJOR] — BBQ→SAE contrast mapping silently uses axis-fallback
 

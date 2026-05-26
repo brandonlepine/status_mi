@@ -41,7 +41,9 @@ Stage 3  SAE feature analysis, cards, triage
    17  triage_sae_identity_features.py              triage/intervention_candidate_features_triaged.csv  ← single most consequential output
 
 Stage 4  BBQ steering + causal analysis
+   18a build_few_shot_pool.py     (optional prereq)  data/bbq/few_shot_pool.json
    18  prepare_bbq_for_steering.py                  prepared/bbq_prepared_examples.{csv,parquet}
+   18b diagnose_bbq_baseline.py   (diagnostic)      prepared/baseline_diagnostics.{json,csv}
    19  extract_bbq_token_level_sae_activations.py   token_level_sae/token_activations/...
    20  run_bbq_sae_steering.py                      steering/results_parts/*.parquet   ← causal-intervention engine
    21  build_bbq_sae_feature_cards.py               feature_cards_filtered/...
@@ -74,7 +76,9 @@ Severity tags are aggregated per script from `issues_and_opportunities.md`. **B*
 | 15 | `build_sae_feature_cards.py` | 3 | m (logit-lens caveat) | [15_build_sae_feature_cards.md](15_build_sae_feature_cards.md) |
 | 16 | `plot_identity_sae_features.py` | 3 | m (5.10) | [16_plot_identity_sae_features.md](16_plot_identity_sae_features.md) |
 | 17 | `triage_sae_identity_features.py` | 3 | M (5.2) | [17_triage_sae_identity_features.md](17_triage_sae_identity_features.md) |
-| 18 | `prepare_bbq_for_steering.py` | 4 | M (1.2, 3.4, 4.1, 4.2) · m (4.4) | [18_prepare_bbq_for_steering.md](18_prepare_bbq_for_steering.md) |
+| 18a | `build_few_shot_pool.py` (prereq) | 4 | enabler (1.2 partial fix) | [18a_build_few_shot_pool.md](18a_build_few_shot_pool.md) |
+| 18 | `prepare_bbq_for_steering.py` | 4 | M (1.2 — partial fix, 3.4, 4.1, 4.2) · m (4.4) | [18_prepare_bbq_for_steering.md](18_prepare_bbq_for_steering.md) |
+| 18b | `diagnose_bbq_baseline.py` (diagnostic) | 4 | enabler (1.2, also touches 1.3, 2.4, 4.3) | [18b_diagnose_bbq_baseline.md](18b_diagnose_bbq_baseline.md) |
 | 19 | `extract_bbq_token_level_sae_activations.py` | 4 | M (3.3) · m (4.6) | [19_extract_bbq_token_level_sae_activations.md](19_extract_bbq_token_level_sae_activations.md) |
 | 20 | `run_bbq_sae_steering.py` | 4 | **B** (2.3, 3.1) · M (1.3, 2.4, 3.2, 3.3, 3.4) · m (3.5) | [20_run_bbq_sae_steering.md](20_run_bbq_sae_steering.md) |
 | 21 | `build_bbq_sae_feature_cards.py` | 4 | m (downstream inheritance) | [21_build_bbq_sae_feature_cards.md](21_build_bbq_sae_feature_cards.md) |
@@ -92,7 +96,7 @@ From Section 7 of `issues_and_opportunities.md`. These are the fixes to make bef
 3. **Re-enable steering controls** (2.3) — Step [20](20_run_bbq_sae_steering.md) ships with `sign_flip`, `random_direction_norm_matched`, `random_feature_matched`, but the production command uses `--disable_controls`. Add the difference-of-means direction as a parallel control (per 5.5).
 4. **Polarity-sign the bias metric** (4.3) — Step [23](23_analyze_bbq_feature_level_causal_effects.md)'s `stereotype_preference_delta` ignores `question_polarity`, so `effect_label`, `beneficial_score`, and the final candidates table are polarity-confounded.
 5. **Validate the measurement locus** (1.1) — Step [04](04_extract_identity_activations.md) stores the final non-padding token, which is essentially always the period. Compare to identity-span-pooled extraction (Step [14](14_extract_token_level_sae_activations.md) already locates spans; Step [05](05_encode_identity_saes.md)'s `token_span` mode is scaffolded but `NotImplementedError`).
-6. **Characterize baseline behavior** (1.2) — Llama-3.1-8B-Base on a `"Answer:"`-format MCQ may put almost no probability on the answer options. Before any steering claim, report total mass on the three options, baseline BBQ accuracy/bias, and argmax-over-options vs greedy continuation.
+6. **Characterize baseline behavior (1.2 — PARTIAL FIX LANDED).** Few-shot pool + prepare integration + a dedicated diagnostic ([Step 18a](18a_build_few_shot_pool.md) / [Step 18](18_prepare_bbq_for_steering.md) `--few_shot_pool` / [Step 18b](18b_diagnose_bbq_baseline.md)) all landed 2026-05-26. **Remaining work:** run both zero-shot and few-shot variants on RunPod, diff `baseline_diagnostics.json` (decision table in [Step 18b](18b_diagnose_bbq_baseline.md#suggested-invocation-order-zero-shot-vs-few-shot-side-by-side)), and pick a prompt mode for steering. Until the diagnostic is run, the precondition is unmet — code is in place, numbers are not.
 
 Tier 2 and Tier 3 are in `issues_and_opportunities.md` Section 7. The per-step docs reference them inline where they apply.
 

@@ -27,16 +27,22 @@ What to do:
 - Report whichever location carries the signal, and justify it. If final-token *does* carry it, that is itself a finding worth showing (with the span-pooled comparison as evidence).
 - This single change de-risks the largest assumption in the project.
 
-### 1.2 [MAJOR] Base model vs. a multiple-choice QA benchmark
+### 1.2 [MAJOR] Base model vs. a multiple-choice QA benchmark (PARTIAL FIX LANDED 2026-05-26)
 
-`download_llama_3_1_8b.py` pulls `meta-llama/Llama-3.1-8B` — the **base** model (correct for SAE compatibility: OpenMOSS LlamaScope SAEs are trained on `Llama3_1-8B-Base`). But BBQ is a QA benchmark, and `prepare_bbq_for_steering.py` builds a zero-shot prompt ending in `"Answer:"`. Base models are weak at, and often off-distribution for, this format.
+**Status:** Code landed; the RunPod measurement remains.
+
+- `scripts/build_few_shot_pool.py` writes `data/bbq/few_shot_pool.json` (K=4, seeded, stratified across (ambig/disambig × neg/nonneg), distinct categories, `Answer: <LETTER>. <text>` format).
+- `scripts/prepare_bbq_for_steering.py` accepts `--few_shot_pool`. When set, the pool's `(source_file, example_id)` keys are excluded and the formatted prefix is prepended to every remaining prompt (also recorded in a new `few_shot_prefix` column). Without the flag, behavior is identical to today.
+- `scripts/diagnose_bbq_baseline.py` (new) consumes the prepared parquet, runs Llama-3.1-8B-Base, and emits `baseline_diagnostics.{json,csv}` with all three audit-required diagnostics: (i) total mass on the three options measured both on the answer LETTERS and on each answer text's first token, (ii) polarity-signed BBQ accuracy + bias score on ambig and disambig strata, (iii) argmax-over-options vs greedy-continuation agreement rate. `--dry_run` validates data flow without the model.
+
+**Original audit:** `download_llama_3_1_8b.py` pulls `meta-llama/Llama-3.1-8B` — the **base** model (correct for SAE compatibility: OpenMOSS LlamaScope SAEs are trained on `Llama3_1-8B-Base`). But BBQ is a QA benchmark, and `prepare_bbq_for_steering.py` builds a zero-shot prompt ending in `"Answer:"`. Base models are weak at, and often off-distribution for, this format.
 
 Why it matters: the entire BBQ causal story rests on the model placing *meaningful, well-calibrated probability mass on the answer options*. If the base model puts 1–2% total mass on the three options and 98% on continuation text, the logprob deltas you steer are in a degenerate regime and "bias" is barely defined.
 
-What to do:
-- Report, at baseline: (i) total probability mass on the three answer options, (ii) the standard BBQ accuracy and bias score for Llama-3.1-8B-Base in this prompt format, (iii) how often the argmax-over-options matches the model's actual greedy continuation. Put this in the paper as a precondition.
-- Consider a few-shot prompt (3–5 BBQ exemplars) to pull the base model onto the task distribution before steering.
-- If behavior is too degenerate, the honest move is to either (a) accept that and frame results around logprob *margins* (which are still defined), or (b) reconsider scope. Do not paper over it.
+Remaining work:
+- Run `diagnose_bbq_baseline.py` on RunPod against (a) a zero-shot prepared parquet and (b) a few-shot prepared parquet, then diff the two `baseline_diagnostics.json` files. The decision rule is documented in `docs/pipeline_steps/18b_diagnose_bbq_baseline.md`.
+- Pick the prompt mode for steering based on that diff; record the headline numbers in the methods writeup as the precondition the audit requires.
+- If even few-shot leaves the model degenerate, fall back to one of the audit's honest options: (a) frame results around logprob *margins* (still defined), or (b) reconsider scope.
 
 ### 1.3 [MAJOR] First-token answer scoring is degenerate for BBQ answers
 
