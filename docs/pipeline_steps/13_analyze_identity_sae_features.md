@@ -1,0 +1,119 @@
+# Step 13 — `analyze_identity_sae_features.py`
+
+**Stage:** 3 — Identity-selective SAE feature analysis
+**Runs after:** `encode_identity_saes.py` (produces top-k feature indices/values + decoder), `extract_identity_activations.py` (residual activations + metadata)
+**Feeds into:** `extract_token_level_sae_activations.py`, `build_sae_feature_cards.py`, `plot_identity_sae_features.py`, `triage_sae_identity_features.py`, ultimately `prepare_bbq_for_steering.py` and `run_bbq_sae_steering.py` (via the triaged CSV)
+
+> **CRITICAL NOTE — load-bearing for fixing 3.1.** This script defines four feature-level intervention helpers (`ablate_features_in_sae`, `steer_features_in_sae`, `decode_sae`, `patch_residual_with_sae_reconstruction`) at lines 414–434, but **none of them are called from `main()`**. The downstream steering pipeline (`run_bbq_sae_steering.py`) implements decoder-direction addition instead of an actual feature-level intervention. Wiring these helpers into the steering hook is the cleanest path to resolving issue 3.1. See `20_run_bbq_sae_steering.md` (forthcoming) for the consumer side.
+
+## Purpose
+
+The bridge from "geometric contrast directions" to "individual SAE features." For each layer, this script computes per-feature identity selectivity and per-contrast selectivity statistics (Cohen's d, AUC, mean/freq comparisons), decoder-row alignment with the difference-of-means contrast direction, a reconstruction analysis (how much of the contrast direction is captured by top-k decoder rows), and an intervention-candidate shortlist that downstream scripts treat as the feature pool.
+
+## Inputs
+
+- `results/sae_identity/llama-3.1-8b/final_token/layer_XX/feature_indices_top64.npy` and `feature_values_top64.npy` — top-k SAE encodings.
+- `results/sae_identity/llama-3.1-8b/final_token/layer_XX/sae_decoder.npy` — decoder rows `(n_features, hidden_dim)`.
+- `results/activations/llama-3.1-8b/identity_prompts_final_token/layer_XX.npy` — raw final-token residual activations.
+- `results/activations/.../metadata.csv` — row-aligned prompt metadata (`identity_id`, `axis`, `family`, `template_id`, `required_form`, `canonical_label`).
+- `DEFAULT_CONTRASTS` (21 entries, lines 22-44) — the contrast registry, or `--contrasts_csv` override.
+
+## Outputs (under `<output_dir>/`, default `.../final_token/analysis/`)
+
+- `feature_identity_selectivity.csv` — per (layer, identity, feature) `mean_identity`, `mean_other_same_axis`, `cohens_d`, `auc`, `freq_*`.
+- `feature_selectivity.csv` — per (layer, contrast, feature) Cohen's d / AUC / diff_mean and ranks.
+- `decoder_direction_alignment.csv` — per (layer, contrast, feature) `cosine_with_direction`, `signed_dot`, norm.
+- `feature_selectivity_alignment_joined.csv` — selectivity + alignment merged, plus `combined_score = z(|d|) + z(|cos|) + z(|auc − 0.5|)`.
+- `direction_reconstruction.csv` — for `k ∈ {5, 10, 20, 50, 100, 200}` × `{decoder_alignment, selectivity, combined_score, random_baseline}`, cosine and "fraction norm captured" of the reconstructed direction.
+- `intervention_candidate_features.csv` — top-N per contrast by `combined_score`, with `direction_side`, `recommended_intervention="ablate"`.
+- `run_config.json`.
+
+## Key implementation details
+
+- Residualization (default `family_residualized`) is applied to the **activations** (`residualize()`, line 102): subtract per-family mean, add back the global mean. This affects the contrast `direction` and `evaluate_direction` scores — but the SAE encodings in `long_df` come from `encode_identity_saes.py`, which encoded **raw** activations. The two representations are mixed. See issue 5.4.
+- Contrast direction (`compute_direction`, line 121) is the unit-normalized centered `mean(A) − mean(B)`, sign-flipped so identity_a scores higher.
+- `feature_selectivity_for_contrast` (line 199): first filters to top `5 × top_n` features by `|diff_mean|`, then computes Cohen's d / AUC only on that subset, then keeps top `top_n` by `|d|`. This selection screen biases the reported `d`/`auc` upward. See issue 2.5.
+- `reconstruct_direction` (line 323) does `coeff = basis @ direction; recon = coeff @ basis` — i.e. `BᵀB d` with `B` having unit-norm but **not orthogonal** rows. This is not an orthogonal projection. See issue 5.1.
+- `combined_score` (line 481) sums three z-scored magnitudes: `|d|`, `|cos|`, `|auc − 0.5|`. Since `d` and `auc` measure the same A/B separation, this double-weights selectivity vs alignment. See issue 5.3.
+- Output CSVs are **appended** (`append_csv`) per layer/contrast, so the existing run requires `--overwrite` to rebuild cleanly.
+- The four SAE intervention helpers (lines 414-434) — `ablate_features_in_sae`, `steer_features_in_sae`, `decode_sae`, `patch_residual_with_sae_reconstruction` — are defined and exported but never invoked in `main()`. They are the missing primitives for a real feature-level intervention.
+
+## Issues & Opportunities
+
+> **Upstream callout — issue 1.4 (CONFIRMED).** Every input this script reads from `results/sae_identity/.../layer_XX/` was produced by the broken encoder in [Step 5](05_encode_identity_saes.md#14-blocker--sae-preprocessing-convention-confirmed-wrong-concrete-fix-below) (plain ReLU instead of JumpReLU θ=0.7539, missing `× 64/29.125` input normalization, spurious `−b_dec` pre-encoder). All `feature_*_selectivity.csv`, `decoder_direction_alignment.csv`, `direction_reconstruction.csv`, and `intervention_candidate_features.csv` artifacts must be regenerated after Step 5 is fixed and Step 6 verifies recon FVU/cosine. The script logic below is sound; only its inputs are wrong.
+
+### 2.5 [MAJOR] — Selection-induced bias ("winner's curse") in feature effect sizes
+
+**What's wrong:** `feature_selectivity_for_contrast` filters to the top `5 · top_n` features by `|diff_mean|`, then computes Cohen's d and AUC only on that surviving subset, then re-ranks and keeps the top `top_n` by `|d|`. Because `diff_mean` and `d` are highly correlated, the reported `d`/`auc` are conditioned on having survived a selection screen and are inflated.
+
+**Why it matters:** Every downstream "this feature has Cohen's d = X" number in `feature_selectivity.csv` (and the `combined_score` derived from it, and the triage thresholds keyed off `|d|`, and the steering pool) is a post-selection estimate without a confirmation set.
+
+**Targeted fix:** Either (a) compute `d`/`auc` for **all** features (cheap on sparse `long_df`) or (b) split prompts into a selection set and a confirmation set per identity pair, screen on the first and report effect sizes on the second. At minimum, drop the `5 · top_n` `|diff_mean|` prefilter — the cost of computing AUC on `n_features` is tractable. Reflect this in `feature_selectivity.csv` schema by labeling current columns as "screening-set" and adding "holdout" columns.
+
+### 5.1 [MAJOR] — Direction reconstruction treats decoder rows as an orthonormal basis
+
+**What's wrong:** `reconstruct_direction` (line 323) computes `basis = decoder_normed[feature_ids]`, then `coeff = basis @ direction; recon = coeff @ basis`. This is `BᵀB d`. With `B` having unit-norm rows but **not** orthogonal rows (related identity features generally are not orthogonal), the orthogonal projection of `d` onto `span(B)` is actually `Bᵀ(BBᵀ)⁻¹B d`. So `fraction_norm_captured = ||recon||²` is not bounded in `[0, 1]` and is not a fraction of anything, and `cosine_with_full_direction` is taken against a non-projection vector.
+
+**Why it matters:** The reconstruction table is meant to answer "how much of the identity direction do `k` SAE features capture" — a natural and reviewable claim. As written the headline number in `direction_reconstruction.csv` does not have the interpretation the column name implies.
+
+**Targeted fix:** Replace the `coeff @ basis` line with a proper least-squares solve: `coeff, *_ = np.linalg.lstsq(basis.T, direction, rcond=None); recon = coeff @ basis`. Equivalently, orthonormalize `B` via QR (`Q, _ = np.linalg.qr(basis.T); recon = (Q.T @ direction) @ Q.T`). Then `fraction_norm_captured = ||recon||² / ||direction||²` (and direction is unit-norm so this is `||recon||²` in `[0, 1]`).
+
+### 5.3 [MINOR] — `combined_score` sums three near-duplicate, equally-weighted metrics
+
+**What's wrong:** `combined_score = zscore(|cohens_d|) + zscore(|cos|) + zscore(|auc − 0.5|)` (line 481). Cohen's d and AUC both measure the same A/B distribution separation and are monotonically related, so the score effectively double-weights selectivity relative to decoder alignment.
+
+**Why it matters:** Propagates into `intervention_candidate_features.csv`, into `extract_token_level_sae_activations.py:select_features` (which picks features by `combined_score`), into `build_sae_feature_cards.py`, and into the triage. The "top by combined_score" features are systematically biased toward selectivity-only features over alignment-only features.
+
+**Targeted fix:** Pick **one** selectivity metric (d **or** AUC) and combine with decoder cosine. E.g. `combined_score = 0.5 zscore(|d|) + 0.5 zscore(|cos|)`. Document the weighting choice in `run_config.json`. Re-run downstream feature selection.
+
+### 5.4 [MINOR] — Residualized direction vs raw-encoded SAE features inconsistency
+
+**What's wrong:** The contrast `direction` is computed from `family_residualized` activations (line 466), but the SAE feature values in `long_df` come from `encode_identity_saes.py`, which encoded **raw** (non-residualized) activations. `decoder_alignment` then takes the cosine between a raw-space decoder row and a residualized-space direction, and `combined_score` mixes a residualized-direction cosine with a raw-SAE-activation `cohens_d`.
+
+**Why it matters:** The two quantities live in slightly different spaces. The "decoder alignment" claim is implicitly "this decoder row points in the residualized direction" but the decoder was trained on raw residuals.
+
+**Targeted fix:** Pick one representation and stick with it. Two consistent choices:
+- **Raw end-to-end:** drop residualization in this script, accept that template/family variance is baked into the direction (and document it).
+- **Residualized end-to-end:** re-encode the residualized activations through the SAE (call `relu((x_resid - b_dec) @ w_enc + b_enc)`), and rebuild `long_df` from those activations. The encoder lives in `encode_identity_saes.py`; either import it or factor the encode step into a shared helper.
+
+Add the chosen mode to `run_config.json` and assert downstream.
+
+### 3.1 (load-bearing context) [BLOCKER] — Feature-level intervention helpers exist here but are never used
+
+**What's wrong (in this file):** Lines 414-434 define `ablate_features_in_sae(latent_acts, feature_ids)`, `steer_features_in_sae(latent_acts, feature_ids, alpha)`, `decode_sae(latent_acts, decoder, decoder_bias)`, and `patch_residual_with_sae_reconstruction(original_x, modified_reconstruction, original_reconstruction)`. These are exactly the primitives needed for the encode → modify-latent-`f` → decode → patch loop that issue 3.1 says the BBQ steering pipeline is missing. `main()` does not call any of them. `run_bbq_sae_steering.py` does not call them either — it uses decoder-vector addition.
+
+**Why it matters:** As long as steering is "add a unit-norm direction at one token," the SAE contributes only a direction; the headline causal claim ("we found SAE features causally implicated in bias") cannot be supported. With these helpers wired in, the headline becomes a proper feature ablation/clamp.
+
+**Targeted fix:** Move these four functions into a small shared module (e.g. `scripts/sae_interventions.py` or a new `status_mi/common.py`, see 5.10) and import them from `run_bbq_sae_steering.py`. The hook in `run_bbq_sae_steering.py:install_hook` should be rewritten to:
+1. Compute `latent = encode_selected_features(h)` (already implemented in `extract_token_level_sae_activations.py`).
+2. Compute `recon_original = decode_sae(latent, w_dec, b_dec)`.
+3. Compute `latent_modified = ablate_features_in_sae(latent, feature_ids)` (or `steer_features_in_sae(..., alpha)` against `p95`).
+4. Compute `recon_modified = decode_sae(latent_modified, w_dec, b_dec)`.
+5. Patch: `h = patch_residual_with_sae_reconstruction(h, recon_modified, recon_original)` at the chosen token positions.
+
+This is the cleanest single change that converts "direction steering" into a feature-level causal test. Make ablation the primary mode (no alpha grid needed).
+
+### 5.10 [MINOR] — Heavy code duplication across analysis scripts
+
+**What's wrong:** `cohens_d`, `compute_direction`, `residualize`, `normalize`, `DEFAULT_CONTRASTS` are re-implemented in this script and again in `analyze_identity_geometry.py`, `analyze_identity_geometry_diagnostics.py`, `analyze_shared_social_subspace.py`, and the plotting scripts. The contrast list also contains identity IDs (`ses_low_income`, `ses_high_socioeconomic_status`) that do not exist in `bbq_identity_normalized_forms.csv` (see issue 4.1).
+
+**Why it matters:** Drift between copies is silent (e.g. a sign convention change in one file). The contrast registry duplication also means the silent skips in `load_contrasts` (line 92, `if skipped: print(...)` — only a `print`, not a warning) happen independently in every consumer.
+
+**Targeted fix:** Extract into `status_mi/common.py` (or `scripts/_common.py`): the effect-size and direction helpers, the residualization function, a **validated** `DEFAULT_CONTRASTS` registry that asserts every identity ID exists in `bbq_identity_normalized_forms.csv` at import time, the SAE intervention helpers (also see 3.1 above). Replace the silent `print(...)` with a hard error or at minimum a `warnings.warn`.
+
+## Rebuild checklist
+
+- [ ] Audit `DEFAULT_CONTRASTS` (lines 22-44) against `bbq_identity_normalized_forms.csv`. Drop or rename `ses_low_income`, `ses_high_socioeconomic_status`; replace with `ses_low_income → ses_low` or `ses_poor`, and add the contrasts that should have been there. Tie this to the shared registry (5.10).
+- [ ] Decide on a single representation: residualize end-to-end (re-encode through SAE on residualized activations) **or** keep everything raw. Document in `run_config.json`. (5.4)
+- [ ] Replace `feature_selectivity_for_contrast`'s `|diff_mean|` prefilter with full computation, or split prompts into selection/confirmation halves and add holdout columns. (2.5)
+- [ ] Replace `reconstruct_direction` with a proper least-squares projection (`np.linalg.lstsq` or QR). Re-derive `fraction_norm_captured` as the normalized squared norm. (5.1)
+- [ ] Rebalance `combined_score`: use one of `|d|`/`|auc-0.5|` plus `|cos|` with a documented weighting. (5.3)
+- [ ] Extract `ablate_features_in_sae`, `steer_features_in_sae`, `decode_sae`, `patch_residual_with_sae_reconstruction` into a shared module so `run_bbq_sae_steering.py` can import them. (3.1)
+- [ ] Convert `load_contrasts`'s silent `print` into a `warnings.warn` (or fail) so missing identity IDs cannot be masked. (4.1)
+- [ ] Re-run with `--overwrite` after the above; downstream scripts (token-level extraction, feature cards, triage) must be re-run to pick up the new CSVs.
+
+## Notes from the doc audit
+
+- `intervention_candidate_features.csv` hardcodes `"recommended_intervention": "ablate"` for every row (line 408), even though the steering runner ignores the field and instead applies decoder-vector addition with both positive and negative `alpha`. The field reads as a specification but is currently aspirational. After the 3.1 fix, this field should become load-bearing.
+- `load_contrasts` skips silently with only a `print` (line 98). Combined with the missing-ID problem in `DEFAULT_CONTRASTS`, the SES axis effectively runs with two contrasts instead of four, with no error.
+- `decoder_direction_alignment.csv` only writes the top-N by each of three ranks per contrast (lines 483-487), so a feature that is mid-rank in every contrast may not appear in this CSV at all — `triage_sae_identity_features.py` joins on this file and the missing rows fall back to `max_abs_decoder_cosine = 0`. Either widen the write here or use the full `alignment` frame.

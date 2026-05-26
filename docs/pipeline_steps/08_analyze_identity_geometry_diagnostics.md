@@ -1,0 +1,94 @@
+# Step 8 — `analyze_identity_geometry_diagnostics.py`
+
+**Stage:** 2 — Identity-geometry analyses (second pass / surface-form controls)
+**Runs after:** `extract_identity_activations.py` (Stage 1); typically also after [Step 7](07_analyze_identity_geometry.md), though it does not consume Step 7's outputs.
+**Feeds into:** Diagnostic figures, downstream SAE-feature analysis (which by default uses `family_residualized` activations), [Step 11](11_plot_identity_directional_visualizations.md), [Step 12](12_plot_identity_directional_followups.md).
+
+## Purpose
+Asks the central robustness question for the geometry pipeline: **does identity structure survive controls for prompt surface form?** Computes variance decomposition (η²) by metadata factor, residualizes activations against `family` / `template_id` / `required_form`, then re-runs PCA, identity probes, surface-form probes, and contrasts under each residualization. Produces per-layer plots and per-axis PCA scatters at `selected_layers_for_plots` (default `0,8,16,24,32`).
+
+## Inputs
+- `results/activations/llama-3.1-8b/identity_prompts_final_token/layer_XX.npy` (per-layer final-token residuals)
+- `results/activations/.../identity_prompts_final_token/metadata.csv`
+- Optionally `--geometry_dir` (default sibling of `--output_dir`) if any first-pass outputs are reused
+
+## Outputs
+- `diagnostics/variance_decomposition.csv` — one row per `(layer, factor)` with η² for `family`, `template_id`, `required_form`, `axis`, `identity_id`
+- `diagnostics/pca_residualized/{raw, family_residualized, template_residualized, required_form_residualized}/pca_layer_XX.csv` + `pca_explained_variance.csv`
+- `diagnostics/probes/axis_probe_residualized_scores.csv`, `identity_within_axis_probe_residualized_scores.csv`, `surface_form_probe_scores.csv`
+- `diagnostics/contrasts/contrast_full_residualized_scores.csv` (full-data AUC/d), `contrast_family_holdout_residualized_scores.csv`
+- `diagnostics/figures/...` — variance-decomposition curves, probe macro-F1 by layer × residualization, contrast AUC by layer, per-axis PCA scatters / progression panels, optional UMAP
+- `diagnostics/run_config.json`
+
+## Key implementation details
+- **Residualization variants.** `RESIDUALIZATIONS = {"raw": None, "family_residualized": "family", "template_residualized": "template_id", "required_form_residualized": "required_form"}`. `residualize(x, metadata, group_col)` subtracts the per-`group_col` mean and adds back the global mean, yielding a per-group-mean-zero activation.
+- **Variance decomposition.** `variance_decomposition_layer` computes between-group SS / total SS as `eta_squared = ss_factor / ss_total` for each factor in `FACTORS = ["family", "template_id", "required_form", "axis", "identity_id"]`. One row per (layer, factor).
+- **Probe model.** `LogisticRegression(class_weight="balanced", solver="saga" by default, max_iter=500)` via the same `crossval_probe` pattern as [Step 7](07_analyze_identity_geometry.md) (`make_probe_features` does `StandardScaler` + `PCA(probe_pca_dim=64)`).
+- **Surface-form probes (raw only).** Predict `required_form` and `family` from activations, grouped by `identity_id`. These are the *positive controls* for surface leakage — if identity probes are high but surface-form probes on raw activations are also high, the identity probes may be picking up surface form.
+- **Contrasts.** Same `CONTRASTS` list as [Step 7](07_analyze_identity_geometry.md); for each residualization computes both full-data and family-holdout AUC/d.
+- **Resume + partial runs.** `--resume` reuses existing per-layer outputs. `--skip_*` and `--only_*` flags allow rerunning a single phase (e.g. `--only_variance`, `--skip_umap`, `--skip_surface_form_probes`).
+- **Plots.** Static matplotlib (Okabe-Ito palette) for variance decomposition, probe curves, contrast AUC, and per-axis PCA scatters at the layers in `--selected_layers_for_plots`.
+
+## Strengths to preserve (audit Section 6)
+
+These are explicitly called out as keepers in `docs/issues_and_opportunities.md` §6 and should survive any refactor:
+
+- **Surface-form residualization diagnostics.** Residualizing by `family` / `template_id` / `required_form` and re-running PCA / probes / contrasts directly attacks the "are we measuring identity or template?" confound. This is the right instinct and a genuine project strength.
+- **Family-holdout / family-to-family generalization.** Training a direction on some families and evaluating on held-out ones is a real generalization test. (Make these the headline numbers — see 2.1 below.)
+- **Variance decomposition (η²)** by metadata factor is a clean, honest way to show how much variance identity explains relative to surface form.
+
+Do not collapse the residualization grid into a single "best" residualization — the comparison across `raw`, `family`, `template_id`, `required_form` is itself a result.
+
+## Issues & Opportunities
+
+### 2.1 [MAJOR] — Headline contrast AUC / Cohen's d are in-sample (circular)
+
+**What's wrong:** `run_contrasts` here writes `contrast_full_residualized_scores.csv` using the same `mean(A) − mean(B)` direction definition and same-prompt evaluation as [Step 7](07_analyze_identity_geometry.md). The honest `contrast_family_holdout_residualized_scores.csv` is also written, but the "full" CSV is what gets plotted in `contrast_full_auc_residualized_by_layer`.
+
+**Why it matters:** The residualization story ("identity geometry survives family residualization") is only convincing if the AUC compared across residualizations is held-out. With in-sample AUC, a residualization that hurts only generalization (not in-sample separability) will look harmless.
+
+**Targeted fix:** Make `plot_contrast_full_auc_residualized_by_layer` read from `contrast_family_holdout_residualized_scores.csv` instead (or add a held-out variant of that plot, demote the in-sample one to `*_in_sample`). Same change in [Step 10](10_plot_identity_geometry.md), [Step 11](11_plot_identity_directional_visualizations.md), [Step 12](12_plot_identity_directional_followups.md).
+
+### 2.2 [BLOCKER] — No null model for the central claims
+
+**What's wrong:** The residualized probe and contrast numbers are reported absolutely, with no permutation null. Across four residualizations the implicit comparison "raw vs residualized" is also uncalibrated — it is unclear how much the residualization-induced drop in AUC exceeds what shuffling `identity_id` labels would produce.
+
+**Why it matters:** Without a null, "η² for identity is X" and "axis probe macro-F1 drops from A to B under family residualization" are descriptive statistics, not findings.
+
+**Targeted fix:** Add a permutation null (shuffle `identity_id` within `family` strata, ≥100 reps) to the probes and contrasts; for variance decomposition, report η² alongside the null distribution of η² under shuffled labels. Save null summaries alongside the observed CSVs (`*_null_mean`, `*_null_sd`, `*_z_score`).
+
+### 4.1 [MAJOR] — Contrast lists reference identities that do not exist (silently skipped)
+
+**What's wrong:** The `CONTRASTS` list here is identical to [Step 7](07_analyze_identity_geometry.md)'s and contains the same nonexistent identity IDs — `ses_low_income`, `ses_high_socioeconomic_status` — that get silently filtered out. The diagnostics CSVs therefore have fewer rows for SES than expected.
+
+**Why it matters:** Any cross-residualization summary that says "mean AUC across SES contrasts" silently averages a smaller set than the code implies. After a dataset edit, the row count changes without anyone noticing.
+
+**Targeted fix:** Import the validated contrast registry from `status_mi/common.py` (per 5.10). Fail loudly at startup if any contrast identity is missing.
+
+### 5.9 [MINOR] — PCA on StandardScaler-ed activations changes the geometry
+
+**What's wrong:** Same as in [Step 7](07_analyze_identity_geometry.md): `StandardScaler` before `PCA` for both `pca_residualized/...` outputs and `make_probe_features`.
+
+**Why it matters:** Explained-variance ratios describe standardized space; comparing them across residualizations is still meaningful, but absolute values should be stated as "post-z-score."
+
+**Targeted fix:** Add `--scaling {standardize, center_only}` and record in `run_config.json`. Show that residualization conclusions are stable under both.
+
+### 5.10 [MINOR] — Heavy code duplication across analysis scripts
+
+**What's wrong:** `cohens_d`, `contrast_direction`, `residualize`, `OKABE_ITO`, `CONTRASTS`, `evaluate_contrast_scores` are copy-pasted from [Step 7](07_analyze_identity_geometry.md). The residualization implementation here is the canonical one — `analyze_shared_social_subspace.py` and the directional plotting scripts copy it.
+
+**Why it matters:** A future fix to residualization (e.g. changing how the global-mean offset is handled) requires editing four files in sync.
+
+**Targeted fix:** Move `residualize` and the residualization map into `status_mi/common.py` as the source of truth; import from there in this script and in [Step 9](09_analyze_shared_social_subspace.md), [Step 11](11_plot_identity_directional_visualizations.md), [Step 12](12_plot_identity_directional_followups.md).
+
+## Rebuild checklist
+- [ ] Import `CONTRASTS` / `residualize` / `cohens_d` / `evaluate_contrast_scores` from the shared module; remove the local copies.
+- [ ] Add permutation-null support to `crossval_probe` and to `run_contrasts` (held-out and full variants); write `*_null_mean`, `*_null_sd`, `*_z_score`, `*_p_value` columns.
+- [ ] Rewire `plot_contrast_full_auc_residualized_by_layer` to read held-out AUC by default; rename the in-sample plot `*_in_sample_diagnostic`.
+- [ ] Add `--scaling {standardize, center_only}`; rerun with `center_only` and confirm residualization conclusions hold.
+- [ ] Fit `StandardScaler` + `PCA` inside each CV fold in `make_probe_features`, or document the leakage and provide a one-layer sensitivity check.
+- [ ] Preserve the η² / surface-form-probe / family-holdout machinery — these are project strengths.
+
+## Notes from the doc audit
+- `--n_splits` defaults to 3 here but 5 in [Step 7](07_analyze_identity_geometry.md). When comparing probe macro-F1 across the two scripts (which is tempting because both publish per-layer probe accuracy), the difference in fold count is a real confound.
+- The diagnostics script supports `--solver saga` and `--max_iter 500` whereas Step 7 hardcodes `lbfgs` and `max_iter=2000`; document this in the rebuild plan.
