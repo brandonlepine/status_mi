@@ -19,12 +19,21 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from encode_identity_saes import find_sae_files, load_configs, load_weight_tensors  # noqa: E402
+from encode_identity_saes import (  # noqa: E402
+    find_sae_files,
+    load_configs,
+    load_weight_tensors,
+    load_sae,
+    encode_full,
+    decode_full,
+)
 
 
 DEFAULT_ACTIVATION_DIR = Path("/workspace/status_mi/results/activations/llama-3.1-8b/identity_prompts_final_token")
 DEFAULT_SAE_DIR = Path("/workspace/status_mi/saes/openmoss/Llama3_1-8B-Base-LXR-32x")
 DEFAULT_OUTPUT_DIR = Path("/workspace/status_mi/results/sae_identity/llama-3.1-8b/hook_validation")
+DEFAULT_RECON_FVU_THRESHOLD = 0.15
+DEFAULT_RECON_SAMPLE_N = 4096
 
 
 def parse_args() -> argparse.Namespace:
@@ -36,6 +45,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model_path", type=Path, default=None)
     parser.add_argument("--allow_mismatch", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--check_reconstruction",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Encode a sample of real activations through the SAE and decode them; "
+             "fail validation if FVU exceeds --reconstruction_fvu_threshold. This is "
+             "the standing regression test for audit issue 1.4 (encoder fix).",
+    )
+    parser.add_argument(
+        "--reconstruction_fvu_threshold",
+        type=float,
+        default=DEFAULT_RECON_FVU_THRESHOLD,
+        help="Maximum acceptable FVU (fraction of variance unexplained) for the recon check.",
+    )
+    parser.add_argument(
+        "--reconstruction_sample_n",
+        type=int,
+        default=DEFAULT_RECON_SAMPLE_N,
+        help="Number of activation rows to sample for the recon check.",
+    )
+    parser.add_argument(
+        "--recon_device",
+        default=None,
+        help="Device for the recon check (cuda / cuda:0 / cpu). Default: auto-detect.",
+    )
     return parser.parse_args()
 
 
@@ -91,6 +125,61 @@ def infer_sae_dims(tensors: dict[str, torch.Tensor], hidden_dim: int) -> tuple[i
     return hidden_dim, int(feature_dim)
 
 
+def resolve_recon_device(override: str | None) -> torch.device:
+    if override:
+        return torch.device(override)
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def reconstruction_metrics(
+    sae_dir: Path, layer: int, activation_path: Path, sample_n: int, device: torch.device,
+) -> dict[str, Any]:
+    """Encode a sample of real activations and decode them; report FVU,
+    mean cosine, and mean L0. This is the standing regression test for
+    audit issue 1.4 (encoder convention) and the natural place to catch
+    a future regression in encode_full / decode_full.
+    """
+    x_all = np.load(activation_path, mmap_mode="r")
+    n_rows = x_all.shape[0]
+    n = min(sample_n, n_rows)
+    rng = np.random.default_rng(seed=0)
+    idx = rng.choice(n_rows, size=n, replace=False)
+    idx.sort()
+    x = np.asarray(x_all[idx], dtype=np.float32)
+
+    # fp32 for the recon measurement so bf16 noise does not pollute the metric.
+    sae = load_sae(sae_dir, layer, x.shape[1], device=device, dtype=torch.float32)
+    with torch.inference_mode():
+        x_t = torch.as_tensor(x, device=device, dtype=torch.float32)
+        acts = encode_full(x_t, sae)
+        recon = decode_full(acts, sae)
+        diff = x_t - recon
+        # FVU = ||x - x_hat||^2 / ||x - mean(x)||^2
+        x_mean = x_t.mean(dim=0, keepdim=True)
+        denom = ((x_t - x_mean) ** 2).sum().clamp(min=1e-12)
+        fvu = (diff ** 2).sum() / denom
+        # Mean per-row cosine
+        cos = torch.nn.functional.cosine_similarity(x_t, recon, dim=-1).mean()
+        # Empirical L0
+        l0_per_row = (acts > 0).float().sum(dim=-1)
+        mean_l0 = l0_per_row.mean()
+        max_l0 = l0_per_row.max()
+    return {
+        "reconstruction_n_rows_sampled": int(n),
+        "reconstruction_fvu": float(fvu.detach().cpu().item()),
+        "reconstruction_cosine_mean": float(cos.detach().cpu().item()),
+        "reconstruction_mean_l0": float(mean_l0.detach().cpu().item()),
+        "reconstruction_max_l0": float(max_l0.detach().cpu().item()),
+        "sae_scale_in": float(sae.scale_in),
+        "sae_scale_out": float(sae.scale_out),
+        "sae_jump_relu_threshold": float(sae.theta),
+        "sae_act_fn": sae.act_fn,
+        "sae_d_model": int(sae.d_model),
+        "sae_d_sae": int(sae.d_sae),
+        "sae_hyperparameters_path": str(sae.hyperparameters_path) if sae.hyperparameters_path else None,
+    }
+
+
 def validate_row(args: argparse.Namespace, layer: int) -> dict[str, Any]:
     weight_files, config_files = find_sae_files(args.sae_dir, layer)
     parsed = parse_llamascope_name(weight_files + config_files)
@@ -126,12 +215,38 @@ def validate_row(args: argparse.Namespace, layer: int) -> dict[str, Any]:
         "checkpoint_layer_match": checkpoint_layer_match,
         "position_marker_is_R": position_marker_is_r,
         "hidden_dim_match": hidden_dim_match,
-        "validation_passed": ok,
         "hook_metadata": hook_metadata,
         "hf_hidden_states_alignment_note": note,
     }
+
+    recon_ok = True
+    if args.check_reconstruction:
+        device = resolve_recon_device(args.recon_device)
+        try:
+            recon = reconstruction_metrics(
+                args.sae_dir, layer, activation_path, args.reconstruction_sample_n, device,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            row["reconstruction_error"] = f"{type(exc).__name__}: {exc}"
+            recon_ok = False
+        else:
+            row.update(recon)
+            recon_ok = recon["reconstruction_fvu"] <= args.reconstruction_fvu_threshold
+            row["reconstruction_fvu_threshold"] = args.reconstruction_fvu_threshold
+            row["reconstruction_passed"] = recon_ok
+    else:
+        row["reconstruction_passed"] = None  # not checked
+
+    ok = ok and recon_ok
+    row["validation_passed"] = ok
     if not ok and not args.allow_mismatch:
-        raise ValueError(f"Hook alignment validation failed for layer {layer}: {json.dumps(row, indent=2, default=str)}")
+        raise ValueError(
+            f"Validation failed for layer {layer} (reconstruction_passed="
+            f"{row.get('reconstruction_passed')}, "
+            f"checkpoint_layer_match={checkpoint_layer_match}, "
+            f"position_marker_is_R={position_marker_is_r}, "
+            f"hidden_dim_match={hidden_dim_match}). Row:\n{json.dumps(row, indent=2, default=str)}"
+        )
     return row
 
 
