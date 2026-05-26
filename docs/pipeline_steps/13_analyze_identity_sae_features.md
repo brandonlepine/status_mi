@@ -40,7 +40,7 @@ The bridge from "geometric contrast directions" to "individual SAE features." Fo
 
 ## Issues & Opportunities
 
-> **Upstream callout — issue 1.4 (CONFIRMED).** Every input this script reads from `results/sae_identity/.../layer_XX/` was produced by the broken encoder in [Step 5](05_encode_identity_saes.md#14-blocker--sae-preprocessing-convention-confirmed-wrong-concrete-fix-below) (plain ReLU instead of JumpReLU θ=0.7539, missing `× 64/29.125` input normalization, spurious `−b_dec` pre-encoder). All `feature_*_selectivity.csv`, `decoder_direction_alignment.csv`, `direction_reconstruction.csv`, and `intervention_candidate_features.csv` artifacts must be regenerated after Step 5 is fixed and Step 6 verifies recon FVU/cosine. The script logic below is sound; only its inputs are wrong.
+> **Upstream callout — issue 1.4 (FIX LANDED; regenerate inputs).** The encoder fix in [Step 5](05_encode_identity_saes.md#14-blocker--sae-preprocessing-convention-fix-landed-2026-05-26) landed in commit `4b8851a` (JumpReLU at θ=0.7539, dataset-wise input normalization, `b_dec` decode-only). Every existing `feature_*_selectivity.csv`, `decoder_direction_alignment.csv`, `direction_reconstruction.csv`, and `intervention_candidate_features.csv` was produced by the broken encoder and must be regenerated: re-run [Step 5](05_encode_identity_saes.md) with `--overwrite`, [Step 6](06_validate_sae_hook_alignment.md) to confirm `reconstruction_fvu <= 0.15`, then this script. The script logic below is unchanged; only its inputs were wrong.
 
 ### 2.5 [MAJOR] — Selection-induced bias ("winner's curse") in feature effect sizes
 

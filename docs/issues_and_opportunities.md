@@ -57,9 +57,19 @@ What to do:
 - Keep `answer_logprob` as a confirmatory mode, but length-normalize it (see 2.4).
 - Re-run; first-token-text results should be treated as preliminary.
 
-### 1.4 [BLOCKER] SAE preprocessing convention is wrong in three ways (CONFIRMED 2026-05-26 from OpenMOSS `hyperparameters.json`)
+### 1.4 [BLOCKER] SAE preprocessing convention (FIX LANDED 2026-05-26; RunPod re-encode + validate pending)
 
-**Status:** Confirmed via `Llama3_1-8B-Base-LXR-32X/Llama3_1-8B-Base-L24R-32X/hyperparameters.json`. Promoted from `[MAJOR]` (verification item) to `[BLOCKER]`.
+**Status:** Three commits closed out the code fix; the verification on RunPod is what remains.
+
+- `1ed1422` — `download_openmoss_saes.py` now selects files by an explicit `L<layer>R-<width>x` marker, requires `hyperparameters.json` per layer, pins `--revision` to an absolute commit SHA via `HfApi`, and asserts (position, width) consistency across requested layers.
+- `4b8851a` — `encode_identity_saes.py` reads `hyperparameters.json`, validates `act_fn`/`apply_decoder_bias_to_pre_encoder`/`norm_activation`, computes per-layer `scale_in` / `scale_out` / `theta`, and exposes `encode_full` / `decode_full` with the corrected formula. `sae_config_resolved.json` now records the verified config (the prior version declared `"relu"` and no normalization).
+- `efc098c` — `validate_sae_hook_alignment.py` imports the corrected `encode_full` / `decode_full`, samples N rows, computes FVU / mean cosine / mean L0 in fp32, and fails the validator above `--reconstruction_fvu_threshold` (default 0.15).
+
+**Remaining work:** re-download on RunPod with `--revision <commit_hash>`, re-encode every layer (deletes obsolete `feature_*.npy` / `feature_stats.csv`), run the validator and confirm `reconstruction_fvu <= 0.15` and `reconstruction_cosine_mean >= 0.95`. Every downstream Stage-3 and Stage-4 analysis must be rerun against the new encodings.
+
+---
+
+**Original diagnosis** (preserved for context):
 
 Relevant fields:
 

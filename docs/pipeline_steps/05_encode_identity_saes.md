@@ -32,9 +32,11 @@ Encode the saved residual activations from [Step 4](04_extract_identity_activati
 
 ## Issues & Opportunities
 
-### 1.4 [BLOCKER] — SAE preprocessing convention (CONFIRMED WRONG; concrete fix below)
+### 1.4 [BLOCKER] — SAE preprocessing convention (FIX LANDED 2026-05-26)
 
-**Status: confirmed via `Llama3_1-8B-Base-LXR-32X/Llama3_1-8B-Base-L24R-32X/hyperparameters.json`.** The current loader is wrong in three ways. The relevant fields from the OpenMOSS hyperparameters file are:
+**Status:** Confirmed via `hyperparameters.json` (the three-bug diagnosis is preserved below for context). Code fix landed in commit `4b8851a`; the recon-quality regression test landed in commit `efc098c`. Re-encoding on RunPod is still required because every prior SAE artifact was produced by the broken encoder.
+
+**Relevant fields from the OpenMOSS hyperparameters file:**
 
 ```json
 {
@@ -64,7 +66,15 @@ Encode the saved residual activations from [Step 4](04_extract_identity_activati
 
 **Why it matters:** Every SAE-based number in the project (`feature_stats.csv`, the top-64 sparse encodings, all `cohens_d`/`auc`/`combined_score` in `analyze_identity_sae_features.py`, the triage roles in `triage_sae_identity_features.py`, the BBQ steering feature pool, every per-feature card) is computed on the broken encoding. Issue 1.4 is now confirmed Tier-1: nothing on the SAE side is trustworthy until this is fixed.
 
-**Targeted fix — correct encode formula:**
+**What landed (commit `4b8851a`):**
+
+- `find_hyperparameters_file` locates `hyperparameters.json` near the SAE weights and raises if missing.
+- `load_layer_hyperparameters` reads the file and asserts `act_fn == "jumprelu"`, `apply_decoder_bias_to_pre_encoder is False`, `norm_activation == "dataset-wise"`, `d_model == hidden_dim`, `d_sae == n_features`. Any deviation raises.
+- `LoadedSAE` carries `scale_in`, `scale_out`, `theta`, `act_fn`, `d_model`, `d_sae`, `apply_decoder_bias_to_pre_encoder`, `hyperparameters_path`.
+- `encode_full` / `decode_full` implement the corrected formula (below). `encode_batch` (the top-k convenience used by `main`) routes through `encode_full` so the formula lives in one place. `decode_full` is exposed for the [Step 6](06_validate_sae_hook_alignment.md) recon check.
+- `sae_config_resolved.json` now records `activation_function: "jumprelu"`, `jump_relu_threshold`, `scale_in`, `scale_out`, `dataset_average_activation_norm`, `apply_decoder_bias_to_pre_encoder`, `use_decoder_bias`, and the literal encode/decode formula strings — the prior file declared `"relu"` and no normalization.
+
+**Correct encode/decode formula (the one now in code):**
 
 ```python
 # Per-layer scalars from sae_config_resolved.json (read from hyperparameters.json):
@@ -72,7 +82,7 @@ scale_in  = math.sqrt(d_model) / dataset_average_activation_norm["in"]   # = 64 
 scale_out = dataset_average_activation_norm["out"] / math.sqrt(d_model)  # = 29.125 / 64 ≈ 0.455 at L24
 theta     = jump_relu_threshold  # 0.75390625 at L24
 
-# Encode (no b_dec subtraction!):
+# Encode (no b_dec subtraction):
 x_norm   = x * scale_in
 pre_acts = x_norm @ W_enc + b_enc
 acts     = pre_acts * (pre_acts > theta).to(pre_acts.dtype)   # JumpReLU
@@ -82,15 +92,13 @@ recon_norm = acts @ W_dec + b_dec
 recon      = recon_norm * scale_out
 ```
 
-**Per-layer constants must be loaded from the matching `hyperparameters.json`** — `dataset_average_activation_norm` and `jump_relu_threshold` differ per layer; do not hardcode the L24 numbers.
+**Per-layer constants are loaded from the matching `hyperparameters.json`** at every `load_sae` call — `dataset_average_activation_norm` and `jump_relu_threshold` differ by layer, and nothing is hardcoded.
 
-**Concrete code changes in `encode_identity_saes.py`:**
+**What remains (RunPod):**
 
-- In `load_sae`: parse `hyperparameters.json` (alongside the existing weight loading) and stash `d_model`, `d_sae`, `act_fn`, `jump_relu_threshold`, `dataset_average_activation_norm`, `apply_decoder_bias_to_pre_encoder`, `use_decoder_bias` on the returned object.
-- In `encode_batch`: replace the current `relu((x − b_dec) @ W_enc + b_enc)` with the formula above. Assert `act_fn == "jumprelu"` and `apply_decoder_bias_to_pre_encoder is False`; raise on any other configuration so a future checkpoint with different settings does not silently mis-encode.
-- Update `sae_config_resolved.json` to record `activation_function: "jumprelu"`, `jump_relu_threshold`, the input/output scale factors actually used, and `apply_decoder_bias_to_pre_encoder: false` — the resolved config is currently lying ("relu" with no normalization).
-- Re-encode every layer. All existing `feature_*.npy` / `feature_stats.csv` / downstream analysis CSVs are obsolete.
-- Verify the fix via the encode → decode reconstruction check in [Step 6](06_validate_sae_hook_alignment.md). A correctly-loaded JumpReLU SAE at 32× expansion reconstructs Llama-3.1-8B residual streams well; if FVU is high after the fix, there is still a bug.
+- Re-run [Step 3](03_download_openmoss_saes.md) under the new explicit-file selector to ensure `hyperparameters.json` is present for every requested layer.
+- Re-encode every layer with this script (`--overwrite`). All existing `feature_*.npy` / `feature_stats.csv` / every downstream Stage-3 and Stage-4 analysis CSV are obsolete.
+- Run [Step 6](06_validate_sae_hook_alignment.md) and confirm `reconstruction_fvu <= 0.15` and `reconstruction_cosine_mean >= 0.95` before consuming any new artifact downstream.
 
 ### 4.6 [MINOR] — Top-64 SAE truncation may clip true activations
 
@@ -115,14 +123,16 @@ recon      = recon_norm * scale_out
 - Mirror the new path in `analyze_identity_sae_features.py` and `triage_sae_identity_features.py` so feature analysis can consume span-based artifacts.
 
 ## Rebuild checklist
-- [ ] Parse `hyperparameters.json` in `load_sae` and stash `d_model`, `act_fn`, `jump_relu_threshold`, `dataset_average_activation_norm`, `apply_decoder_bias_to_pre_encoder`, `use_decoder_bias` per layer.
-- [ ] Replace `encode_batch` with the JumpReLU + dataset-wise-norm formula above. Drop the `(x − b_dec)` pre-encoder subtraction.
-- [ ] Assert `act_fn == "jumprelu"` and `apply_decoder_bias_to_pre_encoder is False`; raise otherwise so a future checkpoint cannot silently change conventions.
-- [ ] Rewrite `sae_config_resolved.json` to record `activation_function`, `jump_relu_threshold`, `scale_in`, `scale_out`, and the boolean flags actually used.
-- [ ] Re-encode every layer. Delete prior `feature_*.npy`, `feature_stats.csv`, and every downstream analysis CSV — they are all obsolete.
-- [ ] Run the reconstruction check in [Step 6](06_validate_sae_hook_alignment.md) and confirm FVU / cosine are in the expected range before consuming any new artifact downstream.
+- [x] Parse `hyperparameters.json` in `load_sae` and stash per-layer constants. (Done.)
+- [x] Replace `encode_batch` with the corrected JumpReLU + dataset-wise-norm formula; route through shared `encode_full`. (Done.)
+- [x] Assert `act_fn == "jumprelu"` and `apply_decoder_bias_to_pre_encoder is False`; raise otherwise. (Done.)
+- [x] Rewrite `sae_config_resolved.json` to record verified config. (Done.)
+- [x] Expose `decode_full` for the recon check in [Step 6](06_validate_sae_hook_alignment.md). (Done.)
+- [ ] Re-download SAEs on RunPod via [Step 3](03_download_openmoss_saes.md) so `hyperparameters.json` is on disk per layer.
+- [ ] Re-encode every layer (`--overwrite`). Delete prior `feature_*.npy`, `feature_stats.csv`, and every downstream analysis CSV.
+- [ ] Run [Step 6](06_validate_sae_hook_alignment.md) and confirm `reconstruction_fvu` ≤ `--reconstruction_fvu_threshold` (default 0.15) before consuming any new artifact downstream.
 - [ ] Measure empirical L0 with the corrected encoder; raise `--top_k_save` if 99th-percentile L0 exceeds ~50 (issue 4.6).
-- [ ] Implement the `token_span` activation mode end-to-end (requires the matching upstream change in [Step 4](04_extract_identity_activations.md)).
+- [ ] Implement the `token_span` activation mode end-to-end (requires the matching upstream change in [Step 4](04_extract_identity_activations.md)). (Independent of the 1.4 fix.)
 - [ ] Re-run every downstream Stage-3 and Stage-4 analysis after re-encoding.
 
 ## Notes from the doc audit

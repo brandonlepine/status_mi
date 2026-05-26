@@ -25,44 +25,37 @@ Verify that the per-layer SAE checkpoint and the extracted activation `.npy` for
 
 ## Issues & Opportunities
 
-### 1.4 [BLOCKER] — SAE preprocessing convention (CONFIRMED; this script is where the recon regression test belongs)
+### 1.4 [BLOCKER] — SAE preprocessing convention (FIX LANDED 2026-05-26)
 
-**Status:** The OpenMOSS `hyperparameters.json` confirms `act_fn = "jumprelu"` (threshold `0.75390625`), `norm_activation = "dataset-wise"` (input scale `sqrt(d_model) / dataset_average_activation_norm.in`), and `apply_decoder_bias_to_pre_encoder = false`. See [Step 5 — 1.4](05_encode_identity_saes.md#14-blocker--sae-preprocessing-convention-confirmed-wrong-concrete-fix-below) for the full corrected encode formula and the loader-side fix. This validator is the right home for the *standing regression test* that the corrected encoder actually works.
+**Status:** The Step 5 encoder fix landed in commit `4b8851a`; this script's recon-quality regression test landed in commit `efc098c`. Running the validator on RunPod against freshly re-downloaded + re-encoded artifacts is the remaining step.
 
-**What's wrong:** Today, the validator confirms the right *file* is paired with the right *layer's activations* — layer index, residual position, hidden_dim. It never runs the SAE forward, so a wrong activation function (the current plain-ReLU mistake), a missing normalization (the current `dataset-wise` mistake), or a flipped encoder/decoder orientation all pass. The Step 5 fix needs a verifier that lives in this script.
+**What landed in this script (commit `efc098c`):**
 
-**Why it matters:** Without a numerical reconstruction check, regressions in `encode_batch` (or a future swap to a checkpoint with different conventions, e.g. a TopK SAE) will silently produce wrong feature activations. This script is already the SAE/activation alignment gate — adding the recon check here makes the gate complete.
+- Imports `load_sae`, `encode_full`, `decode_full` from [Step 5](05_encode_identity_saes.md) (single source of truth — any future change to the encode/decode math propagates here automatically).
+- New `reconstruction_metrics(...)` samples N rows (seeded) from the layer's activation `.npy`, encodes through the SAE, decodes back to raw activation space, and reports:
+  - `reconstruction_fvu` — fraction of variance unexplained
+  - `reconstruction_cosine_mean` — mean per-row cosine between `x` and `recon`
+  - `reconstruction_mean_l0`, `reconstruction_max_l0` — empirical JumpReLU L0
+  - Per-layer encode constants used: `sae_scale_in`, `sae_scale_out`, `sae_jump_relu_threshold`, `sae_act_fn`, `sae_d_model`, `sae_d_sae`, `sae_hyperparameters_path`
+- New CLI flags:
+  - `--check_reconstruction` / `--no-check_reconstruction` (default on)
+  - `--reconstruction_fvu_threshold` (default `0.15`)
+  - `--reconstruction_sample_n` (default `4096`)
+  - `--recon_device` (default auto-detect; `cuda` if available else `cpu`)
+- Validation now fails (raises unless `--allow_mismatch`) when `reconstruction_fvu > --reconstruction_fvu_threshold`, alongside the existing layer/position/hidden_dim checks.
+- The recon check uses fp32 so bf16 noise does not pollute the metric, even when the production encode runs in bf16.
 
-**Targeted fix — add an encode → decode reconstruction check:**
+**Expected numbers:** LlamaScope at 32× expansion on Llama-3.1-8B-Base residual streams should reconstruct well — FVU in single digits (a few percent) and `reconstruction_cosine_mean ≳ 0.95`. If FVU exceeds the threshold after the Step 5 fix, there is still a bug; investigate `encode_full` / `decode_full` and the per-layer hyperparameters before consuming any artifact downstream.
 
-- Import the corrected `load_sae` and `encode_batch` from [Step 5](05_encode_identity_saes.md) (after the JumpReLU + dataset-wise-norm + no-pre-bias fix is in). Do NOT re-implement encoding here — reuse the upstream function so any future change propagates.
-- Sample N rows (e.g. 4096) from `results/activations/.../layer_XX.npy`, encode → decode, and compute:
-
-  ```python
-  # acts comes from corrected encode_batch (JumpReLU, dataset-wise normalized).
-  # Decode in normalized space then un-scale to match raw activation space:
-  recon_norm = acts @ W_dec + b_dec
-  recon = recon_norm * scale_out                # scale_out = dataset_average_activation_norm.out / sqrt(d_model)
-
-  # Metrics on the un-scaled reconstruction (compared to the raw activation x):
-  fvu      = ((x - recon) ** 2).sum() / ((x - x.mean(0)) ** 2).sum()
-  cos_mean = F.cosine_similarity(x, recon, dim=-1).mean()
-  mean_l0  = (acts > 0).float().sum(-1).mean()
-  ```
-
-- Add `reconstruction_fvu`, `reconstruction_cosine`, `mean_l0`, plus the JumpReLU `threshold` and `scale_in` / `scale_out` actually used, to `hook_alignment_validation.json` and `.csv`.
-- LlamaScope at 32× expansion on Llama-3.1-8B-Base residual streams should reconstruct well — expect FVU in single digits (percent) and cosine ≳ 0.95 on real activations. Add `--reconstruction_fvu_threshold` (default ~0.15) and fail the validation when FVU exceeds it, with an error pointing back to Step 5's 1.4 section so the fix path is obvious.
-- Once the validator passes, commit the resulting JSON; treat it as the SAE audit trail. Re-run after any change to `encode_batch`.
-
-**Heads-up:** if `mean_l0` is well above 64, the top-64 truncation in [Step 5](05_encode_identity_saes.md) is dropping real features (issue 4.6). Use the empirical L0 here to set `--top_k_save`.
+**Heads-up:** if `reconstruction_mean_l0` or `reconstruction_max_l0` is well above 64, the top-64 truncation in [Step 5](05_encode_identity_saes.md) is dropping real features (issue 4.6). Use the empirical L0 here to set `--top_k_save`.
 
 ## Rebuild checklist
-- [ ] Add `--check_reconstruction` (default true) and implement encode → decode → FVU/cosine/L0 on a sampled subset.
-- [ ] Reuse `load_sae` and `encode_batch` from [Step 5](05_encode_identity_saes.md) — do not re-implement the encoder here, so any fix to the activation function or input normalization propagates automatically.
-- [ ] Add the new metrics to `hook_alignment_validation.json` and `.csv`.
-- [ ] Add a `--reconstruction_fvu_threshold` flag and fail the validation when reconstruction is worse than expected (with a clear error message pointing to issue 1.4).
-- [ ] Run on every layer that has been encoded so far; record the numbers in the methods doc.
-- [ ] After fixing 1.4 in [Step 5](05_encode_identity_saes.md), re-run this validator on every layer; commit the resulting JSON so the reconstruction quality is part of the audit trail.
+- [x] Add `--check_reconstruction` and implement encode → decode → FVU/cosine/L0 on a sampled subset. (Done.)
+- [x] Reuse `load_sae` / `encode_full` / `decode_full` from [Step 5](05_encode_identity_saes.md). (Done.)
+- [x] Add the new metrics to `hook_alignment_validation.{json,csv}`. (Done.)
+- [x] Add `--reconstruction_fvu_threshold` and fail the validation when exceeded. (Done.)
+- [ ] After [Step 3](03_download_openmoss_saes.md) re-downloads SAEs and [Step 5](05_encode_identity_saes.md) re-encodes, run this validator on every layer in scope on RunPod. Confirm `reconstruction_fvu <= 0.15` and `reconstruction_cosine_mean >= 0.95`.
+- [ ] Commit the resulting `hook_alignment_validation.json` (or copy its key numbers into the methods writeup) so the audit trail records the recon quality used downstream.
 
 ## Notes from the doc audit
 - `infer_sae_dims` chooses `feature_dim = max(max(tensor.shape) for tensor in candidate_mats)`. If a checkpoint includes a non-encoder/decoder 2-D tensor (e.g. an optimizer state or a misc projection) with `hidden_dim` on one axis and a larger second axis, `feature_dim` will reflect that tensor instead of the true `W_dec` shape. Probably safe for LlamaScope checkpoints today but worth a `# TODO` if multi-layer support is added.

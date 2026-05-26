@@ -36,7 +36,7 @@ token_level_sae/
 
 ## Issues & Opportunities
 
-> **Upstream callout — issue 1.4 (CONFIRMED).** This script re-runs the same SAE encoder used in [Step 5](05_encode_identity_saes.md#14-blocker--sae-preprocessing-convention-confirmed-wrong-concrete-fix-below) on BBQ-prompt residual streams (`relu((x − b_dec) @ W_enc + b_enc)`). After the Step 5 fix, this script's encode path must mirror the corrected JumpReLU + dataset-wise-normalization + no-pre-bias formula — either by importing the corrected `encode_batch` from `encode_identity_saes.py` (preferred — single source of truth) or by re-deriving the same change here. Every parquet under `token_level_sae/token_activations/.../layer_XX/` is currently wrong and must be regenerated.
+> **Upstream callout — issue 1.4 (FIX LANDED in Step 5; this script's encode path still TODO).** The encoder fix in [Step 5](05_encode_identity_saes.md#14-blocker--sae-preprocessing-convention-fix-landed-2026-05-26) landed in commit `4b8851a`. **This script has not been updated** — it still inlines the old `relu((x − b_dec) @ W_enc + b_enc)` formula. Before re-running it, refactor to import `load_sae` + `encode_full` from `encode_identity_saes.py` (single source of truth) so the same JumpReLU + dataset-wise-normalization + no-pre-bias convention is used. Every parquet under `token_level_sae/token_activations/.../layer_XX/` is currently wrong and must be regenerated against the corrected encoder.
 
 ### 3.3 [MAJOR] — Intervention positions are located by greedy regex and may hit the wrong span
 

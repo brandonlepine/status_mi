@@ -61,10 +61,10 @@ Severity tags are aggregated per script from `issues_and_opportunities.md`. **B*
 | --- | --- | --- | --- | --- |
 | 01 | `create_dataset.py` | 0 | m | [01_create_dataset.md](01_create_dataset.md) |
 | 02 | `download_llama_3_1_8b.py` | 1 | M (1.2 lives across 02/18/20) | [02_download_llama_3_1_8b.md](02_download_llama_3_1_8b.md) |
-| 03 | `download_openmoss_saes.py` | 1 | — (dependency for 1.4) | [03_download_openmoss_saes.md](03_download_openmoss_saes.md) |
+| 03 | `download_openmoss_saes.py` | 1 | — (1.4 dependency, FIX LANDED) | [03_download_openmoss_saes.md](03_download_openmoss_saes.md) |
 | 04 | `extract_identity_activations.py` | 1 | **B** (1.1) · m (1.5) | [04_extract_identity_activations.md](04_extract_identity_activations.md) |
-| 05 | `encode_identity_saes.py` | 1 | **B** (1.4) · m (4.6) · partial (1.1 enabler) | [05_encode_identity_saes.md](05_encode_identity_saes.md) |
-| 06 | `validate_sae_hook_alignment.py` | 1 | **B** (1.4 — needs recon check added here) | [06_validate_sae_hook_alignment.md](06_validate_sae_hook_alignment.md) |
+| 05 | `encode_identity_saes.py` | 1 | **B** (1.4 — FIX LANDED) · m (4.6) · partial (1.1 enabler) | [05_encode_identity_saes.md](05_encode_identity_saes.md) |
+| 06 | `validate_sae_hook_alignment.py` | 1 | **B** (1.4 — FIX LANDED with recon check) | [06_validate_sae_hook_alignment.md](06_validate_sae_hook_alignment.md) |
 | 07 | `analyze_identity_geometry.py` | 2 | **B** (2.2) · M (2.1, 4.1) · m (2.8, 5.9, 5.10) | [07_analyze_identity_geometry.md](07_analyze_identity_geometry.md) |
 | 08 | `analyze_identity_geometry_diagnostics.py` | 2 | **B** (2.2) · M (2.1, 4.1) · m (5.9, 5.10) — strengths to keep | [08_analyze_identity_geometry_diagnostics.md](08_analyze_identity_geometry_diagnostics.md) |
 | 09 | `analyze_shared_social_subspace.py` | 2 | **B** (2.2) · M (2.1, 4.1) · m (5.10) | [09_analyze_shared_social_subspace.md](09_analyze_shared_social_subspace.md) |
@@ -91,7 +91,12 @@ Severity tags are aggregated per script from `issues_and_opportunities.md`. **B*
 
 From Section 7 of `issues_and_opportunities.md`. These are the fixes to make before trusting any output the pipeline produced.
 
-1. **Fix the SAE encoder (1.4 — CONFIRMED WRONG).** OpenMOSS `hyperparameters.json` shows the LlamaScope SAE is `act_fn = "jumprelu"` (threshold `0.75390625` at L24), `norm_activation = "dataset-wise"` with `dataset_average_activation_norm.in = 29.125` (scale ≈ `64/29.125 ≈ 2.197`), and `apply_decoder_bias_to_pre_encoder = false`. Step [05](05_encode_identity_saes.md) currently uses plain ReLU, no input normalization, AND subtracts `b_dec` pre-encoder — three bugs that together make every SAE feature activation wrong. The full corrected encode formula is in [Step 5 — issue 1.4](05_encode_identity_saes.md#14-blocker--sae-preprocessing-convention-confirmed-wrong-concrete-fix-below). Add the encode→decode FVU/cosine regression test in Step [06](06_validate_sae_hook_alignment.md). Until both are in and the validator passes, every SAE number in the project is wrong.
+1. **Fix the SAE encoder (1.4 — FIX LANDED 2026-05-26, RunPod re-encode + recon-check verification pending).** Three commits closed out the encoder convention fix:
+   - `1ed1422` — [Step 3](03_download_openmoss_saes.md) now selects files by explicit `L<layer>R-<width>x` marker, requires `hyperparameters.json` per layer, and pins `--revision` to an absolute commit SHA.
+   - `4b8851a` — [Step 5](05_encode_identity_saes.md) reads `hyperparameters.json`, validates `act_fn=="jumprelu"`, `apply_decoder_bias_to_pre_encoder is False`, `norm_activation=="dataset-wise"`, computes per-layer `scale_in` / `scale_out` / `theta`, and implements `encode_full` / `decode_full` with the corrected formula.
+   - `efc098c` — [Step 6](06_validate_sae_hook_alignment.md) adds the encode→decode regression test (FVU / cosine / mean L0) and fails the validator above `--reconstruction_fvu_threshold` (default 0.15).
+   
+   **Remaining:** re-download SAEs on RunPod under the new selector, re-encode every layer (deleting prior `feature_*.npy` / `feature_stats.csv` / downstream CSVs), run the validator, and confirm `reconstruction_fvu <= 0.15` before consuming any new artifact downstream. Every Stage-3 and Stage-4 analysis must be rerun against the new encodings.
 2. **Fix the feature intervention** (3.1) — Step [20](20_run_bbq_sae_steering.md)'s `make_vector` adds a fixed decoder direction regardless of feature activation. The encode → modify-latent-f → decode → patch helpers already exist in Step [13](13_analyze_identity_sae_features.md) (`ablate_features_in_sae`, `steer_features_in_sae`, `decode_sae`, `patch_residual_with_sae_reconstruction`) but are never called. Wire them up.
 3. **Re-enable steering controls** (2.3) — Step [20](20_run_bbq_sae_steering.md) ships with `sign_flip`, `random_direction_norm_matched`, `random_feature_matched`, but the production command uses `--disable_controls`. Add the difference-of-means direction as a parallel control (per 5.5).
 4. **Polarity-sign the bias metric** (4.3) — Step [23](23_analyze_bbq_feature_level_causal_effects.md)'s `stereotype_preference_delta` ignores `question_polarity`, so `effect_label`, `beneficial_score`, and the final candidates table are polarity-confounded.

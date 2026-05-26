@@ -81,12 +81,12 @@ At `final_prompt_token` only, for each `(example, feature_set, alpha)`:
 
 ## Issues & Opportunities
 
-> **Upstream callout — issue 1.4 (CONFIRMED).** Two pieces of this script are downstream of the broken encoder in [Step 5](05_encode_identity_saes.md#14-blocker--sae-preprocessing-convention-confirmed-wrong-concrete-fix-below):
+> **Upstream callout — issue 1.4 (FIX LANDED in Step 5; this script's feature pool + future 3.1 fix still TODO).** The encoder fix in [Step 5](05_encode_identity_saes.md#14-blocker--sae-preprocessing-convention-fix-landed-2026-05-26) landed in commit `4b8851a`. Two pieces of this script are downstream:
 >
-> 1. **The feature pool** — `keep_for_intervention=True` rows come from `intervention_candidate_features_triaged.csv` ([Step 17](17_triage_sae_identity_features.md)), which selects features based on the broken encoder's outputs. After the Step 5 fix, regenerate Step 13 → Step 17 first; the current feature list may not even be the same features.
-> 2. **The 3.1 feature-level fix below** — implementing encode → modify latent → decode → patch requires the *corrected* encoder + decoder. JumpReLU at θ=0.7539, dataset-wise input/output scaling (`scale_in = sqrt(d_model)/29.125`, `scale_out = 29.125/sqrt(d_model)`), and `b_dec` only on the decode side. The change in the residual stream must be computed in normalized space and un-scaled before patching: `h += ((acts_modified − acts) @ W_dec) * scale_out`.
+> 1. **The feature pool** — `keep_for_intervention=True` rows come from `intervention_candidate_features_triaged.csv` ([Step 17](17_triage_sae_identity_features.md)), which selects features based on the encoder's outputs. Re-run [Step 5](05_encode_identity_saes.md) → [Step 6](06_validate_sae_hook_alignment.md) → [Step 13](13_analyze_identity_sae_features.md) → [Step 17](17_triage_sae_identity_features.md) before consuming a new pool; the current list of features may not even contain the same `feature_id`s.
+> 2. **The 3.1 feature-level fix (still pending)** — implementing encode → modify latent → decode → patch should now use `encode_full` / `decode_full` from `encode_identity_saes.py` (single source of truth). The change in the residual stream must be computed in normalized space and un-scaled before patching: `h += ((acts_modified − acts) @ W_dec) * scale_out`, where `scale_out` comes from the same per-layer `hyperparameters.json`.
 >
-> The current decoder-direction-addition path (`make_vector` → `h[:, pos, :] += alpha * vec`) does not itself encode anything, so it is not directly broken by 1.4. But the *feature identity* of the vectors being added is wrong (they're rows of the decoder selected by broken activations), and the *scale* of `alpha` is in un-normalized residual units while the SAE itself operates in normalized space — these are entangled with 3.2.
+> The current decoder-direction-addition path (`make_vector` → `h[:, pos, :] += alpha * vec`) does not itself encode anything, so it is not directly broken by 1.4. But the *feature identity* of the vectors being added is wrong until the upstream chain is regenerated, and the *scale* of `alpha` is in un-normalized residual units while the SAE operates in normalized space — these are entangled with 3.2.
 
 ### 3.1 [BLOCKER] — "Feature steering" is decoder-direction addition, not a feature intervention
 
