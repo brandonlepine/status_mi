@@ -5,9 +5,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import shutil
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -38,8 +39,20 @@ class LoadedSAE:
     b_enc: torch.Tensor | None
     w_dec: torch.Tensor
     b_dec: torch.Tensor | None
+    # OpenMOSS/LlamaScope per-layer encode constants (audit issue 1.4):
+    # Encode: x_norm = x * scale_in; pre = x_norm @ W_enc + b_enc;
+    #         acts = pre * (pre > theta)              # JumpReLU
+    # Decode: recon = (acts @ W_dec + b_dec) * scale_out
+    scale_in: float
+    scale_out: float
+    theta: float
+    act_fn: str
+    d_model: int
+    d_sae: int
+    apply_decoder_bias_to_pre_encoder: bool
     config: dict[str, Any]
     source_files: list[str]
+    hyperparameters_path: Path | None = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -200,6 +213,77 @@ def choose_bias(tensors: dict[str, torch.Tensor], dim: int, keywords: list[str])
     return key, tensor.contiguous().float()
 
 
+def find_hyperparameters_file(config_files: list[Path], layer: int) -> Path:
+    """Locate hyperparameters.json among the SAE config files. Audit issue 1.4
+    requires this file; the loader raises if it is missing."""
+    candidates = [p for p in config_files if p.name == "hyperparameters.json"]
+    if not candidates:
+        listing = "\n  ".join(str(p) for p in config_files) or "  (no config files)"
+        raise FileNotFoundError(
+            f"hyperparameters.json not found among SAE config files for layer {layer}. "
+            f"Re-run scripts/download_openmoss_saes.py to fetch it; it is the source of "
+            f"truth for act_fn / jump_relu_threshold / dataset_average_activation_norm / "
+            f"apply_decoder_bias_to_pre_encoder (audit issue 1.4). Config files were:\n  {listing}"
+        )
+    if len(candidates) > 1:
+        # Multiple matches across nested dirs is suspicious; pick the one closest to
+        # the layer's directory or raise.
+        raise FileNotFoundError(
+            f"Multiple hyperparameters.json candidates for layer {layer}: {candidates}. "
+            "Refusing to guess; clean up duplicates."
+        )
+    return candidates[0]
+
+
+def load_layer_hyperparameters(hp_path: Path, layer: int, hidden_dim: int) -> dict[str, Any]:
+    """Load and validate OpenMOSS hyperparameters.json for one layer. Raises on
+    any unsupported configuration so a future checkpoint with different
+    conventions cannot silently mis-encode."""
+    hp = json.loads(hp_path.read_text())
+
+    required_keys = (
+        "d_model", "d_sae", "act_fn", "jump_relu_threshold",
+        "norm_activation", "dataset_average_activation_norm",
+        "apply_decoder_bias_to_pre_encoder", "use_decoder_bias",
+    )
+    missing = [k for k in required_keys if k not in hp]
+    if missing:
+        raise ValueError(f"hyperparameters.json for layer {layer} is missing required keys: {missing}")
+
+    if int(hp["d_model"]) != hidden_dim:
+        raise ValueError(
+            f"hp d_model={hp['d_model']} does not match activation hidden_dim={hidden_dim} "
+            f"for layer {layer}."
+        )
+
+    if hp["act_fn"] != "jumprelu":
+        raise ValueError(
+            f"Unsupported act_fn={hp['act_fn']!r} for layer {layer}; only 'jumprelu' is "
+            "implemented. To support a new activation function, extend encode_full + "
+            "load_sae and add tests."
+        )
+    if hp["apply_decoder_bias_to_pre_encoder"] is not False:
+        raise ValueError(
+            f"Unsupported apply_decoder_bias_to_pre_encoder={hp['apply_decoder_bias_to_pre_encoder']!r} "
+            f"for layer {layer}; only False is implemented (the corrected encoder applies b_dec on "
+            "the decode side only)."
+        )
+    if hp["norm_activation"] != "dataset-wise":
+        raise ValueError(
+            f"Unsupported norm_activation={hp['norm_activation']!r} for layer {layer}; only "
+            "'dataset-wise' is implemented. The encode formula scales by sqrt(d_model)/avg_norm.in."
+        )
+
+    avg_norm = hp["dataset_average_activation_norm"]
+    if not isinstance(avg_norm, dict) or "in" not in avg_norm or "out" not in avg_norm:
+        raise ValueError(
+            f"hp.dataset_average_activation_norm for layer {layer} must be a dict with 'in' and "
+            f"'out' keys; got {avg_norm!r}."
+        )
+
+    return hp
+
+
 def load_sae(sae_dir: Path, layer: int, hidden_dim: int, device: torch.device, dtype: torch.dtype) -> LoadedSAE:
     weight_files, config_files = find_sae_files(sae_dir, layer)
     tensors = load_weight_tensors(weight_files)
@@ -215,6 +299,25 @@ def load_sae(sae_dir: Path, layer: int, hidden_dim: int, device: torch.device, d
         raise ValueError(f"Encoder feature dim {w_enc.shape[1]} does not match decoder feature dim {n_features}.")
     b_enc_key, b_enc = choose_bias(tensors, n_features, ["b_enc", "b_in", "encoder.bias", "enc.bias", "bias"])
     b_dec_key, b_dec = choose_bias(tensors, hidden_dim, ["b_dec", "b_out", "decoder.bias", "dec.bias", "pre_bias", "bias"])
+
+    # Per-layer hyperparameters are mandatory (audit issue 1.4).
+    hp_path = find_hyperparameters_file(config_files, layer)
+    hp = load_layer_hyperparameters(hp_path, layer, hidden_dim)
+    avg_norm = hp["dataset_average_activation_norm"]
+    scale_in = math.sqrt(int(hp["d_model"])) / float(avg_norm["in"])
+    scale_out = float(avg_norm["out"]) / math.sqrt(int(hp["d_model"]))
+    theta = float(hp["jump_relu_threshold"])
+
+    if int(hp["d_sae"]) != n_features:
+        raise ValueError(
+            f"hp d_sae={hp['d_sae']} does not match resolved n_features={n_features} for layer {layer}."
+        )
+    if not hp["use_decoder_bias"] and b_dec is not None:
+        raise ValueError(
+            f"hp.use_decoder_bias=False for layer {layer} but a decoder-bias tensor was loaded "
+            f"({b_dec_key!r}). Refusing to silently ignore b_dec."
+        )
+
     config["resolved"] = {
         "layer": layer,
         "hidden_dim": hidden_dim,
@@ -225,28 +328,75 @@ def load_sae(sae_dir: Path, layer: int, hidden_dim: int, device: torch.device, d
         "decoder_bias_key": b_dec_key,
         "source_weight_files": [str(path) for path in weight_files],
         "source_config_files": [str(path) for path in config_files],
-        "activation_function": "relu",
-        "note": "Generic loader applies ReLU((x - decoder_bias) @ W_enc + b_enc). Check OpenMOSS config if exact preprocessing differs.",
+        "hyperparameters_path": str(hp_path),
+        "activation_function": hp["act_fn"],
+        "jump_relu_threshold": theta,
+        "norm_activation": hp["norm_activation"],
+        "dataset_average_activation_norm": avg_norm,
+        "scale_in": scale_in,
+        "scale_out": scale_out,
+        "apply_decoder_bias_to_pre_encoder": hp["apply_decoder_bias_to_pre_encoder"],
+        "use_decoder_bias": hp["use_decoder_bias"],
+        "encode_formula": "x_norm = x * scale_in; pre = x_norm @ W_enc + b_enc; acts = pre * (pre > theta)",
+        "decode_formula": "recon = (acts @ W_dec + b_dec) * scale_out",
     }
     return LoadedSAE(
         w_enc=w_enc.to(device=device, dtype=dtype),
         b_enc=b_enc.to(device=device, dtype=dtype) if b_enc is not None else None,
-        w_dec=w_dec.float(),
+        w_dec=w_dec.to(device=device, dtype=dtype),
         b_dec=b_dec.to(device=device, dtype=dtype) if b_dec is not None else None,
+        scale_in=scale_in,
+        scale_out=scale_out,
+        theta=theta,
+        act_fn=hp["act_fn"],
+        d_model=int(hp["d_model"]),
+        d_sae=int(hp["d_sae"]),
+        apply_decoder_bias_to_pre_encoder=hp["apply_decoder_bias_to_pre_encoder"],
         config=config,
         source_files=[str(path) for path in weight_files + config_files],
+        hyperparameters_path=hp_path,
     )
 
 
+def encode_full(x: torch.Tensor, sae: LoadedSAE) -> torch.Tensor:
+    """Corrected OpenMOSS/LlamaScope encode (audit issue 1.4).
+
+    1. Dataset-wise normalization to put `x` into the SAE's training space:
+         x_norm = x * scale_in,   scale_in = sqrt(d_model) / avg_norm.in
+    2. Affine encode (no b_dec subtraction — `apply_decoder_bias_to_pre_encoder`
+       is False for LlamaScope):
+         pre = x_norm @ W_enc + b_enc
+    3. JumpReLU: zero out anything not above the learned threshold.
+         acts = pre * (pre > theta)
+
+    Returns the full (B, n_features) activation tensor (no top-k truncation).
+    """
+    x_norm = x * sae.scale_in
+    pre = x_norm @ sae.w_enc
+    if sae.b_enc is not None:
+        pre = pre + sae.b_enc
+    above = (pre > sae.theta).to(pre.dtype)
+    return pre * above
+
+
+def decode_full(acts: torch.Tensor, sae: LoadedSAE) -> torch.Tensor:
+    """Corrected OpenMOSS/LlamaScope decode (audit issue 1.4).
+
+    The reconstruction is computed in normalized space, then scaled back:
+         recon = (acts @ W_dec + b_dec) * scale_out,
+         scale_out = avg_norm.out / sqrt(d_model)
+    """
+    recon_norm = acts @ sae.w_dec
+    if sae.b_dec is not None:
+        recon_norm = recon_norm + sae.b_dec
+    return recon_norm * sae.scale_out
+
+
 def encode_batch(batch: np.ndarray, sae: LoadedSAE, device: torch.device, dtype: torch.dtype, top_k: int) -> tuple[np.ndarray, np.ndarray]:
+    """Encode and return the top-K feature indices + values per row."""
     with torch.inference_mode():
         x = torch.as_tensor(batch, device=device, dtype=dtype)
-        if sae.b_dec is not None:
-            x = x - sae.b_dec
-        acts = x @ sae.w_enc
-        if sae.b_enc is not None:
-            acts = acts + sae.b_enc
-        acts = torch.relu(acts)
+        acts = encode_full(x, sae)
         k = min(top_k, acts.shape[1])
         values, indices = torch.topk(acts, k=k, dim=1)
     return indices.cpu().numpy().astype(np.int32), values.float().cpu().numpy().astype(np.float32)
@@ -349,7 +499,7 @@ def main() -> None:
         np.save(layer_dir / f"feature_indices_top{top_k}.npy", feature_indices)
         np.save(layer_dir / f"feature_values_top{top_k}.npy", feature_values)
         metadata.to_csv(layer_dir / "metadata.csv", index=False)
-        np.save(layer_dir / "sae_decoder.npy", sae.w_dec.numpy().astype(np.float32))
+        np.save(layer_dir / "sae_decoder.npy", sae.w_dec.detach().float().cpu().numpy())
         if sae.b_dec is not None:
             np.save(layer_dir / "sae_decoder_bias.npy", sae.b_dec.float().cpu().numpy())
         (layer_dir / "sae_config_resolved.json").write_text(json.dumps(sae.config, indent=2, default=str) + "\n")
