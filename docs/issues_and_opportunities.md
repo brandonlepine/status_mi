@@ -14,18 +14,26 @@ Each issue says where it lives, why it matters, and what to do. A priority punch
 
 ## 1. Foundational / measurement issues (the representation substrate)
 
-### 1.1 [BLOCKER] The "identity representation" is measured at the final token, which is almost always a period
+### 1.1 [BLOCKER] Measurement locus (PARTIAL FIX LANDED 2026-05-27; RunPod three-mode comparison remaining)
 
-`extract_identity_activations.py` stores, per layer, the residual stream at `attention_mask.sum(dim=1) - 1` — the last non-padding token. Every template in `mi_identity_templates.csv` ends with `.` (e.g. `A01 = "This person is {form}."`, fragment `F03 = "{form}."`). After tokenization the final token is the sentence-final period in essentially every prompt.
+**Status:** Code landed in two commits; the three-mode geometry comparison on RunPod is what remains.
 
-So the entire geometry pipeline — PCA, probes, contrast directions, shared-subspace SVD, family-stability cosines — characterizes the residual stream **at the period token**, not at the identity token. The implicit assumption is "the final token integrates the identity content of the prompt." For a **base** (non-instruct) model with no `[CLS]`-style aggregation objective and no instruction to summarize, that assumption is **untested**. A base LM's final-token residual is optimized to predict the *next* token, not to summarize the sentence.
+- `ca1224e` — `extract_identity_activations.py` gained `--token_mode {final_token, identity_span_last, identity_span_mean}`. Default output dir is now `identity_prompts_{token_mode}` so modes do not overwrite each other. New `find_identity_span` + offset-mapping pre-pass validate that every prompt's `form_used` is locatable and survives tokenizer truncation; failures raise loudly before the GPU run starts. A `span_locations.csv` sidecar records the per-prompt char + token range for the audit trail. `select_layer_activation` reduces per-layer hidden states to (B, D) under each mode (final-token gather, identity-span-last gather, identity-span-mean weighted average).
+- `6bd78fc` — `encode_identity_saes.py` widens `--activation_mode` to the same three values and removes the prior `NotImplementedError`. Step 5 is mode-agnostic by design (the input array is the same shape regardless of locus); the label is recorded in `run_config.json` for the audit trail.
 
-Why it matters: if the period token does not faithfully carry identity content, every geometric claim ("identity is linearly decodable", "there is a shared social subspace") is a claim about period-token geometry, not identity geometry. A reviewer will ask this immediately.
+**Original audit (preserved for context):**
 
-What to do:
-- Run the geometry analysis on (a) the last token of the identity span and (b) the mean over identity-span tokens, and compare to the final-token result. You already produce the data needed: `extract_token_level_sae_activations.py` locates identity spans. Re-extract residual activations span-pooled, or add a span-pooling mode to `extract_identity_activations.py` (the `token_span` mode is already scaffolded but `NotImplementedError` in `encode_identity_saes.py`).
-- Report whichever location carries the signal, and justify it. If final-token *does* carry it, that is itself a finding worth showing (with the span-pooled comparison as evidence).
-- This single change de-risks the largest assumption in the project.
+`extract_identity_activations.py` stored, per layer, the residual stream at `attention_mask.sum(dim=1) - 1` — the last non-padding token. Every template in `mi_identity_templates.csv` ends with `.` (e.g. `A01 = "This person is {form}."`, fragment `F03 = "{form}."`). After tokenization the final token is the sentence-final period in essentially every prompt. So the entire geometry pipeline — PCA, probes, contrast directions, shared-subspace SVD, family-stability cosines — characterized the residual stream **at the period token**, not at the identity token. The implicit assumption is "the final token integrates the identity content of the prompt." For a **base** (non-instruct) model with no `[CLS]`-style aggregation objective and no instruction to summarize, that assumption is untested.
+
+**Remaining work (RunPod):**
+- Run all three modes for layers `{0, 8, 16, 24, 32}` (and optionally every layer once the SAE encoder fix from 1.4 is verified):
+  ```
+  python scripts/extract_identity_activations.py --token_mode final_token        # legacy
+  python scripts/extract_identity_activations.py --token_mode identity_span_last
+  python scripts/extract_identity_activations.py --token_mode identity_span_mean
+  ```
+- For each mode: re-encode via Step 5 with the matching `--activation_dir` and `--activation_mode`, then rerun Stage 2 geometry analyses.
+- Compare contrast AUC, probe accuracy, and shared-subspace spectrum across the three loci. Report whichever location carries the signal in the methods writeup; if final-token does carry it, that is itself a finding (with the span-pooled comparison as evidence). The audit cycle for this issue closes when the comparison is in the paper.
 
 ### 1.2 [MAJOR] Base model vs. a multiple-choice QA benchmark (PARTIAL FIX LANDED 2026-05-26)
 

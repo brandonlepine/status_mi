@@ -27,7 +27,7 @@ Encode the saved residual activations from [Step 4](04_extract_identity_activati
 - The encode step is hard-coded as plain ReLU: `acts = relu((x − b_dec) @ W_enc + b_enc)`. The resolved config writes `"activation_function": "relu"` and a comment flagging that OpenMOSS may differ. **No input normalization is applied** beyond the `−b_dec` pre-bias subtraction.
 - After encode, `torch.topk(acts, k=64, dim=1)` keeps the top-64 indices and values per row. Anything outside the top-64 is dropped (treated as exact zero by everything downstream).
 - `compute_feature_stats` reduces the sparse top-64 to per-feature aggregates by `np.bincount`. p95/p99 are computed *only from non-zero entries that survived the top-64 cut* — features that were active on row but ranked 65th or later contribute nothing.
-- `--activation_mode token_span` is parsed but immediately raises `NotImplementedError("token_span mode is scaffolded for later work; final_token mode is implemented first.")`. The argparse choice exists; the implementation does not. Issue 1.1 fix needs this path filled in.
+- `--activation_mode` accepts `{final_token, identity_span_last, identity_span_mean}` (mirrors [Step 4](04_extract_identity_activations.md)'s `--token_mode`). The choice is purely informational — this script encodes whatever `(n_prompts, hidden_dim)` array the upstream extractor produced, regardless of which token gave rise to each row. The value is recorded in `run_config.json` so the audit trail remembers which locus the encoded features came from.
 - Per-layer outputs include a `metadata.csv` copy so each layer directory is self-contained.
 
 ## Issues & Opportunities
@@ -111,16 +111,30 @@ recon      = recon_norm * scale_out
 - If L0 is comfortably under ~50, document and keep `top_k_save=64`.
 - If L0 is higher, raise `top_k_save` to ~2× the 99th percentile L0 and re-encode. Storage cost is linear in `top_k_save`.
 
-### 1.1 [BLOCKER] — final-token vs. identity-span (scaffolded but unimplemented here)
+### 1.1 [BLOCKER] — Measurement locus (FIX LANDED in this script 2026-05-27)
 
-**What's wrong:** The `--activation_mode` argparse option lists `{"final_token", "token_span"}`, but the `token_span` branch raises `NotImplementedError` at the top of `main()`. The fix in [Step 4](04_extract_identity_activations.md) requires this branch to actually exist: once the upstream extractor produces span-pooled activations, this script must encode them the same way (or, if a per-token encoded form is desired, support a different input shape).
+**Status:** Code landed in commit `6bd78fc`. The `NotImplementedError` is gone; `--activation_mode` now accepts the same three values as [Step 4](04_extract_identity_activations.md)'s `--token_mode` and the encoder runs through identical code for every mode. The companion change is documented in [Step 4 — 1.1](04_extract_identity_activations.md#11-blocker--measurement-locus-partial-fix-landed-2026-05-27); the three-mode comparison run on RunPod is what remains.
 
-**Why it matters:** Issue 1.1 is the biggest assumption in the project. Implementing the span-pooled extraction without filling in the matching SAE encoding path means span-pooled geometry can be analyzed but its SAE-feature decomposition cannot — which leaves the feature-level half of the project still tied to the period token.
+This step is mode-agnostic by design: once Step 4 produces a `(n_prompts, hidden_dim)` array regardless of locus, the SAE encoder treats every row identically. The `--activation_mode` label exists solely so `run_config.json` records which locus the encoded features came from. To run all three modes, point `--activation_dir` at each of Step 4's sibling output directories and pass the matching `--activation_mode` label:
 
-**Targeted fix:**
-- Implement `token_span` mode: read span-pooled `.npy` files from [Step 4](04_extract_identity_activations.md)'s `--token_mode identity_span_*` outputs, and run the same encode-and-top-k pipeline. If span pooling produces multiple vectors per prompt (e.g. one per identity-span token), decide whether to pool to a single vector before SAE encoding or to encode each separately.
-- Update the output directory convention to include the locus (e.g. `results/sae_identity/.../identity_span_last/layer_XX/`).
-- Mirror the new path in `analyze_identity_sae_features.py` and `triage_sae_identity_features.py` so feature analysis can consume span-based artifacts.
+```bash
+python scripts/encode_identity_saes.py \
+    --activation_dir /workspace/status_mi/results/activations/llama-3.1-8b/identity_prompts_final_token \
+    --activation_mode final_token \
+    --output_dir /workspace/status_mi/results/sae_identity/llama-3.1-8b/final_token
+
+python scripts/encode_identity_saes.py \
+    --activation_dir /workspace/status_mi/results/activations/llama-3.1-8b/identity_prompts_identity_span_last \
+    --activation_mode identity_span_last \
+    --output_dir /workspace/status_mi/results/sae_identity/llama-3.1-8b/identity_span_last
+
+python scripts/encode_identity_saes.py \
+    --activation_dir /workspace/status_mi/results/activations/llama-3.1-8b/identity_prompts_identity_span_mean \
+    --activation_mode identity_span_mean \
+    --output_dir /workspace/status_mi/results/sae_identity/llama-3.1-8b/identity_span_mean
+```
+
+Downstream feature analysis ([Step 13](13_analyze_identity_sae_features.md), [Step 17](17_triage_sae_identity_features.md)) consumes the chosen output directory via `--sae_dir` and produces a fully independent set of artifacts per mode. Comparing the three sets is how the audit's "report which locus carries the signal" requirement gets answered.
 
 ## Rebuild checklist
 - [x] Parse `hyperparameters.json` in `load_sae` and stash per-layer constants. (Done.)
@@ -132,7 +146,7 @@ recon      = recon_norm * scale_out
 - [ ] Re-encode every layer (`--overwrite`). Delete prior `feature_*.npy`, `feature_stats.csv`, and every downstream analysis CSV.
 - [ ] Run [Step 6](06_validate_sae_hook_alignment.md) and confirm `reconstruction_fvu` ≤ `--reconstruction_fvu_threshold` (default 0.15) before consuming any new artifact downstream.
 - [ ] Measure empirical L0 with the corrected encoder; raise `--top_k_save` if 99th-percentile L0 exceeds ~50 (issue 4.6).
-- [ ] Implement the `token_span` activation mode end-to-end (requires the matching upstream change in [Step 4](04_extract_identity_activations.md)). (Independent of the 1.4 fix.)
+- [x] Align `--activation_mode` choices with [Step 4](04_extract_identity_activations.md)'s `--token_mode` and drop the `NotImplementedError`. (Done.)
 - [ ] Re-run every downstream Stage-3 and Stage-4 analysis after re-encoding.
 
 ## Notes from the doc audit

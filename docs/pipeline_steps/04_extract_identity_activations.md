@@ -28,17 +28,32 @@ Run Llama-3.1-8B forward over every prompt in `mi_identity_prompts.csv`, take `o
 
 ## Issues & Opportunities
 
-### 1.1 [BLOCKER] — The "identity representation" is measured at the final token, which is almost always a period
+### 1.1 [BLOCKER] — Measurement locus (PARTIAL FIX LANDED 2026-05-27)
 
-**What's wrong:** Every template in `mi_identity_templates.csv` ends with a period (e.g. `A01 = "This person is {form}."`, `F03 = "{form}."`). After tokenization the final non-padding token is the sentence-final period in essentially every prompt. So `extract_final_token_activations` stores, per layer, the residual stream **at the period token**, not at the identity token. The implicit claim is that "the final token integrates the identity content of the prompt," but Llama-3.1-8B is a *base* LM — its final-token residual is optimized to predict the next token, not to summarize the sentence; no `[CLS]`-style aggregation objective exists.
+**Status:** Code landed in commits `ca1224e` (this script) and `6bd78fc` ([Step 5](05_encode_identity_saes.md)). The three-mode comparison run on RunPod is what remains.
 
-**Why it matters:** The entire downstream geometry pipeline (PCA, contrast directions, shared-subspace SVD, family-stability cosines, SAE feature selectivity, decoder alignment, triage roles, the BBQ feature pool) is computed on these arrays. If period-token geometry is not faithful to identity geometry, every geometric and causal claim is downstream of an untested assumption a reviewer will challenge on first read.
+**What landed:**
+- New `--token_mode {final_token, identity_span_last, identity_span_mean}` flag (default `final_token` preserves legacy behavior bit-for-bit). The default output directory is now derived from the mode (`identity_prompts_{token_mode}`), so the three runs land in sibling directories and cannot overwrite each other.
+- `find_identity_span(prompt, form)` (lifted from `extract_token_level_sae_activations.py`) plus `span_token_indices(...)` convert the regex char-match to token positions via the tokenizer's offset_mapping. Both scripts now locate spans identically.
+- New `precompute_span_locations` pre-pass runs CPU-only before the model loads. It tokenizes every prompt with `return_offsets_mapping=True`, validates that every prompt's `form_used` is locatable AND survives `--max_length` truncation, then writes a sidecar `span_locations.csv` (`prompt_id, form_used, span_status, span_start_char, span_end_char, span_token_first, span_token_last, span_n_tokens, span_token_indices`). Failures raise loudly so a long GPU run cannot be started against broken inputs.
+- `select_layer_activation` reduces per-layer hidden states (B, T, D) → (B, D) under the chosen mode:
+  - `final_token`: `hidden[b, attention_mask.sum-1, :]` (legacy gather, byte-identical).
+  - `identity_span_last`: `hidden[b, span_token_last, :]`.
+  - `identity_span_mean`: `sum(hidden * span_mask) / span_mask.sum`, computed once per batch and reused across layers.
+- `run_config.json` records `token_mode`; [Step 5](05_encode_identity_saes.md) widens its `--activation_mode` choices to mirror and writes the label into its own run config too.
 
-**Targeted fix:**
-- Add `--token_mode {final, identity_span_last, identity_span_mean}` to this script. The first is current behavior; the other two require locating the identity surface form in each prompt (regex against `form_used` column from `metadata.csv` plus offset mapping) and pooling residuals over those token positions.
-- Run the geometry analysis on all three modes and compare contrast AUC, probe accuracy, and shared-subspace spectrum across them.
-- Pick the locus that carries signal, justify it, and report the comparison itself as a finding.
-- The companion `token_span` mode is already scaffolded but `NotImplementedError` in [Step 5 — `encode_identity_saes.py`](05_encode_identity_saes.md); both ends need to be filled in for the span-based SAE encoding to work.
+**Why it matters (original audit):** Every template in `mi_identity_templates.csv` ends with a period (e.g. `A01 = "This person is {form}."`, `F03 = "{form}."`). After tokenization the final non-padding token is the sentence-final period in essentially every prompt. So the prior loader stored, per layer, the residual stream at the period token, not at the identity token. The entire downstream geometry pipeline (PCA, contrast directions, shared-subspace SVD, family-stability cosines, SAE feature selectivity, decoder alignment, triage roles, the BBQ feature pool) was computed on these arrays. If period-token geometry is not faithful to identity geometry, every geometric and causal claim is downstream of an untested assumption a reviewer will challenge on first read.
+
+**Remaining work (RunPod):**
+- Run all three modes for at least layers `{0, 8, 16, 24, 32}`:
+  ```bash
+  python scripts/extract_identity_activations.py --token_mode final_token        # legacy
+  python scripts/extract_identity_activations.py --token_mode identity_span_last
+  python scripts/extract_identity_activations.py --token_mode identity_span_mean
+  ```
+- Re-encode each through [Step 5](05_encode_identity_saes.md) with the matching `--activation_dir` and `--activation_mode`.
+- Run Stage 2 (geometry) on each and compare contrast AUC, probe accuracy, and shared-subspace spectrum across modes.
+- Pick the locus that carries signal, justify it, and report the comparison itself as a finding in the methods writeup.
 
 ### 1.5 [MINOR] — Activations are bf16-precision stored as float32
 
@@ -52,11 +67,12 @@ Run Llama-3.1-8B forward over every prompt in `mi_identity_prompts.csv`, take `o
 - For the final headline run, if VRAM allows, run the forward in fp32 and store fp32 — eliminates the asymmetry entirely. Otherwise note it and move on.
 
 ## Rebuild checklist
-- [ ] Implement `--token_mode` with `final`, `identity_span_last`, `identity_span_mean` options. Reuse the regex span-finding logic from `extract_token_level_sae_activations.py`.
-- [ ] When running the new modes, change the output directory name to reflect the locus (e.g. `identity_prompts_identity_span_last/`) so artifacts are not confused with the period-token run.
-- [ ] Run all three modes for at least layers `{0, 8, 16, 24, 32}` so geometry comparisons are tractable without re-running every layer.
-- [ ] Plumb the chosen `token_mode` into [Step 5 — `encode_identity_saes.py`](05_encode_identity_saes.md) so the `token_span` `NotImplementedError` is actually filled in.
-- [ ] Record the chosen final locus and the comparison results in the methods doc.
+- [x] Implement `--token_mode` with three options and the span pre-pass. (Done.)
+- [x] Plumb the chosen `token_mode` into [Step 5](05_encode_identity_saes.md). (Done.)
+- [ ] Run all three modes on RunPod for at least layers `{0, 8, 16, 24, 32}` so geometry comparisons are tractable without re-running every layer.
+- [ ] Verify each run's `span_locations.csv` shows `span_status == "exact"` for ≥99% of prompts and `span_n_tokens` distribution is reasonable (no single-token spans for multi-word forms).
+- [ ] Re-encode each through [Step 5](05_encode_identity_saes.md); rerun [Step 7](07_analyze_identity_geometry.md) / [Step 8](08_analyze_identity_geometry_diagnostics.md) / [Step 9](09_analyze_shared_social_subspace.md) for each mode.
+- [ ] Compare contrast AUC, probe accuracy, and shared-subspace spectrum across modes; record the chosen locus and the comparison in the methods doc as the audit-required justification.
 - [ ] Disclose bf16 forward / fp32 storage in `run_config.json` (already there) and propagate to the methods write-up.
 
 ## Notes from the doc audit
