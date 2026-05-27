@@ -43,7 +43,7 @@ Bulk static plotting over the CSVs produced by `analyze_identity_sae_features.py
 ### Inherited issues (do not require changes to this file)
 
 - **2.5 (post-selection bias)** — The heatmap and scatters faithfully display the inflated Cohen's d numbers. Once the upstream fix lands, the plots will improve automatically.
-- **5.1 (reconstruction projection math)** — The reconstruction-curve plots inherit `fraction_norm_captured` from the upstream CSV. Fix upstream; this script will pick up the corrected values.
+- **5.1 (reconstruction projection math)** — *FIX LANDED 2026-05-27 upstream (commit `1a569c3`).* The reconstruction-curve plots inherit `fraction_norm_captured` and `cosine_with_full_direction` from `direction_reconstruction.csv`; the upstream now writes the true least-squares projection (`fraction ∈ [0, 1]`, `cosine² = fraction`). Plot code unchanged — re-run with `--overwrite` against re-generated CSVs.
 - **5.3 (`combined_score` double-weighting)** — The top-10-by-`combined_score` labels in the alignment scatter (line 110) reflect the upstream weighting. Fix upstream.
 
 ## Rebuild checklist

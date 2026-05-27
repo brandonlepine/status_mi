@@ -370,16 +370,25 @@ What to do: define a **polarity-signed** bias quantity, e.g. `signed_bias_delta 
 
 ## 5. Methodological issues and opportunities
 
-### 5.1 [MAJOR] Direction reconstruction treats decoder rows as an orthonormal basis
+### 5.1 [MAJOR] Direction reconstruction treats decoder rows as an orthonormal basis (FIX LANDED 2026-05-27)
 
-`analyze_identity_sae_features.py:reconstruct_direction` does `basis = decoder_normed[feature_ids]; coeff = basis @ direction; recon = coeff @ basis` — i.e. `recon = BᵀB d` with `B` having unit-norm but **not orthogonal** rows. The orthogonal projection of `d` onto `span(B)` is `Bᵀ(BBᵀ)⁻¹B d`. The two coincide only when `B` is orthonormal. SAE decoder rows of related identity features are generally *not* orthogonal, so:
+**Status:** Closed in commit `1a569c3` (`scripts/analyze_identity_sae_features.py`). The output schema of `direction_reconstruction.csv` is unchanged; the values are now correct and bounded.
 
-- `fraction_norm_captured = ||recon||²` is not a fraction of anything — `BᵀB` is not a projector, and `||BᵀB d||²` can exceed 1.
-- `cosine_with_full_direction` is computed against the (re-normalized) `recon`, so it is a real cosine but to a *non-projection* vector, not to "the best k-feature reconstruction."
+**What landed:** `reconstruct_direction` now solves the least-squares problem `argmin_c ||basis.T @ c − direction||²` via `np.linalg.lstsq`; the minimizer `recon = c @ basis` is the true orthogonal projection of `direction` onto `span(rows of basis)`. With this:
+- `fraction_norm_captured = ||recon||² / ||direction||² ∈ [0, 1]` by construction.
+- `cosine_with_full_direction = sqrt(fraction_norm_captured)` (projection identity).
+- Defensive: `fraction` divides by `||direction||²` rather than assuming unit-norm input.
 
-Why it matters: the reconstruction analysis is meant to answer "how much of the identity direction do k SAE features capture" — a natural and reviewable claim. As written, the numbers are not that.
+**Validation:** 200 random trials (`k ∈ [3, 50]`, `d_model = 256`) all gave `fraction ∈ [0, 1]`; the projection identity held to ~1e-15. Pathological case (10 basis rows with avg mutual cosine 0.77, direction along the cluster) — old: `fraction = 74.7` (nonsensical); new: `0.984` (correct).
 
-What to do: compute the true least-squares projection (`numpy.linalg.lstsq` of `d` onto `Bᵀ`, or QR/orthonormalize `B`). Then `fraction_norm_captured = ||proj||² / ||d||²` is a genuine variance-captured fraction in [0,1].
+**Original audit (preserved):**
+
+`analyze_identity_sae_features.py:reconstruct_direction` did `basis = decoder_normed[feature_ids]; coeff = basis @ direction; recon = coeff @ basis` — i.e. `recon = BᵀB d` with `B` having unit-norm but **not orthogonal** rows. The orthogonal projection of `d` onto `span(B)` is `Bᵀ(BBᵀ)⁻¹B d`. The two coincide only when `B` is orthonormal. SAE decoder rows of related identity features are generally *not* orthogonal, so:
+
+- `fraction_norm_captured = ||recon||²` was not a fraction of anything — `BᵀB` is not a projector, and `||BᵀB d||²` can exceed 1.
+- `cosine_with_full_direction` was computed against the (re-normalized) `recon`, so it was a real cosine but to a *non-projection* vector, not to "the best k-feature reconstruction."
+
+The reconstruction analysis is meant to answer "how much of the identity direction do k SAE features capture" — a natural and reviewable claim. As written, the numbers were not that.
 
 ### 5.2 [MAJOR] Triage roles are heuristic definitions, not validated findings
 
@@ -494,7 +503,7 @@ Ordered by what most threatens a defensible result.
 
 **Tier 3 — correctness, clarity, strengthening**
 
-15. Fix the reconstruction projection math (least-squares, not `BᵀB`) (5.1).
+15. Fix the reconstruction projection math (least-squares, not `BᵀB`) (5.1 — FIX LANDED 2026-05-27, commit `1a569c3`).
 16. Verify intervention positions land in the intended prompt section (3.3).
 17. Tie steering magnitude to a meaningful scale (3.2).
 18. Decide intersectional BBQ handling — first-class or excluded, not flattened (4.2).

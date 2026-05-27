@@ -33,7 +33,7 @@ The bridge from "geometric contrast directions" to "individual SAE features." Fo
 - Residualization (default `family_residualized`) is applied to the **activations** (`residualize()`, line 102): subtract per-family mean, add back the global mean. This affects the contrast `direction` and `evaluate_direction` scores — but the SAE encodings in `long_df` come from `encode_identity_saes.py`, which encoded **raw** activations. The two representations are mixed. See issue 5.4.
 - Contrast direction (`compute_direction`, line 121) is the unit-normalized centered `mean(A) − mean(B)`, sign-flipped so identity_a scores higher.
 - `feature_selectivity_for_contrast` (line 199): computes Cohen's d and AUC analytically for **all** `n_features` via `compute_cohens_d_and_auc_for_all_features` (Cohen's d from sum/sum_sq/count using sample variance; AUC via the sparse 4-bucket decomposition), then ranks and keeps top `top_n` by `|d|`. The prior code prefiltered to `5 × top_n` by `|diff_mean|` before computing d/AUC, which biased the reported effect sizes upward. Audit 2.5 closed 2026-05-27.
-- `reconstruct_direction` (line 323) does `coeff = basis @ direction; recon = coeff @ basis` — i.e. `BᵀB d` with `B` having unit-norm but **not orthogonal** rows. This is not an orthogonal projection. See issue 5.1.
+- `reconstruct_direction` solves the least-squares problem `argmin_c ||basis.T @ c − direction||²` via `np.linalg.lstsq` and sets `recon = c @ basis` — the true orthogonal projection of `direction` onto `span(rows of basis)`. `fraction_norm_captured = ||recon||² / ||direction||²` is now correctly in `[0, 1]` and equals `cosine_with_full_direction²` (projection identity). Audit 5.1 closed 2026-05-27 in commit `1a569c3`. The prior `coeff = basis @ direction; recon = coeff @ basis` (= `BᵀB d`) was only the orthogonal projection when `B Bᵀ = I`, which decoder rows don't satisfy.
 - `combined_score` (line 481) sums three z-scored magnitudes: `|d|`, `|cos|`, `|auc − 0.5|`. Since `d` and `auc` measure the same A/B separation, this double-weights selectivity vs alignment. See issue 5.3.
 - Output CSVs are **appended** (`append_csv`) per layer/contrast, so the existing run requires `--overwrite` to rebuild cleanly.
 - The four numpy intervention helpers (lines 414-434) — `ablate_features_in_sae`, `steer_features_in_sae`, `decode_sae`, `patch_residual_with_sae_reconstruction` — are still defined here for analysis-side use, but the canonical torch primitives now live in [`scripts/encode_identity_saes.py`](05_encode_identity_saes.md) and are the ones consumed by [Step 20](20_run_bbq_sae_steering.md) under `--intervention_modes`. See issue 3.1 below.
@@ -74,13 +74,26 @@ The bridge from "geometric contrast directions" to "individual SAE features." Fo
 
 **Original audit (preserved):** `feature_selectivity_for_contrast` filtered to the top `5 · top_n` features by `|diff_mean|`, then computed Cohen's d and AUC only on that surviving subset, then re-ranked and kept the top `top_n` by `|d|`. Because `diff_mean` and `d` are highly correlated, the reported `d`/`auc` were conditioned on having survived a selection screen and inflated. Every downstream "this feature has Cohen's d = X" number — in `feature_selectivity.csv`, in the `combined_score` derived from it, in the triage thresholds keyed off `|d|`, and in the steering pool — was a post-selection estimate without a confirmation set.
 
-### 5.1 [MAJOR] — Direction reconstruction treats decoder rows as an orthonormal basis
+### 5.1 [MAJOR] — Direction reconstruction treats decoder rows as an orthonormal basis (FIX LANDED 2026-05-27)
 
-**What's wrong:** `reconstruct_direction` (line 323) computes `basis = decoder_normed[feature_ids]`, then `coeff = basis @ direction; recon = coeff @ basis`. This is `BᵀB d`. With `B` having unit-norm rows but **not** orthogonal rows (related identity features generally are not orthogonal), the orthogonal projection of `d` onto `span(B)` is actually `Bᵀ(BBᵀ)⁻¹B d`. So `fraction_norm_captured = ||recon||²` is not bounded in `[0, 1]` and is not a fraction of anything, and `cosine_with_full_direction` is taken against a non-projection vector.
+**Status:** Closed in commit `1a569c3`. `reconstruct_direction` now solves the least-squares problem `argmin_c ||basis.T @ c − direction||²` via `np.linalg.lstsq`; the minimizer `recon = c @ basis` is the true orthogonal projection of `direction` onto `span(rows of basis)`. Output schema of `direction_reconstruction.csv` unchanged — only the values become correct (and bounded).
 
-**Why it matters:** The reconstruction table is meant to answer "how much of the identity direction do `k` SAE features capture" — a natural and reviewable claim. As written the headline number in `direction_reconstruction.csv` does not have the interpretation the column name implies.
+**What landed:**
+- `fraction_norm_captured = ||recon||² / ||direction||²` is now in `[0, 1]` by construction (orthogonal projection always satisfies `||proj|| ≤ ||original||`).
+- `cosine_with_full_direction = sqrt(fraction_norm_captured)` follows from the projection identity `direction · recon = ||recon||²`. The two columns are now algebraically related (squaring one gives the other), which is the right invariant.
+- Defensive: `fraction` is computed with `||direction||²` in the denominator rather than assuming the direction is unit-norm.
 
-**Targeted fix:** Replace the `coeff @ basis` line with a proper least-squares solve: `coeff, *_ = np.linalg.lstsq(basis.T, direction, rcond=None); recon = coeff @ basis`. Equivalently, orthonormalize `B` via QR (`Q, _ = np.linalg.qr(basis.T); recon = (Q.T @ direction) @ Q.T`). Then `fraction_norm_captured = ||recon||² / ||direction||²` (and direction is unit-norm so this is `||recon||²` in `[0, 1]`).
+**Validation:**
+- 200 random trials over `k ∈ [3, 50]`, `d_model = 256`: new fraction always in `[0, 1]`; projection identity holds to ~1e-15.
+- Direction lying in `span(basis)` → `fraction = 1.0` exactly.
+- Orthonormal basis (the degenerate case where the old formula was correct) → new matches old to numerical zero.
+- Pathological case (10 basis rows with average mutual cosine 0.77, direction along the cluster): old gives `fraction = 74.7` (nonsensical), new gives `0.984` (correct: direction lies almost entirely in span).
+
+**Downstream re-validation:**
+- [Step 16 — `plot_identity_sae_features.py`](16_plot_identity_sae_features.md) reads `cosine_with_full_direction` and `fraction_norm_captured` directly from the CSV; the curves will now be bounded and interpretable. No code change needed there.
+- [Step 17 — `triage_sae_identity_features.py`](17_triage_sae_identity_features.md): `aggregate_signal_metrics` references the fraction column; re-validate its thresholds against the (now-correctly-bounded) values.
+
+**Original audit (preserved):** `reconstruct_direction` computed `basis = decoder_normed[feature_ids]`, then `coeff = basis @ direction; recon = coeff @ basis` — i.e. `BᵀB d`. With `B` having unit-norm rows but **not** orthogonal rows (related identity features generally are not orthogonal), the orthogonal projection of `d` onto `span(B)` is actually `Bᵀ(BBᵀ)⁻¹B d`. So `fraction_norm_captured = ||recon||²` was not bounded in `[0, 1]` and was not a fraction of anything; `cosine_with_full_direction` was taken against a non-projection vector. The reconstruction table is meant to answer "how much of the identity direction do `k` SAE features capture" — a natural and reviewable claim — and the headline number in `direction_reconstruction.csv` did not have the interpretation the column name implied.
 
 ### 5.3 [MINOR] — `combined_score` sums three near-duplicate, equally-weighted metrics
 
@@ -122,7 +135,7 @@ Add the chosen mode to `run_config.json` and assert downstream.
 - [ ] Audit `DEFAULT_CONTRASTS` (lines 22-44) against `bbq_identity_normalized_forms.csv`. Drop or rename `ses_low_income`, `ses_high_socioeconomic_status`; replace with `ses_low_income → ses_low` or `ses_poor`, and add the contrasts that should have been there. Tie this to the shared registry (5.10).
 - [ ] Decide on a single representation: residualize end-to-end (re-encode through SAE on residualized activations) **or** keep everything raw. Document in `run_config.json`. (5.4)
 - [x] Replace `feature_selectivity_for_contrast`'s `|diff_mean|` prefilter with full computation. (2.5) *(Done 2026-05-27: commit `4481445` — analytical d/AUC for all features; identity_selectivity also fixed.)* **Still open:** holdout-set confirmation columns, bundled with 2.1 winner's-curse correction.
-- [ ] Replace `reconstruct_direction` with a proper least-squares projection (`np.linalg.lstsq` or QR). Re-derive `fraction_norm_captured` as the normalized squared norm. (5.1)
+- [x] Replace `reconstruct_direction` with a proper least-squares projection (`np.linalg.lstsq` or QR). Re-derive `fraction_norm_captured` as the normalized squared norm. (5.1) *(Done 2026-05-27: commit `1a569c3`.)*
 - [ ] Rebalance `combined_score`: use one of `|d|`/`|auc-0.5|` plus `|cos|` with a documented weighting. (5.3)
 - [x] Extract canonical SAE intervention primitives into a shared module so `run_bbq_sae_steering.py` can consume them. (3.1) *(Done 2026-05-27: torch primitives in `scripts/encode_identity_saes.py`, commits `11d4a4d` + `84c87b5`.)*
 - [ ] Convert `load_contrasts`'s silent `print` into a `warnings.warn` (or fail) so missing identity IDs cannot be masked. (4.1)
