@@ -28,12 +28,12 @@ For a curated subset of identity-related SAE features, re-run the model on the p
 - Prompt selection per feature (`select_prompt_rows`, line 135): top `--max_prompts_per_feature` (default 200) by final-token activation, with a `positive` fallback to "any nonzero" then to "all rows" if no rows have a positive final-token value.
 - Identity span localization (`find_identity_span`, line 151): regex search for the realized `form_used` in the prompt; falls back to a whitespace/punctuation-normalized form. Records `identity_span_match_status ∈ {exact, normalized, failed}`. This is the data needed by issue 1.1.
 - Per-token SAE encoding (`encode_selected_features`, line 177): `relu((hidden - b_dec) @ w_enc[:, features] + b_enc[features])`. Same generic-loader convention as `encode_identity_saes.py`; inherits the unverified preprocessing convention flagged by issue 1.4.
-- Per-prompt `feature_localization_type` (lines 332-339):
+- Per-prompt `feature_localization_type` is assigned by `common.classify_feature_localization` (audit 5.10 instance closed 2026-05-27 in commit `402731f` — same helper is called from `build_sae_feature_cards.py:exemplar_prompt_table`):
   - `identity_span_local` if `max_span_activation ≥ 0.7 · max_token_activation`,
   - `final_token_integrated` if `final_token_activation ≥ 0.7 · max_token_activation`,
-  - `template_context` if the max token is not in the identity span,
-  - `diffuse_or_unclear` otherwise.
-  The 0.7 cutoffs are hardcoded and are the source of the triage's `identity_span_local_threshold` / `final_token_integrated_threshold` matching.
+  - `template_context` if max activation exists but didn't land in span or final token,
+  - `diffuse_or_unclear` if max activation is zero.
+  Threshold default is `common.DEFAULT_LOCALIZATION_THRESHOLD = 0.7` — the same constant the triage's `identity_span_local_threshold` / `final_token_integrated_threshold` are matched against.
 - `resume` works at prompt-id granularity by counting how many distinct `feature_id`s have been written per `prompt_id` (`processed_prompt_ids`, line 197) and skipping prompts that already have all selected features.
 
 ## Issues & Opportunities
@@ -46,13 +46,13 @@ For a curated subset of identity-related SAE features, re-run the model on the p
 
 **Targeted fix:** Refactor `find_identity_span` (line 151) into a shared helper (see 5.10 in step 13). Add a `--token_pooling {final, identity_span_last, identity_span_mean}` flag to `extract_identity_activations.py` that consumes the same logic. Re-run extraction at `identity_span_last` and `identity_span_mean`; re-run Stage 2 geometry on those. The token-pooling mode is already scaffolded but `NotImplementedError` in `encode_identity_saes.py`, so this also unblocks span-pooled SAE encoding.
 
-### 4.6 [MINOR] — Top-k SAE truncation may clip true activations
+### 4.6 [MINOR] — Top-k SAE truncation may clip true activations (PARTIAL FIX LANDED 2026-05-27)
 
-**What's wrong:** Upstream, `encode_identity_saes.py` keeps only the top-64 features per row (`--top_k_save 64`); everything else is treated as zero. This script's `final_token_feature_values` (line 116) and prompt-selection logic both rely on those top-64 indices. If a feature's true activation rank for some prompts is between 65 and ~131k, that prompt is **missed** in the per-feature top-prompt selection, even if the model would produce a real (non-trivial) per-token activation on that prompt.
+**Status:** Upstream detection landed in commit `c6dbcfe` ([Step 6](06_validate_sae_hook_alignment.md)): the validator now reports `reconstruction_l0_p50/p95/p99` and gates on `max_l0 > --top_k_save_threshold` (default 64, matching step 5's `--top_k_save`). If empirical max L0 exceeds the cap, the validator fails before any downstream consumer (including this script) sees the encoding. The empirical answer itself still requires the RunPod run.
 
-**Why it matters in this file:** Even though `encode_selected_features` runs a fresh forward and computes the **dense** per-token activation for the chosen features (so per-token values are not truncated), the **set of prompts** examined per feature is determined by the upstream top-64 sparse encoding. Features whose final-token activation is moderate (rank 65-150) but whose mid-prompt activation is large will appear to have very few prompts and uninformative `feature_localization_type` distributions.
+**Why it matters in this file (preserved):** Even though `encode_selected_features` runs a fresh forward and computes the **dense** per-token activation for the chosen features (so per-token values are not truncated), the **set of prompts** examined per feature is determined by the upstream top-64 sparse encoding. Features whose final-token activation is moderate (rank 65-150) but whose mid-prompt activation is large will appear to have very few prompts and uninformative `feature_localization_type` distributions.
 
-**Targeted fix:** Check the SAE's reported/empirical L0 at layer 24. If it exceeds ~50, raise `--top_k_save` in `encode_identity_saes.py` (e.g. to 128 or 256) and re-encode. Alternatively, augment `select_prompt_rows` here to optionally re-encode the **full** feature column for a candidate set of prompts (those above some activation threshold from the truncated encoding), at the cost of more forward passes.
+**Remaining (RunPod):** After the audit-1.4 re-encode, [Step 6](06_validate_sae_hook_alignment.md) will report `recon_l0_clipping_risk`. If True, raise `--top_k_save` in step 5 and re-encode before running this script.
 
 ## Rebuild checklist
 
@@ -60,7 +60,7 @@ For a curated subset of identity-related SAE features, re-run the model on the p
 - [ ] Add a `--token_pooling` flag to `extract_identity_activations.py` using the shared helper; rerun Stage 1 with `identity_span_last` and `identity_span_mean`. Rerun Stage 2 geometry on those outputs and report the comparison. (1.1)
 - [ ] Audit SAE empirical L0; if needed, raise `--top_k_save` in `encode_identity_saes.py` and rerun `encode_identity_saes.py` and this script. (4.6)
 - [ ] After fixing `combined_score` and selection bias upstream (5.3, 2.5), re-run `select_features` here so the per-feature top-prompts reflect the corrected feature pool.
-- [ ] Hardcoded 0.7 cutoffs in localization assignment (lines 332-336) should be exposed as CLI args so the triage's thresholds (`identity_span_local_threshold`, `final_token_integrated_threshold`) can be swept jointly.
+- [ ] Hardcoded 0.7 cutoffs in localization assignment should be exposed as CLI args so the triage's thresholds (`identity_span_local_threshold`, `final_token_integrated_threshold`) can be swept jointly. The threshold now lives as `common.DEFAULT_LOCALIZATION_THRESHOLD` and the helper takes it as a keyword arg, so the change is one `--localization_threshold` CLI flag away.
 
 ## Notes from the doc audit
 

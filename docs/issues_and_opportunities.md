@@ -480,6 +480,8 @@ SAEs are encoded/steered only at layer 24. The geometry diagnostics show identit
 
 **Smoke-tested:** 10/10 common.py unit tests pass; all 8 consumer scripts import without runtime error; AST-clean.
 
+**Follow-up extension (2026-05-27, commit `402731f`):** the `feature_localization_type` 4-branch classifier was a 5.10 instance not covered by `e50bbd1`. It is now `common.classify_feature_localization(max_token_activation, max_identity_span_activation, final_token_activation, threshold=0.7)`, called by both `extract_token_level_sae_activations.py` and `build_sae_feature_cards.py`. Constants surfaced as `DEFAULT_LOCALIZATION_THRESHOLD = 0.7` and `LOCALIZATION_TYPES` tuple in common.
+
 ---
 
 ## 6. What is already done well (keep these)

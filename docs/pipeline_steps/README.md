@@ -72,8 +72,8 @@ Severity tags are aggregated per script from `issues_and_opportunities.md`. **B*
 | 11 | `plot_identity_directional_visualizations.py` | 2 | m (2.1 visualization — FIX LANDED, 5.10 — FIX LANDED) | [11_plot_identity_directional_visualizations.md](11_plot_identity_directional_visualizations.md) |
 | 12 | `plot_identity_directional_followups.py` | 2 | m (2.1 visualization — PARTIAL FIX LANDED, 4.1 — FIX LANDED, 5.10 — FIX LANDED) | [12_plot_identity_directional_followups.md](12_plot_identity_directional_followups.md) |
 | 13 | `analyze_identity_sae_features.py` | 3 | M (2.1 — PARTIAL FIX LANDED, 2.5 — PARTIAL FIX LANDED, 4.1 — FIX LANDED, 5.1 — FIX LANDED) · m (5.3 — FIX LANDED, 5.4 — FIX LANDED, 5.10 — FIX LANDED) · enabler (3.1 — FIX LANDED) | [13_analyze_identity_sae_features.md](13_analyze_identity_sae_features.md) |
-| 14 | `extract_token_level_sae_activations.py` | 3 | m (4.6) · enabler (1.1) | [14_extract_token_level_sae_activations.md](14_extract_token_level_sae_activations.md) |
-| 15 | `build_sae_feature_cards.py` | 3 | m (logit-lens caveat) | [15_build_sae_feature_cards.md](15_build_sae_feature_cards.md) |
+| 14 | `extract_token_level_sae_activations.py` | 3 | m (4.6 — PARTIAL FIX LANDED, 5.10 — FIX LANDED) · enabler (1.1) | [14_extract_token_level_sae_activations.md](14_extract_token_level_sae_activations.md) |
+| 15 | `build_sae_feature_cards.py` | 3 | m (logit-lens caveat — FIX LANDED, 5.10 — FIX LANDED) | [15_build_sae_feature_cards.md](15_build_sae_feature_cards.md) |
 | 16 | `plot_identity_sae_features.py` | 3 | m (5.10 — FIX LANDED) | [16_plot_identity_sae_features.md](16_plot_identity_sae_features.md) |
 | 17 | `triage_sae_identity_features.py` | 3 | M (5.2) | [17_triage_sae_identity_features.md](17_triage_sae_identity_features.md) |
 | 18a | `build_few_shot_pool.py` (prereq) | 4 | enabler (1.2 partial fix) | [18a_build_few_shot_pool.md](18a_build_few_shot_pool.md) |
