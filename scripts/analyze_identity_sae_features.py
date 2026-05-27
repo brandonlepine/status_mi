@@ -19,29 +19,8 @@ from tqdm.auto import tqdm
 DEFAULT_SAE_ENCODED_DIR = Path("/workspace/status_mi/results/sae_identity/llama-3.1-8b/final_token")
 DEFAULT_ACTIVATION_DIR = Path("/workspace/status_mi/results/activations/llama-3.1-8b/identity_prompts_final_token")
 DEFAULT_OUTPUT_DIR = Path("/workspace/status_mi/results/sae_identity/llama-3.1-8b/final_token/analysis")
-DEFAULT_CONTRASTS = [
-    ("race_black_vs_race_white", "race_black", "race_white", "race_ethnicity"),
-    ("race_black_vs_race_asian", "race_black", "race_asian", "race_ethnicity"),
-    ("race_black_vs_race_caucasian", "race_black", "race_caucasian", "race_ethnicity"),
-    ("sexuality_gay_vs_sexuality_straight", "sexuality_gay", "sexuality_straight", "sexual_orientation"),
-    ("sexuality_gay_vs_sexuality_heterosexual", "sexuality_gay", "sexuality_heterosexual", "sexual_orientation"),
-    ("sexuality_lesbian_vs_sexuality_straight", "sexuality_lesbian", "sexuality_straight", "sexual_orientation"),
-    ("sexuality_bisexual_vs_sexuality_straight", "sexuality_bisexual", "sexuality_straight", "sexual_orientation"),
-    ("disability_disabled_vs_disability_nondisabled", "disability_disabled", "disability_nondisabled", "disability_status"),
-    ("disability_disabled_vs_disability_able_bodied", "disability_disabled", "disability_able_bodied", "disability_status"),
-    ("appearance_short_vs_appearance_tall", "appearance_short", "appearance_tall", "physical_appearance"),
-    ("appearance_obese_vs_appearance_thin", "appearance_obese", "appearance_thin", "physical_appearance"),
-    ("appearance_poorly_dressed_vs_appearance_well_dressed", "appearance_poorly_dressed", "appearance_well_dressed", "physical_appearance"),
-    ("ses_low_income_vs_ses_rich", "ses_low_income", "ses_rich", "socioeconomic_status"),
-    ("ses_low_income_vs_ses_high_socioeconomic_status", "ses_low_income", "ses_high_socioeconomic_status", "socioeconomic_status"),
-    ("ses_lower_class_vs_ses_upper_class", "ses_lower_class", "ses_upper_class", "socioeconomic_status"),
-    ("ses_blue_collar_vs_ses_white_collar", "ses_blue_collar", "ses_white_collar", "socioeconomic_status"),
-    ("gender_transgender_vs_gender_cisgender", "gender_transgender", "gender_cisgender", "gender_identity"),
-    ("gender_transgender_man_vs_gender_cisgender_man", "gender_transgender_man", "gender_cisgender_man", "gender_identity"),
-    ("gender_transgender_woman_vs_gender_cisgender_woman", "gender_transgender_woman", "gender_cisgender_woman", "gender_identity"),
-    ("religion_muslim_vs_religion_christian", "religion_muslim", "religion_christian", "religion"),
-    ("religion_jewish_vs_religion_christian", "religion_jewish", "religion_christian", "religion"),
-]
+# Canonical contrast registry — see scripts/contrast_registry.py. Audit 4.1.
+from contrast_registry import CONTRASTS as DEFAULT_CONTRASTS  # noqa: E402
 RESIDUALIZATION_GROUPS = {
     "raw": None,
     "family_residualized": "family",
@@ -89,14 +68,39 @@ def append_csv(path: Path, rows: list[dict[str, object]]) -> None:
     pd.DataFrame(rows).to_csv(path, mode="a", header=not path.exists(), index=False)
 
 
-def load_contrasts(path: Path | None, metadata: pd.DataFrame) -> pd.DataFrame:
-    contrasts = pd.read_csv(path, keep_default_na=False) if path else pd.DataFrame(DEFAULT_CONTRASTS, columns=["contrast_name", "identity_a", "identity_b", "axis"])
-    identities = set(metadata["identity_id"])
-    valid = contrasts[contrasts["identity_a"].isin(identities) & contrasts["identity_b"].isin(identities)].copy()
-    skipped = len(contrasts) - len(valid)
-    if skipped:
-        print(f"Skipping {skipped} contrasts because one or both identity IDs are absent.")
-    return valid.reset_index(drop=True)
+def load_contrasts(path: Path | None, metadata: pd.DataFrame, output_dir: Path | None = None) -> pd.DataFrame:
+    """Load + validate the contrast registry against this run's identity set.
+
+    When `path` is None, the canonical registry (`contrast_registry.CONTRASTS`)
+    is used. When `path` is given, the CSV must have the same 4 columns.
+    Per-row warnings emit for each skipped pair, and a `contrasts_skipped.csv`
+    sidecar is written next to the analysis outputs (audit 4.1; no startup
+    assertion so partial-axis runs work).
+    """
+    from contrast_registry import (
+        CONTRASTS as _REGISTRY,
+        load_validated_contrasts,
+        write_contrasts_skipped,
+    )
+    if path is None:
+        registry_rows = _REGISTRY
+    else:
+        custom = pd.read_csv(path, keep_default_na=False)
+        registry_rows = [tuple(row[c] for c in ("contrast_name", "identity_a", "identity_b", "axis"))
+                         for _, row in custom.iterrows()]
+    import tempfile, os
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
+        pd.DataFrame({"identity_id": metadata["identity_id"].unique()}).to_csv(f.name, index=False)
+        tmp_path = f.name
+    try:
+        result = load_validated_contrasts(tmp_path, registry=registry_rows)
+    finally:
+        os.unlink(tmp_path)
+    if output_dir is not None:
+        analysis_dir = output_dir / "analysis"
+        analysis_dir.mkdir(parents=True, exist_ok=True)
+        write_contrasts_skipped(result.skipped, analysis_dir / "contrasts_skipped.csv")
+    return result.valid.reset_index(drop=True)
 
 
 def residualize(x: np.ndarray, metadata: pd.DataFrame, residualization: str) -> np.ndarray:
@@ -447,7 +451,7 @@ def main() -> None:
         raise ValueError(f"Unknown residualization: {args.residualization}")
     prepare_output(args.output_dir, args.overwrite)
     metadata = pd.read_csv(args.activation_dir / "metadata.csv", keep_default_na=False)
-    contrasts = load_contrasts(args.contrasts_csv, metadata)
+    contrasts = load_contrasts(args.contrasts_csv, metadata, output_dir=args.output_dir)
     k_values = parse_int_list(args.top_k_reconstruction_values)
     (args.output_dir / "run_config.json").write_text(json.dumps({
         "sae_encoded_dir": str(args.sae_encoded_dir),

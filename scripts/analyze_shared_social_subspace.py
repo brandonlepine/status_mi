@@ -67,43 +67,18 @@ METADATA_COLUMNS = [
     "family",
     "required_form",
 ]
-DEFAULT_CONTRASTS = [
-    ("race_black_vs_race_white", "race_black", "race_white", "race_ethnicity"),
-    ("race_black_vs_race_asian", "race_black", "race_asian", "race_ethnicity"),
-    ("race_black_vs_race_caucasian", "race_black", "race_caucasian", "race_ethnicity"),
-    ("sexuality_gay_vs_sexuality_straight", "sexuality_gay", "sexuality_straight", "sexual_orientation"),
-    ("sexuality_gay_vs_sexuality_heterosexual", "sexuality_gay", "sexuality_heterosexual", "sexual_orientation"),
-    ("sexuality_lesbian_vs_sexuality_straight", "sexuality_lesbian", "sexuality_straight", "sexual_orientation"),
-    ("sexuality_bisexual_vs_sexuality_straight", "sexuality_bisexual", "sexuality_straight", "sexual_orientation"),
-    ("disability_disabled_vs_disability_nondisabled", "disability_disabled", "disability_nondisabled", "disability_status"),
-    ("disability_disabled_vs_disability_able_bodied", "disability_disabled", "disability_able_bodied", "disability_status"),
-    ("appearance_short_vs_appearance_tall", "appearance_short", "appearance_tall", "physical_appearance"),
-    ("appearance_obese_vs_appearance_thin", "appearance_obese", "appearance_thin", "physical_appearance"),
-    ("appearance_poorly_dressed_vs_appearance_well_dressed", "appearance_poorly_dressed", "appearance_well_dressed", "physical_appearance"),
-    ("ses_low_income_vs_ses_rich", "ses_low_income", "ses_rich", "socioeconomic_status"),
-    ("ses_low_income_vs_ses_high_socioeconomic_status", "ses_low_income", "ses_high_socioeconomic_status", "socioeconomic_status"),
-    ("ses_lower_class_vs_ses_upper_class", "ses_lower_class", "ses_upper_class", "socioeconomic_status"),
-    ("ses_blue_collar_vs_ses_white_collar", "ses_blue_collar", "ses_white_collar", "socioeconomic_status"),
-    ("gender_transgender_vs_gender_cisgender", "gender_transgender", "gender_cisgender", "gender_identity"),
-    ("gender_transgender_man_vs_gender_cisgender_man", "gender_transgender_man", "gender_cisgender_man", "gender_identity"),
-    ("gender_transgender_woman_vs_gender_cisgender_woman", "gender_transgender_woman", "gender_cisgender_woman", "gender_identity"),
-    ("religion_muslim_vs_religion_christian", "religion_muslim", "religion_christian", "religion"),
-    ("religion_jewish_vs_religion_christian", "religion_jewish", "religion_christian", "religion"),
-]
-KEY_CONTRASTS = [
-    "sexuality_gay_vs_sexuality_straight",
-    "race_black_vs_race_white",
-    "gender_transgender_vs_gender_cisgender",
-    "appearance_obese_vs_appearance_thin",
-    "ses_low_income_vs_ses_rich",
-    "disability_disabled_vs_disability_able_bodied",
-]
-SELECTED_CROSS_AXIS_ORDERINGS = [
-    ("appearance_poorly_dressed_vs_appearance_well_dressed", "socioeconomic_status"),
-    ("ses_low_income_vs_ses_rich", "race_ethnicity"),
-    ("appearance_poorly_dressed_vs_appearance_well_dressed", "gender_identity"),
-    ("ses_lower_class_vs_ses_upper_class", "physical_appearance"),
-]
+# Canonical contrast registry — see scripts/contrast_registry.py for the
+# canonical list, key-subset, and cross-axis pairs. Audit 4.1 fix: previously
+# this script had its own DEFAULT_CONTRASTS with typo-broken SES entries
+# (ses_low_income / ses_high_socioeconomic_status); those silently failed
+# validation downstream. Imported aliases here preserve the in-file names
+# the rest of the script reads.
+from contrast_registry import (
+    CONTRASTS as _REGISTRY_CONTRASTS,
+    KEY_CONTRAST_NAMES as KEY_CONTRASTS,
+    SELECTED_CROSS_AXIS_ORDERINGS,
+)
+DEFAULT_CONTRASTS = _REGISTRY_CONTRASTS
 SPECTRUM_COLUMNS = [
     "layer",
     "residualization",
@@ -447,21 +422,44 @@ def stratified_sample_for_plot(df: pd.DataFrame, group_col: str, max_n: int, see
     return sampled
 
 
-def load_contrasts(path: Path | None, metadata: pd.DataFrame) -> pd.DataFrame:
-    if path is None:
-        contrasts = pd.DataFrame(DEFAULT_CONTRASTS, columns=["contrast_name", "identity_a", "identity_b", "axis"])
-    else:
-        contrasts = pd.read_csv(path, keep_default_na=False)
+def load_contrasts(path: Path | None, metadata: pd.DataFrame, output_dir: Path | None = None) -> pd.DataFrame:
+    """Load + validate the contrast registry against this run's identity set.
+
+    When `path` is None, the canonical registry (`contrast_registry.CONTRASTS`)
+    is used. When `path` is given, the CSV must have the same 4 columns; it is
+    validated the same way. Per-row warnings emit for each skipped pair, and
+    a contrasts_skipped.csv sidecar is written (audit 4.1; no startup
+    assertion so partial-axis runs work).
+    """
+    from contrast_registry import (
+        CONTRASTS as _REGISTRY,
+        load_validated_contrasts,
+        write_contrasts_skipped,
+    )
     required = {"contrast_name", "identity_a", "identity_b", "axis"}
-    missing = required - set(contrasts.columns)
-    if missing:
-        raise ValueError(f"Contrast CSV missing columns: {sorted(missing)}")
-    identities = set(metadata["identity_id"])
-    valid = contrasts[contrasts["identity_a"].isin(identities) & contrasts["identity_b"].isin(identities)].copy()
-    skipped = len(contrasts) - len(valid)
-    if skipped:
-        print(f"Skipping {skipped} contrasts because one or both identity IDs are absent.")
-    return valid.reset_index(drop=True)
+    if path is None:
+        registry_rows = _REGISTRY
+    else:
+        custom = pd.read_csv(path, keep_default_na=False)
+        missing = required - set(custom.columns)
+        if missing:
+            raise ValueError(f"Contrast CSV missing columns: {sorted(missing)}")
+        registry_rows = [tuple(row[c] for c in ("contrast_name", "identity_a", "identity_b", "axis")) for _, row in custom.iterrows()]
+
+    import tempfile, os
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
+        pd.DataFrame({"identity_id": metadata["identity_id"].unique()}).to_csv(f.name, index=False)
+        tmp_path = f.name
+    try:
+        result = load_validated_contrasts(tmp_path, registry=registry_rows)
+    finally:
+        os.unlink(tmp_path)
+
+    if output_dir is not None:
+        metrics_dir = output_dir / "metrics"
+        metrics_dir.mkdir(parents=True, exist_ok=True)
+        write_contrasts_skipped(result.skipped, metrics_dir / "contrasts_skipped.csv")
+    return result.valid.reset_index(drop=True)
 
 
 def compute_contrast_directions(x: np.ndarray, metadata: pd.DataFrame, contrasts: pd.DataFrame) -> list[DirectionRecord]:
@@ -1246,7 +1244,7 @@ def main() -> None:
     invalid = [item for item in residualizations if item not in RESIDUALIZATION_GROUPS]
     if invalid:
         raise ValueError(f"Unknown residualizations: {invalid}")
-    contrasts = load_contrasts(args.contrasts_csv, metadata)
+    contrasts = load_contrasts(args.contrasts_csv, metadata, output_dir=args.output_dir)
     prepare_output(args.output_dir, args.overwrite)
     (args.output_dir / "run_config.json").write_text(json.dumps({
         "activation_dir": str(args.activation_dir),
