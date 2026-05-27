@@ -70,6 +70,18 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Device for the recon check (cuda / cuda:0 / cpu). Default: auto-detect.",
     )
+    parser.add_argument(
+        "--top_k_save_threshold",
+        type=int,
+        default=64,
+        help="Audit 4.6 gate: top_k_save in encode_identity_saes.py truncates "
+             "each row's encoding to this many features (default 64). If the "
+             "SAE's empirical max L0 on real prompts exceeds this threshold, "
+             "real activations are silently clipped to zero downstream. The "
+             "validator records `recon_l0_clipping_risk = True` and fails the "
+             "row when l0_max > threshold (unless --allow_mismatch). Set to "
+             "match the --top_k_save you intend to use at encoding time.",
+    )
     return parser.parse_args()
 
 
@@ -160,16 +172,24 @@ def reconstruction_metrics(
         fvu = (diff ** 2).sum() / denom
         # Mean per-row cosine
         cos = torch.nn.functional.cosine_similarity(x_t, recon, dim=-1).mean()
-        # Empirical L0
+        # Empirical L0 — distribution stats are the audit-4.6 gate for top_k_save
+        # truncation in encode_identity_saes.py. Reporting percentiles in addition
+        # to mean/max lets the operator see how close the tail is to the cap.
         l0_per_row = (acts > 0).float().sum(dim=-1)
         mean_l0 = l0_per_row.mean()
         max_l0 = l0_per_row.max()
+        l0_p50 = l0_per_row.quantile(0.50)
+        l0_p95 = l0_per_row.quantile(0.95)
+        l0_p99 = l0_per_row.quantile(0.99)
     return {
         "reconstruction_n_rows_sampled": int(n),
         "reconstruction_fvu": float(fvu.detach().cpu().item()),
         "reconstruction_cosine_mean": float(cos.detach().cpu().item()),
         "reconstruction_mean_l0": float(mean_l0.detach().cpu().item()),
         "reconstruction_max_l0": float(max_l0.detach().cpu().item()),
+        "reconstruction_l0_p50": float(l0_p50.detach().cpu().item()),
+        "reconstruction_l0_p95": float(l0_p95.detach().cpu().item()),
+        "reconstruction_l0_p99": float(l0_p99.detach().cpu().item()),
         "sae_scale_in": float(sae.scale_in),
         "sae_scale_out": float(sae.scale_out),
         "sae_jump_relu_threshold": float(sae.theta),
@@ -233,6 +253,12 @@ def validate_row(args: argparse.Namespace, layer: int) -> dict[str, Any]:
             row.update(recon)
             recon_ok = recon["reconstruction_fvu"] <= args.reconstruction_fvu_threshold
             row["reconstruction_fvu_threshold"] = args.reconstruction_fvu_threshold
+            # Audit 4.6 gate: empirical max L0 must not exceed top_k_save, else
+            # encode_identity_saes.py silently truncates real activations to zero.
+            l0_clipping_risk = recon["reconstruction_max_l0"] > args.top_k_save_threshold
+            row["top_k_save_threshold"] = args.top_k_save_threshold
+            row["recon_l0_clipping_risk"] = l0_clipping_risk
+            recon_ok = recon_ok and (not l0_clipping_risk)
             row["reconstruction_passed"] = recon_ok
     else:
         row["reconstruction_passed"] = None  # not checked
@@ -245,7 +271,9 @@ def validate_row(args: argparse.Namespace, layer: int) -> dict[str, Any]:
             f"{row.get('reconstruction_passed')}, "
             f"checkpoint_layer_match={checkpoint_layer_match}, "
             f"position_marker_is_R={position_marker_is_r}, "
-            f"hidden_dim_match={hidden_dim_match}). Row:\n{json.dumps(row, indent=2, default=str)}"
+            f"hidden_dim_match={hidden_dim_match}, "
+            f"recon_l0_clipping_risk={row.get('recon_l0_clipping_risk')}). "
+            f"Row:\n{json.dumps(row, indent=2, default=str)}"
         )
     return row
 
