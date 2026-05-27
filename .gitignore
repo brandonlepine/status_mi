@@ -48,5 +48,8 @@ temp/
 
 # Keep source data and generated prompt CSVs trackable unless explicitly ignored later.
 !data/mi_identity_prompts.csv
+
+# Per-row audit artifact from scripts/audit_identity_spans.py; regeneratable.
+data/find_identity_span_audit.csv
 status_mi_runpod_figures_latest/
 output_data/**

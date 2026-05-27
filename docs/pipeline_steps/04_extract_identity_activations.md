@@ -44,6 +44,23 @@ Run Llama-3.1-8B forward over every prompt in `mi_identity_prompts.csv`, take `o
 
 **Why it matters (original audit):** Every template in `mi_identity_templates.csv` ends with a period (e.g. `A01 = "This person is {form}."`, `F03 = "{form}."`). After tokenization the final non-padding token is the sentence-final period in essentially every prompt. So the prior loader stored, per layer, the residual stream at the period token, not at the identity token. The entire downstream geometry pipeline (PCA, contrast directions, shared-subspace SVD, family-stability cosines, SAE feature selectivity, decoder alignment, triage roles, the BBQ feature pool) was computed on these arrays. If period-token geometry is not faithful to identity geometry, every geometric and causal claim is downstream of an untested assumption a reviewer will challenge on first read.
 
+**Verifying span-finding on the production CSV:**
+
+`scripts/audit_identity_spans.py` runs four integrity checks against any prompt CSV (defaults to `data/mi_identity_prompts.csv`) and exits non-zero on any failure. Pre-run on 2026-05-27 against the current 12,567-prompt dataset:
+
+| Check | Result |
+| --- | --- |
+| Span found (status != `failed`) | 12,567 / 12,567 PASS |
+| Matched text equals form (case-insensitive) | 12,567 / 12,567 PASS |
+| No ambiguity (form does not appear multiple times in prompt) | 12,567 / 12,567 PASS |
+| Clean word boundary (no substring overlap like `man` inside `woman`) | 12,567 / 12,567 PASS |
+
+```bash
+python scripts/audit_identity_spans.py  # exits 0 on full pass, 1 on any failure
+```
+
+Rerun this whenever `data/mi_identity_prompts.csv` regenerates (e.g., after a template/identity edit), or whenever `find_identity_span` is touched.
+
 **Remaining work (RunPod):**
 - Run all three modes for at least layers `{0, 8, 16, 24, 32}`:
   ```bash
