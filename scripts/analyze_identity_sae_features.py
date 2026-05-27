@@ -21,12 +21,6 @@ DEFAULT_ACTIVATION_DIR = Path("/workspace/status_mi/results/activations/llama-3.
 DEFAULT_OUTPUT_DIR = Path("/workspace/status_mi/results/sae_identity/llama-3.1-8b/final_token/analysis")
 # Canonical contrast registry — see scripts/contrast_registry.py. Audit 4.1.
 from contrast_registry import CONTRASTS as DEFAULT_CONTRASTS  # noqa: E402
-RESIDUALIZATION_GROUPS = {
-    "raw": None,
-    "family_residualized": "family",
-    "template_residualized": "template_id",
-    "required_form_residualized": "required_form",
-}
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,7 +32,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--contrasts_csv", type=Path, default=None)
     parser.add_argument("--top_n_features", type=int, default=100)
     parser.add_argument("--top_k_reconstruction_values", default="5,10,20,50,100,200")
-    parser.add_argument("--residualization", default="family_residualized")
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -114,14 +107,16 @@ from common import (  # noqa: E402
     cohens_d, cosine, normalize,
     compute_direction as _compute_direction_lowlevel,
     evaluate_projection as _evaluate_projection_canonical,
-    residualize as _residualize_by_column,
 )
-
-
-def residualize(x: np.ndarray, metadata: pd.DataFrame, residualization: str) -> np.ndarray:
-    """Adapter that maps residualization NAME -> column via RESIDUALIZATION_GROUPS.
-    Routes to common.residualize. Audit 5.10."""
-    return _residualize_by_column(x, metadata, RESIDUALIZATION_GROUPS[residualization])
+# Audit 5.4 (closed 2026-05-27): this script previously residualized
+# activations (default: family-residualized) before computing contrast
+# directions, but SAE features in long_df were encoded by Step 5 from RAW
+# activations. The two representations lived in slightly different spaces,
+# so decoder_alignment cosined a raw-space decoder row against a
+# residualized-space direction, and combined_score mixed a residualized
+# cosine with a raw-SAE Cohen's d. The script is now raw end-to-end:
+# direction, decoder alignment, selectivity, and reconstruction all
+# operate on the same raw activations the SAE was trained on.
 
 
 def compute_direction(x: np.ndarray, metadata: pd.DataFrame, identity_a: str, identity_b: str) -> tuple[np.ndarray | None, np.ndarray]:
@@ -395,14 +390,13 @@ def identity_selectivity(long_df: pd.DataFrame, metadata: pd.DataFrame, n_featur
     return pd.DataFrame(rows)
 
 
-def decoder_alignment(decoder: np.ndarray, direction: np.ndarray, contrast: pd.Series, layer: int, residualization: str) -> pd.DataFrame:
+def decoder_alignment(decoder: np.ndarray, direction: np.ndarray, contrast: pd.Series, layer: int) -> pd.DataFrame:
     norms = np.linalg.norm(decoder, axis=1)
     safe_norms = np.maximum(norms, 1e-12)
     cosine = (decoder @ direction) / safe_norms
     signed_dot = decoder @ direction
     df = pd.DataFrame({
         "layer": layer,
-        "residualization": residualization,
         "contrast_name": contrast.contrast_name,
         "axis": contrast.axis,
         "identity_a": contrast.identity_a,
@@ -467,7 +461,6 @@ def reconstruction_rows(
     global_mean: np.ndarray,
     k_values: list[int],
     layer: int,
-    residualization: str,
 ) -> list[dict[str, object]]:
     rows = []
     decoder_normed = decoder / np.maximum(np.linalg.norm(decoder, axis=1, keepdims=True), 1e-12)
@@ -495,7 +488,6 @@ def reconstruction_rows(
             # not just held-out direction estimation.
             rows.append({
                 "layer": layer,
-                "residualization": residualization,
                 "contrast_name": contrast.contrast_name,
                 "axis": contrast.axis,
                 "identity_a": contrast.identity_a,
@@ -592,8 +584,6 @@ def patch_residual_with_sae_reconstruction(original_x: np.ndarray, modified_reco
 def main() -> None:
     args = parse_args()
     start_all = time.perf_counter()
-    if args.residualization not in RESIDUALIZATION_GROUPS:
-        raise ValueError(f"Unknown residualization: {args.residualization}")
     prepare_output(args.output_dir, args.overwrite)
     metadata = pd.read_csv(args.activation_dir / "metadata.csv", keep_default_na=False)
     contrasts = load_contrasts(args.contrasts_csv, metadata, output_dir=args.output_dir)
@@ -606,7 +596,16 @@ def main() -> None:
         "layers": parse_int_list(args.layers),
         "top_n_features": args.top_n_features,
         "top_k_reconstruction_values": k_values,
-        "residualization": args.residualization,
+        "representation": "raw",
+        "representation_audit_note": (
+            "Audit 5.4 (closed 2026-05-27): this script is raw end-to-end. "
+            "SAE features in long_df were encoded by Step 5 from raw "
+            "activations, so the contrast direction and decoder alignment "
+            "operate on the same representation. The prior default "
+            "--residualization=family_residualized was removed; mixing "
+            "residualized direction with raw SAE features lived in different "
+            "spaces."
+        ),
         "combined_score_formula": (
             f"{combined_score_weights['cohens_d']} * zscore(|cohens_d|) "
             f"+ {combined_score_weights['decoder_cosine']} * zscore(|cosine_with_direction|)"
@@ -630,7 +629,6 @@ def main() -> None:
         decoder = np.load(layer_dir / "sae_decoder.npy", mmap_mode="r")
         n_features = decoder.shape[0]
         x = np.asarray(np.load(args.activation_dir / f"layer_{layer:02d}.npy", mmap_mode="r"), dtype=np.float32)
-        x = residualize(x, metadata, args.residualization)
         long_df = sparse_long(np.asarray(indices), np.asarray(values))
         print(f"\nLayer {layer:02d}: sparse rows={len(long_df):,}, n_features={n_features:,}")
 
@@ -642,7 +640,7 @@ def main() -> None:
             if direction is None:
                 continue
             selectivity = feature_selectivity_for_contrast(long_df, metadata, contrast, n_features, args.top_n_features, layer)
-            alignment = decoder_alignment(np.asarray(decoder, dtype=np.float32), direction, contrast, layer, args.residualization)
+            alignment = decoder_alignment(np.asarray(decoder, dtype=np.float32), direction, contrast, layer)
             joined = selectivity.merge(alignment, on=["layer", "contrast_name", "axis", "identity_a", "identity_b", "feature_id"], how="left")
             # Audit 5.3 (closed 2026-05-27): combined_score now weights selectivity
             # (Cohen's d) and decoder alignment (|cosine|) equally. The prior
@@ -661,7 +659,7 @@ def main() -> None:
             ]).drop_duplicates("feature_id")
             append_csv(args.output_dir / "decoder_direction_alignment.csv", alignment_top.to_dict("records"))
             append_csv(args.output_dir / "feature_selectivity_alignment_joined.csv", joined.to_dict("records"))
-            recon = reconstruction_rows(joined, alignment, np.asarray(decoder, dtype=np.float32), x, metadata, contrast, direction, global_mean, k_values, layer, args.residualization)
+            recon = reconstruction_rows(joined, alignment, np.asarray(decoder, dtype=np.float32), x, metadata, contrast, direction, global_mean, k_values, layer)
             append_csv(args.output_dir / "direction_reconstruction.csv", recon)
             candidates = intervention_candidates(joined, contrast, layer, args.top_n_features)
             append_csv(args.output_dir / "intervention_candidate_features.csv", candidates.to_dict("records"))
