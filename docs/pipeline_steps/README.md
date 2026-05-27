@@ -63,8 +63,8 @@ Severity tags are aggregated per script from `issues_and_opportunities.md`. **B*
 | 02 | `download_llama_3_1_8b.py` | 1 | M (1.2 lives across 02/18/20) | [02_download_llama_3_1_8b.md](02_download_llama_3_1_8b.md) |
 | 03 | `download_openmoss_saes.py` | 1 | — (1.4 dependency, FIX LANDED) | [03_download_openmoss_saes.md](03_download_openmoss_saes.md) |
 | 04 | `extract_identity_activations.py` | 1 | **B** (1.1 — PARTIAL FIX LANDED) · m (1.5) | [04_extract_identity_activations.md](04_extract_identity_activations.md) |
-| 05 | `encode_identity_saes.py` | 1 | **B** (1.4 — FIX LANDED) · m (4.6) · **B** (1.1 — FIX LANDED) | [05_encode_identity_saes.md](05_encode_identity_saes.md) |
-| 06 | `validate_sae_hook_alignment.py` | 1 | **B** (1.4 — FIX LANDED with recon check) | [06_validate_sae_hook_alignment.md](06_validate_sae_hook_alignment.md) |
+| 05 | `encode_identity_saes.py` | 1 | **B** (1.4 — FIX LANDED) · m (4.6 — PARTIAL FIX LANDED) · **B** (1.1 — FIX LANDED) | [05_encode_identity_saes.md](05_encode_identity_saes.md) |
+| 06 | `validate_sae_hook_alignment.py` | 1 | **B** (1.4 — FIX LANDED with recon check) · enabler (4.6 — PARTIAL FIX LANDED, L0 gate) | [06_validate_sae_hook_alignment.md](06_validate_sae_hook_alignment.md) |
 | 07 | `analyze_identity_geometry.py` | 2 | **B** (2.2 — PROBE NULL LANDED) · M (2.1 — FIX LANDED, 4.1 — FIX LANDED) · m (2.8 — VERIFIER LANDED, 5.9 — FIX LANDED, 5.10 — FIX LANDED) | [07_analyze_identity_geometry.md](07_analyze_identity_geometry.md) |
 | 08 | `analyze_identity_geometry_diagnostics.py` | 2 | **B** (2.2 — PROBE NULL LANDED) · M (2.1 — FIX LANDED, 4.1 — FIX LANDED) · m (2.8 — VERIFIER LANDED, 5.9 — FIX LANDED, 5.10 — FIX LANDED) — strengths to keep | [08_analyze_identity_geometry_diagnostics.md](08_analyze_identity_geometry_diagnostics.md) |
 | 09 | `analyze_shared_social_subspace.py` | 2 | **B** (2.2 — FIX LANDED) · M (2.1 — FIX LANDED, 4.1 — FIX LANDED) · m (5.10 — FIX LANDED) | [09_analyze_shared_social_subspace.md](09_analyze_shared_social_subspace.md) |
@@ -79,7 +79,7 @@ Severity tags are aggregated per script from `issues_and_opportunities.md`. **B*
 | 18a | `build_few_shot_pool.py` (prereq) | 4 | enabler (1.2 partial fix) | [18a_build_few_shot_pool.md](18a_build_few_shot_pool.md) |
 | 18 | `prepare_bbq_for_steering.py` | 4 | M (1.2 — partial fix, 3.4, 4.1, 4.2) · m (4.4) | [18_prepare_bbq_for_steering.md](18_prepare_bbq_for_steering.md) |
 | 18b | `diagnose_bbq_baseline.py` (diagnostic) | 4 | enabler (1.2, also touches 1.3, 2.4, 4.3) | [18b_diagnose_bbq_baseline.md](18b_diagnose_bbq_baseline.md) |
-| 19 | `extract_bbq_token_level_sae_activations.py` | 4 | M (3.3) · m (4.6) | [19_extract_bbq_token_level_sae_activations.md](19_extract_bbq_token_level_sae_activations.md) |
+| 19 | `extract_bbq_token_level_sae_activations.py` | 4 | M (3.3) · m (4.6 — PARTIAL FIX LANDED) | [19_extract_bbq_token_level_sae_activations.md](19_extract_bbq_token_level_sae_activations.md) |
 | 20 | `run_bbq_sae_steering.py` | 4 | **B** (2.3, 3.1 — FIX LANDED) · M (1.3, 2.4, 3.2, 3.3, 3.4) · m (3.5) | [20_run_bbq_sae_steering.md](20_run_bbq_sae_steering.md) |
 | 21 | `build_bbq_sae_feature_cards.py` | 4 | m (downstream inheritance) | [21_build_bbq_sae_feature_cards.md](21_build_bbq_sae_feature_cards.md) |
 | 22 | `analyze_bbq_steering_results.py` | 4 | m (5.10) — marked legacy | [22_analyze_bbq_steering_results.md](22_analyze_bbq_steering_results.md) |

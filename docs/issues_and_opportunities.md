@@ -362,9 +362,18 @@ What to do: define a **polarity-signed** bias quantity, e.g. `signed_bias_delta 
 
 `create_dataset.py` decides whether a template×identity pair is realized purely by "is the required form column non-empty", ignoring the `works_is_adj` / `works_group` / … flags in the identity CSV. In practice forms are empty roughly when the flag is 0, so output is mostly correct, but the flags are unused. Either use them as the source of truth or delete them to avoid the impression of a constraint that is not enforced.
 
-### 4.6 [MINOR] Top-64 SAE truncation may clip true activations
+### 4.6 [MINOR] Top-64 SAE truncation may clip true activations (PARTIAL FIX LANDED 2026-05-27)
 
-`encode_identity_saes.py` keeps only the top-64 features per row (`--top_k_save 64`); everything else is treated as exact zero downstream (`sparse_long` drops non-positive). The SAE is a 32× expansion (~131k features). If the SAE's true L0 (number of active features) at layer 24 exceeds 64 on some prompts, real activations are clipped to zero, which biases `mean_a`/`freq_a` downward for mid-ranked features and slightly inflates apparent contrast selectivity. Check the SAE's reported/empirical L0; if it is comfortably under ~50, 64 is fine — otherwise raise `top_k_save`.
+**Status:** Detection landed in commit `c6dbcfe` (`scripts/validate_sae_hook_alignment.py`). The empirical answer — does the LlamaScope SAE actually need more than 64 active features per prompt? — still requires the RunPod run with real SAE weights and real activations.
+
+**What landed:**
+- The step-6 validator now reports `reconstruction_l0_p50`, `reconstruction_l0_p95`, `reconstruction_l0_p99` alongside the existing `reconstruction_mean_l0` and `reconstruction_max_l0`.
+- New `--top_k_save_threshold` CLI flag (default `64`, matching step 5's `--top_k_save`). The validator computes `recon_l0_clipping_risk = (max_l0 > top_k_save_threshold)`, records it on the row, and fails recon when True (unless `--allow_mismatch`).
+- Converts 4.6 from a manual "remember to eyeball the CSV" check into an automatic gate: if the SAE's true L0 exceeds 64 on any prompt, the validator raises before any downstream consumer sees the encoding.
+
+**Remaining (RunPod):** Run the validator against the (audit-1.4-corrected) re-encoded SAEs. If `recon_l0_clipping_risk = True`, raise `--top_k_save` in step 5 (and re-encode), or pass `--top_k_save_threshold=<higher>` after a deliberate justification.
+
+**Original audit (preserved):** `encode_identity_saes.py` keeps only the top-64 features per row (`--top_k_save 64`); everything else is treated as exact zero downstream (`sparse_long` drops non-positive). The SAE is a 32× expansion (~131k features). If the SAE's true L0 at layer 24 exceeds 64 on some prompts, real activations are clipped to zero, which biases `mean_a` / `freq_a` downward for mid-ranked features and slightly inflates apparent contrast selectivity. If empirical max L0 is comfortably under ~50, 64 is fine — otherwise raise `top_k_save`.
 
 ---
 

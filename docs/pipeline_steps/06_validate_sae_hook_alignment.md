@@ -47,14 +47,15 @@ Verify that the per-layer SAE checkpoint and the extracted activation `.npy` for
 
 **Expected numbers:** LlamaScope at 32× expansion on Llama-3.1-8B-Base residual streams should reconstruct well — FVU in single digits (a few percent) and `reconstruction_cosine_mean ≳ 0.95`. If FVU exceeds the threshold after the Step 5 fix, there is still a bug; investigate `encode_full` / `decode_full` and the per-layer hyperparameters before consuming any artifact downstream.
 
-**Heads-up:** if `reconstruction_mean_l0` or `reconstruction_max_l0` is well above 64, the top-64 truncation in [Step 5](05_encode_identity_saes.md) is dropping real features (issue 4.6). Use the empirical L0 here to set `--top_k_save`.
+**Audit 4.6 gate (FIX LANDED 2026-05-27 in commit `c6dbcfe`):** the validator now reports `reconstruction_l0_p50`, `reconstruction_l0_p95`, `reconstruction_l0_p99` alongside `reconstruction_mean_l0` and `reconstruction_max_l0`, and the row fails if `reconstruction_max_l0 > --top_k_save_threshold` (default `64`, matching [Step 5](05_encode_identity_saes.md)'s `--top_k_save`). When max L0 exceeds the cap, real activations are silently truncated to zero downstream (`sparse_long` drops everything outside the top-k), which biases `mean_a` / `freq_a` and inflates apparent contrast selectivity. The validator now flags this automatically as `recon_l0_clipping_risk = True` — either raise `--top_k_save` in step 5 (and re-encode), or pass `--top_k_save_threshold=<higher>` to acknowledge the choice.
 
 ## Rebuild checklist
 - [x] Add `--check_reconstruction` and implement encode → decode → FVU/cosine/L0 on a sampled subset. (Done.)
 - [x] Reuse `load_sae` / `encode_full` / `decode_full` from [Step 5](05_encode_identity_saes.md). (Done.)
 - [x] Add the new metrics to `hook_alignment_validation.{json,csv}`. (Done.)
 - [x] Add `--reconstruction_fvu_threshold` and fail the validation when exceeded. (Done.)
-- [ ] After [Step 3](03_download_openmoss_saes.md) re-downloads SAEs and [Step 5](05_encode_identity_saes.md) re-encodes, run this validator on every layer in scope on RunPod. Confirm `reconstruction_fvu <= 0.15` and `reconstruction_cosine_mean >= 0.95`.
+- [x] Audit 4.6: add `--top_k_save_threshold` and percentile L0 reporting; fail when empirical max L0 exceeds the cap. *(Done 2026-05-27: commit `c6dbcfe`.)*
+- [ ] After [Step 3](03_download_openmoss_saes.md) re-downloads SAEs and [Step 5](05_encode_identity_saes.md) re-encodes, run this validator on every layer in scope on RunPod. Confirm `reconstruction_fvu <= 0.15`, `reconstruction_cosine_mean >= 0.95`, and `recon_l0_clipping_risk = False` (empirical max L0 within `--top_k_save`).
 - [ ] Commit the resulting `hook_alignment_validation.json` (or copy its key numbers into the methods writeup) so the audit trail records the recon quality used downstream.
 
 ## Notes from the doc audit
