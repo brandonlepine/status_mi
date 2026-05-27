@@ -29,7 +29,22 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from encode_identity_saes import load_sae, torch_dtype  # noqa: E402
+from encode_identity_saes import (  # noqa: E402
+    load_sae, torch_dtype,
+    # Audit 3.1 feature-intervention primitives:
+    ablate_features, clamp_features, steer_features,
+    patched_residual_with_intervention,
+)
+
+# Two families of intervention modes:
+#   - LEGACY decoder-direction (kept for the audit 5.5 baseline comparison):
+#     adds or projects out a unit-norm direction built from decoder rows.
+#   - FEATURE intervention (audit 3.1 fix): does the encode -> modify-latent-f
+#     -> decode -> patch loop, so the SAE actually contributes a feature, not
+#     just a direction.
+LEGACY_INTERVENTION_MODES = {"add_vector", "ablate_projection"}
+FEATURE_INTERVENTION_MODES = {"ablate", "clamp", "steer"}
+ALL_INTERVENTION_MODES = LEGACY_INTERVENTION_MODES | FEATURE_INTERVENTION_MODES
 
 
 DEFAULT_MODEL_PATH = Path("/workspace/status_mi/models/llama-3.1-8b")
@@ -76,7 +91,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top_k_per_contrast", default="5,10,20,50")
     parser.add_argument("--scoring_mode", default="answer_logprob", choices=["answer_logprob", "first_token"])
     parser.add_argument("--intervention_positions", default="final_prompt_token,target_identity_last_token,nontarget_identity_last_token,stereotype_language_last_token")
-    parser.add_argument("--intervention_modes", default="add_vector", help="Comma-separated add_vector,ablate_projection.")
+    parser.add_argument(
+        "--intervention_modes",
+        default="ablate",
+        help=(
+            "Comma-separated intervention modes to run per (feature_set, position). "
+            "Legacy decoder-direction modes: 'add_vector' (h += alpha*vec), "
+            "'ablate_projection' (h -= alpha*(h.unit)*unit). Feature-intervention "
+            "modes (audit 3.1): 'ablate' (clamp feature(s) to 0; primary causal "
+            "test; alpha grid not used), 'clamp' (set feature(s) to --clamp_value "
+            "in normalized latent space; alpha grid not used), 'steer' (add alpha "
+            "to feature(s) in normalized latent space; uses alpha grid). Default "
+            "'ablate' makes the headline causal claim defensible without an alpha grid."
+        ),
+    )
+    parser.add_argument(
+        "--clamp_value",
+        type=float,
+        default=None,
+        help=(
+            "Value to clamp feature(s) to when --intervention_modes includes 'clamp'. "
+            "In NORMALIZED latent space units. For per-feature p95/p99-based "
+            "amplification, look up the value in feature_stats.csv and pass it here."
+        ),
+    )
     parser.add_argument("--include_unmapped", action="store_true")
     parser.add_argument(
         "--axis_match_mode",
@@ -361,6 +399,168 @@ def install_hook(model, layer: int, vector: torch.Tensor, positions: list[int], 
         return edit
 
     return module.register_forward_hook(hook)
+
+
+def _build_intervention_fn(
+    mode: str,
+    feature_ids: torch.Tensor,
+    signs: torch.Tensor | None,
+    alpha: float,
+    clamp_value: float | None,
+):
+    """Build the latent -> latent intervention closure for a feature-level mode."""
+    if mode == "ablate":
+        return lambda latent: ablate_features(latent, feature_ids)
+    if mode == "clamp":
+        if clamp_value is None:
+            raise ValueError("--clamp_value is required when --intervention_modes includes 'clamp'.")
+        return lambda latent: clamp_features(latent, feature_ids, clamp_value)
+    if mode == "steer":
+        return lambda latent: steer_features(latent, feature_ids, alpha, signs)
+    raise ValueError(f"Unknown feature intervention mode: {mode!r}")
+
+
+def install_feature_intervention_hook(
+    model,
+    layer: int,
+    sae,
+    feature_ids: list[int],
+    signs: list[float] | None,
+    positions: list[int],
+    mode: str,
+    alpha: float = 0.0,
+    clamp_value: float | None = None,
+):
+    """Audit 3.1: the encode -> modify-latent-f -> decode -> patch hook.
+
+    Unlike `install_hook` (which adds a fixed decoder direction regardless
+    of whether the SAE feature was active on the example), this hook
+    actually exercises the SAE: it encodes the residual through the
+    corrected JumpReLU encoder, modifies the latent activations for the
+    specified `feature_ids`, decodes back to residual space, and adds
+    only the delta to the original residual. SAE reconstruction error
+    cancels in the delta.
+    """
+    if layer <= 0:
+        raise ValueError("Steering hooks require layer >= 1 because LkR maps to post-block k.")
+    module = model.model.layers[layer - 1]
+    device = next(model.parameters()).device
+    fid = torch.as_tensor(feature_ids, dtype=torch.long, device=device)
+    sgn = None if signs is None else torch.as_tensor(signs, dtype=torch.float32, device=device)
+    pos = torch.as_tensor(positions, dtype=torch.long, device=device)
+    intervention = _build_intervention_fn(mode, fid, sgn, alpha, clamp_value)
+
+    def hook(_module, _inputs, output):
+        hidden = output[0] if isinstance(output, tuple) else output
+        edit = hidden.clone()
+        h_subset = edit[:, pos, :].to(dtype=sae.w_enc.dtype)
+        h_patched = patched_residual_with_intervention(h_subset, sae, intervention)
+        edit[:, pos, :] = h_patched.to(dtype=edit.dtype)
+        if isinstance(output, tuple):
+            return (edit, *output[1:])
+        return edit
+
+    return module.register_forward_hook(hook)
+
+
+def install_batched_feature_intervention_hook(
+    model,
+    layer: int,
+    sae,
+    feature_ids: list[int],
+    signs: list[float] | None,
+    positions_by_example: list[list[int]],
+    mode: str,
+    alpha: float = 0.0,
+    clamp_value: float | None = None,
+):
+    """Per-example variant of install_feature_intervention_hook. Applies the
+    encode -> modify -> decode -> patch only at this example's `positions`."""
+    if layer <= 0:
+        raise ValueError("Steering hooks require layer >= 1 because LkR maps to post-block k.")
+    module = model.model.layers[layer - 1]
+    device = next(model.parameters()).device
+    fid = torch.as_tensor(feature_ids, dtype=torch.long, device=device)
+    sgn = None if signs is None else torch.as_tensor(signs, dtype=torch.float32, device=device)
+    intervention = _build_intervention_fn(mode, fid, sgn, alpha, clamp_value)
+
+    def hook(_module, _inputs, output):
+        hidden = output[0] if isinstance(output, tuple) else output
+        edit = hidden.clone()
+        for batch_idx, positions in enumerate(positions_by_example):
+            if not positions:
+                continue
+            pos = torch.as_tensor(positions, dtype=torch.long, device=edit.device)
+            h_subset = edit[batch_idx, pos, :].to(dtype=sae.w_enc.dtype)
+            # Add a batch dim so patched_residual_with_intervention sees (1, n_pos, d_model).
+            h_patched = patched_residual_with_intervention(h_subset.unsqueeze(0), sae, intervention).squeeze(0)
+            edit[batch_idx, pos, :] = h_patched.to(dtype=edit.dtype)
+        if isinstance(output, tuple):
+            return (edit, *output[1:])
+        return edit
+
+    return module.register_forward_hook(hook)
+
+
+def make_batched_hook_fn(
+    model,
+    fs: "FeatureSet",
+    vector: torch.Tensor | None,
+    sae,
+    positions_by_example: list[list[int]],
+    alpha: float,
+    mode: str,
+    clamp_value: float | None,
+) -> Callable[[], object]:
+    """Dispatch factory: returns a no-arg callable that installs the right
+    hook for the chosen intervention mode. Legacy modes (add_vector,
+    ablate_projection) use the precomputed decoder direction `vector`;
+    feature modes (ablate, clamp, steer) use the full SAE for the
+    encode -> modify -> decode -> patch loop (audit 3.1)."""
+    if mode in LEGACY_INTERVENTION_MODES:
+        if vector is None:
+            raise RuntimeError(f"vector was not built for legacy mode {mode!r}.")
+        return lambda: install_batched_hook(model, fs.layer, vector, positions_by_example, alpha, mode)
+    if mode in FEATURE_INTERVENTION_MODES:
+        return lambda: install_batched_feature_intervention_hook(
+            model, fs.layer, sae, fs.feature_ids, fs.signs, positions_by_example, mode,
+            alpha=alpha, clamp_value=clamp_value,
+        )
+    raise ValueError(f"Unknown intervention mode: {mode!r}; expected one of {sorted(ALL_INTERVENTION_MODES)}.")
+
+
+def make_hook_fn(
+    model,
+    fs: "FeatureSet",
+    vector: torch.Tensor | None,
+    sae,
+    positions: list[int],
+    alpha: float,
+    mode: str,
+    clamp_value: float | None,
+) -> Callable[[], object]:
+    """Non-batched variant of make_batched_hook_fn for the per-example
+    scoring paths (answer_logprob scoring iterates one prompt at a time)."""
+    if mode in LEGACY_INTERVENTION_MODES:
+        if vector is None:
+            raise RuntimeError(f"vector was not built for legacy mode {mode!r}.")
+        return lambda: install_hook(model, fs.layer, vector, positions, alpha, mode)
+    if mode in FEATURE_INTERVENTION_MODES:
+        return lambda: install_feature_intervention_hook(
+            model, fs.layer, sae, fs.feature_ids, fs.signs, positions, mode,
+            alpha=alpha, clamp_value=clamp_value,
+        )
+    raise ValueError(f"Unknown intervention mode: {mode!r}; expected one of {sorted(ALL_INTERVENTION_MODES)}.")
+
+
+def alpha_grid_for_mode(mode: str, alphas: list[float]) -> list[float]:
+    """ablate and clamp modes don't use the alpha grid (the audit's primary
+    causal test is just ablation; clamp uses --clamp_value). Run them once
+    with a sentinel alpha so downstream output rows have a consistent
+    schema. add_vector / ablate_projection / steer use the full alpha grid."""
+    if mode in {"ablate", "clamp"}:
+        return [0.0]
+    return alphas
 
 
 def install_batched_hook(model, layer: int, vector: torch.Tensor, positions_by_example: list[list[int]], alpha: float, mode: str):
@@ -677,7 +877,8 @@ def run_first_token_batched_feature_set(
     positions: list[str],
     intervention_modes: list[str],
     args: argparse.Namespace,
-    vector: torch.Tensor,
+    vector: torch.Tensor | None,
+    sae,
     done: set[str],
     done_path: Path,
     part_rows: list[dict[str, object]],
@@ -696,10 +897,12 @@ def run_first_token_batched_feature_set(
         prompts = [str(row["prompt"]) for row in row_series]
         answers_batch = [[str(row.get(f"ans{i}", "")) for i in range(3)] for row in row_series]
         base_scores = score_first_token_batch(model, tokenizer, prompts, answers_batch, 512)
-        for alpha in alphas:
-            for pos_name in positions:
-                positions_by_example = [positions_for(tokenizer, prompt, row, 512, pos_name) for prompt, row in zip(prompts, row_series)]
-                for mode in intervention_modes:
+        for pos_name in positions:
+            positions_by_example = [positions_for(tokenizer, prompt, row, 512, pos_name) for prompt, row in zip(prompts, row_series)]
+            for mode in intervention_modes:
+                # ablate/clamp ignore the alpha grid; the audit's primary
+                # causal test is just ablation. See alpha_grid_for_mode.
+                for alpha in alpha_grid_for_mode(mode, alphas):
                     pending_indices = []
                     for batch_idx, row in enumerate(row_series):
                         jid = job_id([row["bbq_uid"], fs.layer, fs.set_id, alpha, pos_name, mode, args.scoring_mode])
@@ -714,18 +917,19 @@ def run_first_token_batched_feature_set(
                             "axis": fs.axis,
                             "alpha": alpha,
                             "pos": pos_name,
+                            "mode": mode,
                             "role": fs.roles[0] if fs.roles else "",
                         },
                         refresh=False,
                     )
+                    hook_fn = make_batched_hook_fn(
+                        model=model, fs=fs, vector=vector, sae=sae,
+                        positions_by_example=positions_by_example,
+                        alpha=alpha, mode=mode, clamp_value=args.clamp_value,
+                    )
                     start = time.perf_counter()
                     inter_scores = score_first_token_batch(
-                        model,
-                        tokenizer,
-                        prompts,
-                        answers_batch,
-                        512,
-                        hook_fn=lambda p=positions_by_example, a=alpha, m=mode: install_batched_hook(model, fs.layer, vector, p, a, m),
+                        model, tokenizer, prompts, answers_batch, 512, hook_fn=hook_fn,
                     )
                     runtime = (time.perf_counter() - start) / max(1, len(pending_indices))
                     for batch_idx, jid in pending_indices:
@@ -762,6 +966,17 @@ def main() -> None:
     top_ks = parse_ints(args.top_k_per_contrast)
     positions = [part.strip() for part in args.intervention_positions.split(",") if part.strip()]
     intervention_modes = [part.strip() for part in args.intervention_modes.split(",") if part.strip()]
+    unknown_modes = [m for m in intervention_modes if m not in ALL_INTERVENTION_MODES]
+    if unknown_modes:
+        raise ValueError(
+            f"Unknown intervention_modes: {unknown_modes}. "
+            f"Expected one or more of {sorted(ALL_INTERVENTION_MODES)}. "
+            "Audit 3.1: 'ablate' is the audit-preferred primary causal test."
+        )
+    if "clamp" in intervention_modes and args.clamp_value is None:
+        raise ValueError(
+            "--clamp_value is required when --intervention_modes includes 'clamp'."
+        )
     config = vars(args).copy()
     config.update({k: str(v) for k, v in config.items() if isinstance(v, Path)})
     config["created_at"] = datetime.now(timezone.utc).isoformat()
@@ -856,10 +1071,18 @@ def main() -> None:
                 logger.info("Loading SAE for layer %02d", fs.layer)
                 sae_cache[fs.layer] = load_sae(args.sae_dir, fs.layer, hidden_dim, device, dtype)
             sae = sae_cache[fs.layer]
-            vector_key = (fs.set_id, fs.layer, "kept")
-            if vector_key not in vector_cache:
-                vector_cache[vector_key] = make_vector(sae, fs, not args.no_normalize_features, device)
-            vector = vector_cache[vector_key]
+            # Only build the decoder-direction vector when at least one
+            # legacy intervention mode is in play (audit 3.1: feature
+            # modes don't need a precomputed vector — they go through the
+            # encode -> decode -> patch loop instead).
+            needs_vector = any(m in LEGACY_INTERVENTION_MODES for m in intervention_modes) or not args.disable_controls
+            if needs_vector:
+                vector_key = (fs.set_id, fs.layer, "kept")
+                if vector_key not in vector_cache:
+                    vector_cache[vector_key] = make_vector(sae, fs, not args.no_normalize_features, device)
+                vector = vector_cache[vector_key]
+            else:
+                vector = None
             if args.scoring_mode == "first_token" and args.disable_controls:
                 part_idx, added = run_first_token_batched_feature_set(
                     model,
@@ -871,6 +1094,7 @@ def main() -> None:
                     intervention_modes,
                     args,
                     vector,
+                    sae,
                     done,
                     done_path,
                     part_rows,
@@ -888,10 +1112,11 @@ def main() -> None:
                 answers = [str(row_s.get(f"ans{i}", "")) for i in range(3)]
                 prompt = str(row_s["prompt"])
                 base = score_fn(model, tokenizer, prompt, answers, 512)
-                for alpha in alphas:
-                    for pos_name in positions:
-                        pos = positions_for(tokenizer, prompt, row_s, 512, pos_name)
-                        for mode in intervention_modes:
+                for pos_name in positions:
+                    pos = positions_for(tokenizer, prompt, row_s, 512, pos_name)
+                    for mode in intervention_modes:
+                        # ablate/clamp don't sweep alpha — see alpha_grid_for_mode.
+                        for alpha in alpha_grid_for_mode(mode, alphas):
                             jid = job_id([row_s["bbq_uid"], fs.layer, fs.set_id, alpha, pos_name, mode, args.scoring_mode])
                             if jid in done:
                                 continue
@@ -902,12 +1127,17 @@ def main() -> None:
                                     "axis": fs.axis,
                                     "alpha": alpha,
                                     "pos": pos_name,
+                                    "mode": mode,
                                     "role": fs.roles[0] if fs.roles else "",
                                 },
                                 refresh=False,
                             )
                             start = time.perf_counter()
-                            hook_fn = lambda v=vector, p=pos, a=alpha, m=mode: install_hook(model, fs.layer, v, p, a, m)
+                            hook_fn = make_hook_fn(
+                                model=model, fs=fs, vector=vector, sae=sae,
+                                positions=pos, alpha=alpha, mode=mode,
+                                clamp_value=args.clamp_value,
+                            )
                             inter = score_fn(model, tokenizer, prompt, answers, 512, hook_fn=hook_fn)
                             out = steering_output_row(row_s, fs, alpha, mode, pos_name, base, inter, time.perf_counter() - start)
                             part_rows.append(out)
