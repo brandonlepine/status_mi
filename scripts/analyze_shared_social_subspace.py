@@ -112,7 +112,7 @@ SPECTRUM_COLUMNS = [
     "explained_variance_ratio",
     "cumulative_explained_variance",
 ]
-DECOMPOSITION_COLUMNS = [
+_DECOMP_BASE = [
     "layer",
     "residualization",
     "contrast_name",
@@ -124,15 +124,16 @@ DECOMPOSITION_COLUMNS = [
     "component_norm",
     "fraction_norm",
     "cosine_with_full",
-    "auc",
-    "cohens_d",
-    "accuracy_midpoint",
-    "mean_a",
-    "mean_b",
-    "sd_a",
-    "sd_b",
-    "n_a",
-    "n_b",
+]
+_DECOMP_METRIC_KEYS = ("auc", "cohens_d", "accuracy_midpoint", "mean_a", "mean_b", "sd_a", "sd_b")
+# In-sample: the contrast direction and the SVD basis are estimated on the
+# same rows the metrics are evaluated on. Reported as a diagnostic only;
+# the held-out variant (DECOMPOSITION_HOLDOUT_COLUMNS) is the headline
+# (audit 2.1).
+DECOMPOSITION_COLUMNS = _DECOMP_BASE + [f"{key}_in_sample" for key in _DECOMP_METRIC_KEYS] + ["n_a", "n_b"]
+DECOMPOSITION_HOLDOUT_COLUMNS = _DECOMP_BASE + ["heldout_family"] + list(_DECOMP_METRIC_KEYS) + ["n_a", "n_b"]
+DECOMPOSITION_HOLDOUT_SUMMARY_COLUMNS = _DECOMP_BASE + [
+    "auc_mean", "auc_sd", "cohens_d_mean", "cohens_d_sd", "n_folds",
 ]
 AXIS_SUMMARY_COLUMNS = [
     "layer",
@@ -141,12 +142,15 @@ AXIS_SUMMARY_COLUMNS = [
     "k",
     "mean_fraction_shared",
     "median_fraction_shared",
-    "mean_full_auc",
-    "mean_shared_auc",
-    "mean_residual_auc",
-    "mean_full_d",
-    "mean_shared_d",
-    "mean_residual_d",
+    # In-sample metrics (audit 2.1): aggregated from decomposition_metrics.csv,
+    # which is the in-sample diagnostic. The held-out per-axis summary is
+    # derived from decomposition_metrics_holdout_summary.csv downstream.
+    "mean_full_auc_in_sample",
+    "mean_shared_auc_in_sample",
+    "mean_residual_auc_in_sample",
+    "mean_full_d_in_sample",
+    "mean_shared_d_in_sample",
+    "mean_residual_d_in_sample",
     "n_contrasts",
 ]
 PC_RANKING_COLUMNS = [
@@ -503,6 +507,17 @@ def spectrum_rows(singular_values: np.ndarray, layer: int, residualization: str)
     return rows
 
 
+def _suffix_metric_keys(metrics: dict, suffix: str) -> dict:
+    """Add `suffix` to the metric keys returned by evaluate_component while
+    leaving sample-count keys (n_a, n_b) unchanged. Lets the same metric
+    function back both the in-sample diagnostic CSV (suffix='_in_sample')
+    and the held-out CSV (suffix='')."""
+    return {
+        (key + suffix if key in _DECOMP_METRIC_KEYS else key): value
+        for key, value in metrics.items()
+    }
+
+
 def decomposition_rows(
     x: np.ndarray,
     records: list[DirectionRecord],
@@ -512,6 +527,9 @@ def decomposition_rows(
     layer: int,
     residualization: str,
 ) -> list[dict[str, object]]:
+    """In-sample (diagnostic) decomposition rows. Direction and SVD basis are
+    estimated on the same data the AUC / Cohen's d are computed on; columns
+    are suffixed `_in_sample` so the headline (held-out) is unambiguous."""
     rows: list[dict[str, object]] = []
     max_k = basis.shape[0]
     for record in tqdm(records, desc="decompose", leave=False):
@@ -539,9 +557,120 @@ def decomposition_rows(
                     "component_norm": component_norm,
                     "fraction_norm": fraction_norm,
                     "cosine_with_full": cosine,
-                    **metrics,
+                    **_suffix_metric_keys(metrics, "_in_sample"),
                 })
     return rows
+
+
+def decomposition_rows_holdout(
+    x: np.ndarray,
+    metadata: pd.DataFrame,
+    contrasts: pd.DataFrame,
+    k_values: list[int],
+    layer: int,
+    residualization: str,
+) -> list[dict[str, object]]:
+    """Family-holdout decomposition rows (audit 2.1 headline).
+
+    For each held-out template family `f`:
+      - Re-derive every contrast direction on the non-`f` rows only.
+      - Stack the directions and re-SVD to get a held-out shared-subspace
+        basis. The basis interpretation is fold-specific but stable in
+        practice on this dataset (verified empirically by the in-sample/
+        held-out gap reported in `decomposition_metrics_holdout_summary.csv`).
+      - For each contrast: project its non-`f`-trained direction onto the
+        non-`f`-trained basis -> shared + residual components.
+      - Evaluate each component on the `f` rows only.
+
+    Returns one row per (contrast, k, component_type, heldout_family). Run
+    aggregation downstream to produce the summary CSV.
+    """
+    rows: list[dict[str, object]] = []
+    families = sorted(metadata["family"].unique())
+    for heldout_family in tqdm(families, desc="family holdouts", leave=False):
+        heldout_mask = metadata["family"].eq(heldout_family).to_numpy()
+        train_mask = ~heldout_mask
+        if not train_mask.any() or not heldout_mask.any():
+            continue
+        x_train = x[train_mask]
+        metadata_train = metadata[train_mask].reset_index(drop=True)
+        x_eval = x[heldout_mask]
+        metadata_eval = metadata[heldout_mask].reset_index(drop=True)
+
+        records_train = compute_contrast_directions(x_train, metadata_train, contrasts)
+        if len(records_train) < 2:
+            continue
+        try:
+            _, _, vt_train = run_svd(records_train)
+        except ValueError:
+            continue
+        basis_train = vt_train.astype(np.float32)
+        max_k = basis_train.shape[0]
+
+        for record in records_train:
+            full_metrics = evaluate_component(
+                x_eval, metadata_eval, record.identity_a, record.identity_b,
+                record.direction, record.global_mean,
+            )
+            for k in k_values:
+                k_eff = min(k, max_k)
+                shared, residual, shared_norm, residual_norm = project_onto_subspace(
+                    record.direction, basis_train[:k_eff]
+                )
+                components = [
+                    ("full", record.direction, 1.0, 1.0, 1.0, full_metrics),
+                    ("shared", shared, shared_norm, shared_norm ** 2,
+                     float(np.dot(record.direction, shared)) if shared is not None else float("nan"), None),
+                    ("residual", residual, residual_norm, residual_norm ** 2,
+                     float(np.dot(record.direction, residual)) if residual is not None else float("nan"), None),
+                ]
+                for component_type, component, component_norm, fraction_norm, cosine, metrics in components:
+                    if metrics is None:
+                        metrics = evaluate_component(
+                            x_eval, metadata_eval, record.identity_a, record.identity_b,
+                            component, record.global_mean,
+                        )
+                    rows.append({
+                        "layer": layer,
+                        "residualization": residualization,
+                        "contrast_name": record.contrast_name,
+                        "axis": record.axis,
+                        "identity_a": record.identity_a,
+                        "identity_b": record.identity_b,
+                        "k": k,
+                        "component_type": component_type,
+                        "component_norm": component_norm,
+                        "fraction_norm": fraction_norm,
+                        "cosine_with_full": cosine,
+                        "heldout_family": heldout_family,
+                        **metrics,
+                    })
+    return rows
+
+
+def write_decomposition_holdout_summary(holdout_csv_path: Path, summary_csv_path: Path) -> None:
+    """Aggregate per-fold held-out decomposition rows into one row per
+    (contrast, k, component_type): auc / cohens_d mean + sd across folds.
+    This is the headline shared-subspace number cited in the methods doc.
+    """
+    if not holdout_csv_path.exists():
+        return
+    df = pd.read_csv(holdout_csv_path)
+    if df.empty or "auc" not in df.columns:
+        return
+    group_cols = ["layer", "residualization", "contrast_name", "axis", "identity_a", "identity_b", "k", "component_type"]
+    summary = (
+        df.groupby(group_cols, sort=True)
+        .agg(
+            auc_mean=("auc", "mean"),
+            auc_sd=("auc", "std"),
+            cohens_d_mean=("cohens_d", "mean"),
+            cohens_d_sd=("cohens_d", "std"),
+            n_folds=("auc", "size"),
+        )
+        .reset_index()
+    )
+    summary.to_csv(summary_csv_path, index=False)
 
 
 def identity_centroids(x: np.ndarray, metadata: pd.DataFrame, global_mean: np.ndarray | None = None) -> pd.DataFrame:
@@ -674,29 +803,29 @@ def aggregate_axis_sharedness(decomp_path: Path, output_dir: Path) -> pd.DataFra
     df = pd.read_csv(decomp_path)
     if df.empty:
         return pd.DataFrame(columns=AXIS_SUMMARY_COLUMNS)
-    shared = df[df["component_type"].eq("shared")][["layer", "residualization", "axis", "contrast_name", "k", "fraction_norm", "auc", "cohens_d"]].rename(columns={
+    shared = df[df["component_type"].eq("shared")][["layer", "residualization", "axis", "contrast_name", "k", "fraction_norm", "auc_in_sample", "cohens_d_in_sample"]].rename(columns={
         "fraction_norm": "fraction_shared",
-        "auc": "shared_auc",
-        "cohens_d": "shared_d",
+        "auc_in_sample": "shared_auc",
+        "cohens_d_in_sample": "shared_d",
     })
-    residual = df[df["component_type"].eq("residual")][["layer", "residualization", "axis", "contrast_name", "k", "auc", "cohens_d"]].rename(columns={
-        "auc": "residual_auc",
-        "cohens_d": "residual_d",
+    residual = df[df["component_type"].eq("residual")][["layer", "residualization", "axis", "contrast_name", "k", "auc_in_sample", "cohens_d_in_sample"]].rename(columns={
+        "auc_in_sample": "residual_auc",
+        "cohens_d_in_sample": "residual_d",
     })
-    full = df[df["component_type"].eq("full")][["layer", "residualization", "axis", "contrast_name", "k", "auc", "cohens_d"]].rename(columns={
-        "auc": "full_auc",
-        "cohens_d": "full_d",
+    full = df[df["component_type"].eq("full")][["layer", "residualization", "axis", "contrast_name", "k", "auc_in_sample", "cohens_d_in_sample"]].rename(columns={
+        "auc_in_sample": "full_auc",
+        "cohens_d_in_sample": "full_d",
     })
     merged = shared.merge(residual, on=["layer", "residualization", "axis", "contrast_name", "k"], how="left").merge(full, on=["layer", "residualization", "axis", "contrast_name", "k"], how="left")
     summary = merged.groupby(["layer", "residualization", "axis", "k"], sort=True).agg(
         mean_fraction_shared=("fraction_shared", "mean"),
         median_fraction_shared=("fraction_shared", "median"),
-        mean_full_auc=("full_auc", "mean"),
-        mean_shared_auc=("shared_auc", "mean"),
-        mean_residual_auc=("residual_auc", "mean"),
-        mean_full_d=("full_d", "mean"),
-        mean_shared_d=("shared_d", "mean"),
-        mean_residual_d=("residual_d", "mean"),
+        mean_full_auc_in_sample=("full_auc", "mean"),
+        mean_shared_auc_in_sample=("shared_auc", "mean"),
+        mean_residual_auc_in_sample=("residual_auc", "mean"),
+        mean_full_d_in_sample=("full_d", "mean"),
+        mean_shared_d_in_sample=("shared_d", "mean"),
+        mean_residual_d_in_sample=("residual_d", "mean"),
         n_contrasts=("contrast_name", "nunique"),
     ).reset_index()
     write_csv(output_dir / "metrics" / "axis_sharedness_summary.csv", summary, AXIS_SUMMARY_COLUMNS)
@@ -896,7 +1025,7 @@ def plot_axis_summary(output_dir: Path, main_layer: int = 24) -> None:
 
     auc_df = layer_df.melt(
         id_vars=["layer", "residualization", "axis", "k"],
-        value_vars=["mean_full_auc", "mean_shared_auc", "mean_residual_auc"],
+        value_vars=["mean_full_auc_in_sample", "mean_shared_auc_in_sample", "mean_residual_auc_in_sample"],
         var_name="component",
         value_name="mean_auc",
     )
@@ -909,11 +1038,11 @@ def plot_axis_summary(output_dir: Path, main_layer: int = 24) -> None:
         ax.legend(frameon=False)
     ax.axhline(0.5, color="black", linestyle=":", linewidth=1, alpha=0.6)
     ax.set_ylim(0.45, 1.02)
-    ax.set_title(f"Shared vs residual AUC by axis, layer {main_layer:02d}")
+    ax.set_title(f"DIAGNOSTIC (in-sample): shared vs residual AUC by axis, layer {main_layer:02d}")
     ax.set_xlabel("k shared PCs")
-    ax.set_ylabel("Mean AUC")
+    ax.set_ylabel("Mean AUC (in-sample)")
     add_outside_legend(ax, max_items=80)
-    save_fig(fig, output_dir / "figures" / "axis_summary" / f"axis_shared_vs_residual_auc_layer{main_layer:02d}")
+    save_fig(fig, output_dir / "figures" / "axis_summary" / f"axis_shared_vs_residual_auc_in_sample_layer{main_layer:02d}")
 
 
 def signed_bar_colors(values: pd.Series) -> list[str]:
@@ -1050,7 +1179,7 @@ def create_paper_panel(output_dir: Path, main_layer: int = 24, main_residualizat
     try:
         key = decomp[decomp["layer"].eq(main_layer) & decomp["contrast_name"].isin(KEY_CONTRASTS) & decomp["component_type"].isin(["shared", "residual"])]
         if sns is not None and not key.empty:
-            sns.lineplot(data=key, x="k", y="auc", hue="component_type", style="contrast_name", ax=axs[0, 2], linewidth=2, marker="o")
+            sns.lineplot(data=key, x="k", y="auc_in_sample", hue="component_type", style="contrast_name", ax=axs[0, 2], linewidth=2, marker="o")
         axs[0, 2].axhline(0.5, color="black", linestyle=":", linewidth=1)
         axs[0, 2].set_ylim(0.45, 1.02)
         axs[0, 2].set_title("C. Shared vs Residual AUC")
@@ -1133,6 +1262,8 @@ def main() -> None:
 
     spectrum_path = args.output_dir / "metrics" / "shared_subspace_spectrum.csv"
     decomp_path = args.output_dir / "metrics" / "decomposition_metrics.csv"
+    decomp_holdout_path = args.output_dir / "metrics" / "decomposition_metrics_holdout.csv"
+    decomp_holdout_summary_path = args.output_dir / "metrics" / "decomposition_metrics_holdout_summary.csv"
     pc_rankings_path = args.output_dir / "metrics" / "shared_pc_identity_rankings.csv"
     pc_top_bottom_path = args.output_dir / "metrics" / "shared_pc_top_bottom.csv"
     loadings_path = args.output_dir / "metrics" / "contrast_pc_loadings.csv"
@@ -1158,6 +1289,12 @@ def main() -> None:
             basis = vt[: min(max_pc_needed, vt.shape[0])]
             append_rows(spectrum_path, spectrum_rows(singular_values, layer, residualization), SPECTRUM_COLUMNS)
             append_rows(decomp_path, decomposition_rows(x, records, basis, metadata, k_values, layer, residualization), DECOMPOSITION_COLUMNS)
+            # Headline (audit 2.1): leave-one-family-out decomposition.
+            append_rows(
+                decomp_holdout_path,
+                decomposition_rows_holdout(x, metadata, contrasts, k_values, layer, residualization),
+                DECOMPOSITION_HOLDOUT_COLUMNS,
+            )
             pc_rows, top_bottom_rows = pc_interpretation_rows(x, metadata, basis, layer, residualization, n_pcs=min(10, basis.shape[0]))
             append_rows(pc_rankings_path, pc_rows, PC_RANKING_COLUMNS)
             append_rows(pc_top_bottom_path, top_bottom_rows, PC_TOP_BOTTOM_COLUMNS)
@@ -1169,6 +1306,7 @@ def main() -> None:
         print(f"Layer {layer:02d}: complete in {elapsed(layer_start)}")
 
     aggregate_axis_sharedness(decomp_path, args.output_dir)
+    write_decomposition_holdout_summary(decomp_holdout_path, decomp_holdout_summary_path)
     plot_all_outputs(args.output_dir)
     print(f"\nShared-subspace decomposition complete in {elapsed(start_all)}")
     print(f"Outputs: {args.output_dir}")

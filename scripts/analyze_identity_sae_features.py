@@ -366,6 +366,12 @@ def reconstruction_rows(
                 auc, d_value = float("nan"), float("nan")
             else:
                 auc, d_value = evaluate_direction(x, metadata, contrast.identity_a, contrast.identity_b, recon, global_mean)
+            # All AUC / Cohen's d here are in-sample — the contrast direction and
+            # the feature ranking are both derived from the same data the metrics
+            # are evaluated on. Audit 2.1; the held-out reconstruction is a
+            # follow-up bundled with the 2.5 winner's-curse fix because the
+            # full held-out story also requires held-out feature SELECTION,
+            # not just held-out direction estimation.
             rows.append({
                 "layer": layer,
                 "residualization": residualization,
@@ -376,12 +382,12 @@ def reconstruction_rows(
                 "selection_method": method,
                 "k": k,
                 "cosine_with_full_direction": cosine,
-                "auc": auc,
-                "cohens_d": d_value,
+                "auc_in_sample": auc,
+                "cohens_d_in_sample": d_value,
                 "fraction_norm_captured": fraction,
                 "n_features": len(selected),
-                "full_direction_auc": full_auc,
-                "full_direction_cohens_d": full_d,
+                "full_direction_auc_in_sample": full_auc,
+                "full_direction_cohens_d_in_sample": full_d,
             })
     return rows
 
