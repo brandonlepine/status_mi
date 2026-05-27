@@ -229,6 +229,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--contrasts_csv", type=Path, default=None)
     parser.add_argument("--max_points_per_plot", type=int, default=20000)
     parser.add_argument("--random_seed", type=int, default=42)
+    parser.add_argument(
+        "--n_nulls_svd",
+        type=int,
+        default=200,
+        help=(
+            "Number of null replicates per SVD null method (audit 2.2). Two "
+            "methods run: shuffle_identities (permutes which prompts belong "
+            "to which identity within each contrast pair) and "
+            "random_half_split (random partition of axis-wide prompts). "
+            "Set 0 to disable the null pass."
+        ),
+    )
+    parser.add_argument(
+        "--null_svd_random_seed",
+        type=int,
+        default=None,
+        help="RNG seed for the SVD null. Defaults to --random_seed.",
+    )
+    parser.add_argument(
+        "--null_svd_top_k",
+        type=int,
+        default=5,
+        help="k for the top-k-explained-variance concentration metric.",
+    )
+    parser.add_argument(
+        "--save_null_svd_replicates",
+        action="store_true",
+        help="Also write per-replicate singular values to shared_subspace_spectrum_null_replicates.csv. Large file; off by default.",
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -475,6 +504,246 @@ def run_svd(records: list[DirectionRecord]) -> tuple[np.ndarray, np.ndarray, np.
         raise ValueError("Need at least two valid contrast directions for shared subspace SVD.")
     direction_matrix = np.vstack([record.direction for record in records]).astype(np.float32)
     return np.linalg.svd(direction_matrix, full_matrices=False)
+
+
+def participation_ratio(singular_values: np.ndarray) -> float:
+    """PR = (sum of sigma^2)^2 / sum of sigma^4.
+
+    Equivalent to the effective rank under squared-singular-value weights.
+    For a matrix whose squared singular values are all equal (uniform
+    spectrum), PR equals the number of singular values. For a matrix
+    dominated by a single singular value, PR approaches 1. Used as a
+    concentration metric (audit 2.2 SVD null)."""
+    s2 = np.asarray(singular_values, dtype=np.float64) ** 2
+    denom = float((s2 ** 2).sum())
+    if denom <= 0 or not np.isfinite(denom):
+        return float("nan")
+    return float((s2.sum() ** 2) / denom)
+
+
+def top_k_explained_variance(singular_values: np.ndarray, k: int) -> float:
+    """Fraction of total variance captured by the top-k singular values
+    (sum of sigma_i^2 for i<=k, divided by total sum of sigma^2)."""
+    s2 = np.asarray(singular_values, dtype=np.float64) ** 2
+    total = float(s2.sum())
+    if total <= 0 or not np.isfinite(total):
+        return float("nan")
+    k = min(k, len(s2))
+    return float(s2[:k].sum() / total)
+
+
+def _null_direction_from_masks(
+    x: np.ndarray, mask_a: np.ndarray, mask_b: np.ndarray, global_mean: np.ndarray,
+) -> np.ndarray | None:
+    """Helper: compute the unit-normed diff-of-means direction for two masks,
+    using a fixed (pre-computed) global mean for centering. Returns None if
+    the diff has zero norm or either mask is empty. Uses the common low-level
+    `compute_direction` (the local `compute_direction` adapter has a different
+    signature for back-compat)."""
+    cd = _compute_direction_lowlevel(x, mask_a, mask_b, center=True, center_mean=global_mean)
+    return None if cd is None else cd.direction
+
+
+def null_directions_shuffle_identities(
+    x: np.ndarray, metadata: pd.DataFrame, contrasts: pd.DataFrame, rng: np.random.Generator,
+) -> list[np.ndarray]:
+    """Audit 2.2 null method (a): for each contrast (identity_a, identity_b),
+    shuffle the prompts BETWEEN identity_a and identity_b (preserving the
+    marginal n_a and n_b), then compute the diff-of-means direction.
+
+    This tests the null H0 = "there is no identity-specific structure in the
+    difference between identity_a's prompts and identity_b's prompts beyond
+    what random relabeling would produce." Preserves the per-contrast prompt
+    counts; only randomizes the identity-prompt correspondence.
+    """
+    global_mean = x.mean(axis=0, keepdims=True)
+    directions: list[np.ndarray] = []
+    for _, row in contrasts.iterrows():
+        mask_a = metadata["identity_id"].eq(row["identity_a"]).to_numpy()
+        mask_b = metadata["identity_id"].eq(row["identity_b"]).to_numpy()
+        n_a, n_b = int(mask_a.sum()), int(mask_b.sum())
+        if n_a == 0 or n_b == 0:
+            continue
+        union = np.where(mask_a | mask_b)[0]
+        shuffled = rng.permutation(union)
+        new_a = np.zeros(len(metadata), dtype=bool)
+        new_b = np.zeros(len(metadata), dtype=bool)
+        new_a[shuffled[:n_a]] = True
+        new_b[shuffled[n_a:n_a + n_b]] = True
+        direction = _null_direction_from_masks(x, new_a, new_b, global_mean)
+        if direction is not None:
+            directions.append(direction)
+    return directions
+
+
+def null_directions_random_half_split(
+    x: np.ndarray, metadata: pd.DataFrame, contrasts: pd.DataFrame, rng: np.random.Generator,
+) -> list[np.ndarray]:
+    """Audit 2.2 null method (b): for each contrast, take all prompts on
+    that AXIS (not just the two endpoint identities) and randomly split
+    them into two halves whose sizes match (n_a, n_b). Compute the
+    diff-of-means direction.
+
+    Tests the null H0 = "the contrast direction reflects no axis-specific
+    structure beyond what a random 50/50 split of that axis's prompts
+    would produce." More aggressive than method (a) because it permits any
+    identity-disjoint partition of the axis.
+    """
+    global_mean = x.mean(axis=0, keepdims=True)
+    directions: list[np.ndarray] = []
+    for _, row in contrasts.iterrows():
+        axis_mask = metadata["axis"].eq(row["axis"]).to_numpy()
+        if axis_mask.sum() < 4:
+            continue
+        n_a = int(metadata["identity_id"].eq(row["identity_a"]).sum())
+        n_b = int(metadata["identity_id"].eq(row["identity_b"]).sum())
+        axis_indices = np.where(axis_mask)[0]
+        if n_a + n_b > len(axis_indices):
+            # Fall back to a proportional half-split.
+            half = len(axis_indices) // 2
+            n_a, n_b = half, len(axis_indices) - half
+        shuffled = rng.permutation(axis_indices)
+        new_a = np.zeros(len(metadata), dtype=bool)
+        new_b = np.zeros(len(metadata), dtype=bool)
+        new_a[shuffled[:n_a]] = True
+        new_b[shuffled[n_a:n_a + n_b]] = True
+        direction = _null_direction_from_masks(x, new_a, new_b, global_mean)
+        if direction is not None:
+            directions.append(direction)
+    return directions
+
+
+def _svd_singular_values(directions: list[np.ndarray]) -> np.ndarray | None:
+    """Stack and SVD; returns sigma vector or None if fewer than 2 directions."""
+    if len(directions) < 2:
+        return None
+    matrix = np.vstack(directions).astype(np.float32)
+    try:
+        _, s, _ = np.linalg.svd(matrix, full_matrices=False)
+    except np.linalg.LinAlgError:
+        return None
+    return s
+
+
+def compute_svd_null_replicates(
+    x: np.ndarray,
+    metadata: pd.DataFrame,
+    contrasts: pd.DataFrame,
+    observed_singular_values: np.ndarray,
+    n_nulls: int,
+    rng_seed: int,
+    layer: int,
+    residualization: str,
+    top_k: int = 5,
+) -> tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]]:
+    """Run `n_nulls` replicates of each null method, compute per-component
+    spectra and concentration metrics, and return three lists of dicts:
+
+      1. summary_rows : per (null_method, component) summary with observed
+         singular value, null mean / sd / p5 / p50 / p95, and
+         `observed_exceeds_p95` flag.
+      2. concentration_rows : per (null_method) summary with observed
+         participation_ratio and top_k_variance, and the matching null
+         distribution statistics.
+      3. replicate_rows : per (null_method, replicate, component) singular
+         values. Large; caller decides whether to write it.
+    """
+    rng = np.random.default_rng(rng_seed)
+    methods = {
+        "shuffle_identities": null_directions_shuffle_identities,
+        "random_half_split":  null_directions_random_half_split,
+    }
+    n_components = len(observed_singular_values)
+    obs_pr = participation_ratio(observed_singular_values)
+    obs_top_k = top_k_explained_variance(observed_singular_values, top_k)
+
+    summary_rows: list[dict[str, object]] = []
+    concentration_rows: list[dict[str, object]] = []
+    replicate_rows: list[dict[str, object]] = []
+
+    for method_name, method_fn in methods.items():
+        # Each method draws from a sub-stream so seed reproducibility holds.
+        method_rng = np.random.default_rng(rng.integers(0, 2**31 - 1))
+        # rows x components matrix; missing replicates filled with NaN.
+        null_sigmas: list[np.ndarray] = []
+        null_pr: list[float] = []
+        null_top_k: list[float] = []
+        for replicate_idx in range(n_nulls):
+            directions = method_fn(x, metadata, contrasts, method_rng)
+            s = _svd_singular_values(directions)
+            if s is None:
+                continue
+            # Pad / truncate to n_components so per-component stats line up.
+            sigma = np.full(n_components, np.nan, dtype=np.float64)
+            k = min(len(s), n_components)
+            sigma[:k] = s[:k]
+            null_sigmas.append(sigma)
+            null_pr.append(participation_ratio(s))
+            null_top_k.append(top_k_explained_variance(s, top_k))
+            for component_idx, value in enumerate(sigma, start=1):
+                if np.isfinite(value):
+                    replicate_rows.append({
+                        "layer": layer,
+                        "residualization": residualization,
+                        "null_method": method_name,
+                        "replicate": replicate_idx,
+                        "component": component_idx,
+                        "singular_value": float(value),
+                    })
+        if not null_sigmas:
+            continue
+
+        null_matrix = np.stack(null_sigmas, axis=0)  # (n_replicates, n_components)
+        for component_idx in range(n_components):
+            col = null_matrix[:, component_idx]
+            col = col[np.isfinite(col)]
+            if len(col) == 0:
+                continue
+            obs_val = float(observed_singular_values[component_idx])
+            summary_rows.append({
+                "layer": layer,
+                "residualization": residualization,
+                "null_method": method_name,
+                "component": component_idx + 1,
+                "observed_singular_value": obs_val,
+                "null_mean": float(col.mean()),
+                "null_sd": float(col.std(ddof=1)) if len(col) > 1 else 0.0,
+                "null_p5": float(np.percentile(col, 5)),
+                "null_p50": float(np.percentile(col, 50)),
+                "null_p95": float(np.percentile(col, 95)),
+                "n_null_replicates": int(len(col)),
+                "observed_exceeds_p95": bool(obs_val > float(np.percentile(col, 95))),
+            })
+        if null_pr and null_top_k:
+            null_pr_arr = np.asarray(null_pr)
+            null_topk_arr = np.asarray(null_top_k)
+            # For participation_ratio: smaller = more concentrated. So
+            # observed concentration is "significant" when obs_pr < null_p5.
+            # For top_k_variance: larger = more concentrated; significant
+            # when obs_top_k > null_p95.
+            concentration_rows.append({
+                "layer": layer,
+                "residualization": residualization,
+                "null_method": method_name,
+                "n_null_replicates": int(len(null_pr_arr)),
+                "observed_participation_ratio": obs_pr,
+                "null_pr_mean": float(null_pr_arr.mean()),
+                "null_pr_sd": float(null_pr_arr.std(ddof=1)) if len(null_pr_arr) > 1 else 0.0,
+                "null_pr_p5": float(np.percentile(null_pr_arr, 5)),
+                "null_pr_p50": float(np.percentile(null_pr_arr, 50)),
+                "null_pr_p95": float(np.percentile(null_pr_arr, 95)),
+                "observed_pr_more_concentrated_than_p5": bool(obs_pr < float(np.percentile(null_pr_arr, 5))),
+                "top_k": top_k,
+                "observed_top_k_variance": obs_top_k,
+                "null_top_k_mean": float(null_topk_arr.mean()),
+                "null_top_k_sd": float(null_topk_arr.std(ddof=1)) if len(null_topk_arr) > 1 else 0.0,
+                "null_top_k_p5": float(np.percentile(null_topk_arr, 5)),
+                "null_top_k_p50": float(np.percentile(null_topk_arr, 50)),
+                "null_top_k_p95": float(np.percentile(null_topk_arr, 95)),
+                "observed_top_k_exceeds_p95": bool(obs_top_k > float(np.percentile(null_topk_arr, 95))),
+            })
+
+    return summary_rows, concentration_rows, replicate_rows
 
 
 def spectrum_rows(singular_values: np.ndarray, layer: int, residualization: str) -> list[dict[str, object]]:
@@ -1249,6 +1518,9 @@ def main() -> None:
     }, indent=2) + "\n")
 
     spectrum_path = args.output_dir / "metrics" / "shared_subspace_spectrum.csv"
+    null_summary_path = args.output_dir / "metrics" / "shared_subspace_spectrum_null_summary.csv"
+    null_concentration_path = args.output_dir / "metrics" / "shared_subspace_concentration_null.csv"
+    null_replicates_path = args.output_dir / "metrics" / "shared_subspace_spectrum_null_replicates.csv"
     decomp_path = args.output_dir / "metrics" / "decomposition_metrics.csv"
     decomp_holdout_path = args.output_dir / "metrics" / "decomposition_metrics_holdout.csv"
     decomp_holdout_summary_path = args.output_dir / "metrics" / "decomposition_metrics_holdout_summary.csv"
@@ -1276,6 +1548,45 @@ def main() -> None:
             _, singular_values, vt = run_svd(records)
             basis = vt[: min(max_pc_needed, vt.shape[0])]
             append_rows(spectrum_path, spectrum_rows(singular_values, layer, residualization), SPECTRUM_COLUMNS)
+
+            if args.n_nulls_svd > 0:
+                null_seed_base = args.null_svd_random_seed if args.null_svd_random_seed is not None else args.random_seed
+                # Derive a layer/residualization-specific seed so each (layer,
+                # residualization) cell gets a distinct but reproducible stream.
+                null_seed = (null_seed_base * 1000003 + layer * 31 + hash(residualization)) & 0x7FFFFFFF
+                print(f"Layer {layer:02d} {residualization}: SVD null pass (n_nulls={args.n_nulls_svd})")
+                null_start = time.perf_counter()
+                summary_rows_n, concentration_rows_n, replicate_rows_n = compute_svd_null_replicates(
+                    x=x, metadata=metadata, contrasts=contrasts,
+                    observed_singular_values=singular_values,
+                    n_nulls=args.n_nulls_svd, rng_seed=null_seed,
+                    layer=layer, residualization=residualization,
+                    top_k=args.null_svd_top_k,
+                )
+                if summary_rows_n:
+                    append_rows(null_summary_path, summary_rows_n,
+                                ["layer", "residualization", "null_method", "component",
+                                 "observed_singular_value", "null_mean", "null_sd",
+                                 "null_p5", "null_p50", "null_p95",
+                                 "n_null_replicates", "observed_exceeds_p95"])
+                if concentration_rows_n:
+                    append_rows(null_concentration_path, concentration_rows_n,
+                                ["layer", "residualization", "null_method",
+                                 "n_null_replicates",
+                                 "observed_participation_ratio",
+                                 "null_pr_mean", "null_pr_sd",
+                                 "null_pr_p5", "null_pr_p50", "null_pr_p95",
+                                 "observed_pr_more_concentrated_than_p5",
+                                 "top_k",
+                                 "observed_top_k_variance",
+                                 "null_top_k_mean", "null_top_k_sd",
+                                 "null_top_k_p5", "null_top_k_p50", "null_top_k_p95",
+                                 "observed_top_k_exceeds_p95"])
+                if args.save_null_svd_replicates and replicate_rows_n:
+                    append_rows(null_replicates_path, replicate_rows_n,
+                                ["layer", "residualization", "null_method",
+                                 "replicate", "component", "singular_value"])
+                print(f"Layer {layer:02d} {residualization}: SVD null pass finished in {elapsed(null_start)}")
             append_rows(decomp_path, decomposition_rows(x, records, basis, metadata, k_values, layer, residualization), DECOMPOSITION_COLUMNS)
             # Headline (audit 2.1): leave-one-family-out decomposition.
             append_rows(
