@@ -598,6 +598,7 @@ def main() -> None:
     metadata = pd.read_csv(args.activation_dir / "metadata.csv", keep_default_na=False)
     contrasts = load_contrasts(args.contrasts_csv, metadata, output_dir=args.output_dir)
     k_values = parse_int_list(args.top_k_reconstruction_values)
+    combined_score_weights = {"cohens_d": 0.5, "decoder_cosine": 0.5}
     (args.output_dir / "run_config.json").write_text(json.dumps({
         "sae_encoded_dir": str(args.sae_encoded_dir),
         "activation_dir": str(args.activation_dir),
@@ -606,6 +607,17 @@ def main() -> None:
         "top_n_features": args.top_n_features,
         "top_k_reconstruction_values": k_values,
         "residualization": args.residualization,
+        "combined_score_formula": (
+            f"{combined_score_weights['cohens_d']} * zscore(|cohens_d|) "
+            f"+ {combined_score_weights['decoder_cosine']} * zscore(|cosine_with_direction|)"
+        ),
+        "combined_score_weights": combined_score_weights,
+        "combined_score_audit_note": (
+            "Audit 5.3 (closed 2026-05-27): prior formula was "
+            "z(|cohens_d|) + z(|cosine_with_direction|) + z(|auc - 0.5|), which "
+            "double-weighted selectivity (cohens_d and auc measure the same "
+            "A/B distribution separation and are monotonically related)."
+        ),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }, indent=2) + "\n")
 
@@ -632,8 +644,15 @@ def main() -> None:
             selectivity = feature_selectivity_for_contrast(long_df, metadata, contrast, n_features, args.top_n_features, layer)
             alignment = decoder_alignment(np.asarray(decoder, dtype=np.float32), direction, contrast, layer, args.residualization)
             joined = selectivity.merge(alignment, on=["layer", "contrast_name", "axis", "identity_a", "identity_b", "feature_id"], how="left")
-            joined["auc_distance"] = (joined["auc"] - 0.5).abs()
-            joined["combined_score"] = zscore(joined["cohens_d"].abs()) + zscore(joined["cosine_with_direction"].abs()) + zscore(joined["auc_distance"])
+            # Audit 5.3 (closed 2026-05-27): combined_score now weights selectivity
+            # (Cohen's d) and decoder alignment (|cosine|) equally. The prior
+            # formula added z(|auc - 0.5|) as a third term; AUC and Cohen's d
+            # measure the same A/B distribution separation and are monotonically
+            # related, so the third term double-weighted selectivity vs alignment.
+            joined["combined_score"] = (
+                combined_score_weights["cohens_d"] * zscore(joined["cohens_d"].abs())
+                + combined_score_weights["decoder_cosine"] * zscore(joined["cosine_with_direction"].abs())
+            )
             append_csv(args.output_dir / "feature_selectivity.csv", selectivity.to_dict("records"))
             alignment_top = pd.concat([
                 alignment.nsmallest(args.top_n_features, "negative_rank"),
