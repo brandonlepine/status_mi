@@ -7,6 +7,7 @@ import argparse
 import html
 import json
 import shutil
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -19,6 +20,11 @@ try:
 except ImportError:  # pragma: no cover
     AutoModelForCausalLM = None
     AutoTokenizer = None
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+from common import classify_feature_localization  # noqa: E402
 
 
 DEFAULT_ANALYSIS_DIR = Path("/workspace/status_mi/results/sae_identity/llama-3.1-8b/final_token/analysis")
@@ -214,14 +220,11 @@ def exemplar_prompt_table(feature_token_df: pd.DataFrame, top_n: int) -> pd.Data
         span_max = float(span["token_feature_activation"].max()) if not span.empty else 0.0
         span_mean = float(span["token_feature_activation"].mean()) if not span.empty else 0.0
         final_token = float(group["final_token_feature_activation"].iloc[0]) if "final_token_feature_activation" in group.columns else 0.0
-        if max_token > 0 and span_max >= 0.7 * max_token:
-            localization = "identity_span_local"
-        elif max_token > 0 and final_token >= 0.7 * max_token:
-            localization = "final_token_integrated"
-        elif max_token > 0:
-            localization = "template_context"
-        else:
-            localization = "diffuse_or_unclear"
+        localization = classify_feature_localization(
+            max_token_activation=max_token,
+            max_identity_span_activation=span_max,
+            final_token_activation=final_token,
+        )
         max_row.update({
             "prompt_id": prompt_id,
             "final_token_feature_activation": final_token,
@@ -364,13 +367,28 @@ def compute_logit_effects(args: argparse.Namespace, layer_dir: Path, feature_id:
     if feature_id >= decoder.shape[0]:
         return [], [], "Not computed because feature_id is outside decoder shape."
     w = np.asarray(decoder[feature_id], dtype=np.float32)
+    # Apply Llama's final RMSNorm so the projection lands on the same scale
+    # as the model's actual output logits. Without this, absolute logit
+    # magnitudes are not comparable to anything the model emits and
+    # cross-feature comparisons are misleading when decoder rows have
+    # different norms. RMSNorm is x * rsqrt(mean(x^2) + eps) * gamma.
+    norm_module = getattr(getattr(model, "model", model), "norm", None)
+    if norm_module is not None and hasattr(norm_module, "weight"):
+        gamma = norm_module.weight.detach().float().cpu().numpy()
+        eps = float(getattr(norm_module, "variance_epsilon", 1e-5))
+        rms = np.sqrt((w ** 2).mean() + eps)
+        w_for_projection = (w / rms) * gamma
+        note = "Decoder @ final_norm @ lm_head projection."
+    else:
+        w_for_projection = w
+        note = "Raw decoder @ lm_head projection; final norm not applied (model.model.norm not found)."
     unembed = model.lm_head.weight.detach().float().cpu().numpy()
-    logits = unembed @ w
+    logits = unembed @ w_for_projection
     top_idx = np.argsort(logits)[-20:][::-1]
     bottom_idx = np.argsort(logits)[:20]
     positive = [{"token": tokenizer.decode([int(i)]), "token_id": int(i), "score": float(logits[i])} for i in top_idx]
     negative = [{"token": tokenizer.decode([int(i)]), "token_id": int(i), "score": float(logits[i])} for i in bottom_idx]
-    return positive, negative, "Raw decoder @ lm_head projection; final norm not applied."
+    return positive, negative, note
 
 
 def build_card(args: argparse.Namespace, layer: int, feature_id: int, layer_dir: Path, metadata: pd.DataFrame, feature_values: np.ndarray, token_df: pd.DataFrame, hook_summary: dict[str, object]) -> dict[str, object]:

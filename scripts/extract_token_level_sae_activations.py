@@ -23,6 +23,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from encode_identity_saes import load_sae, torch_dtype  # noqa: E402
+from common import classify_feature_localization  # noqa: E402
 
 
 DEFAULT_MODEL_PATH = Path("/workspace/status_mi/models/llama-3.1-8b")
@@ -329,14 +330,11 @@ def main() -> None:
                     final_value = float(final_lookup.get((feature_id, int(meta.row_idx)), 0.0))
                     max_span = float(span_vals.max()) if len(span_vals) else 0.0
                     mean_span = float(span_vals.mean()) if len(span_vals) else 0.0
-                    if max_val > 0 and max_span >= 0.7 * max_val:
-                        localization = "identity_span_local"
-                    elif max_val > 0 and final_value >= 0.7 * max_val:
-                        localization = "final_token_integrated"
-                    elif max_val > 0 and not token_span_flags[max_idx]:
-                        localization = "template_context"
-                    else:
-                        localization = "diffuse_or_unclear"
+                    localization = classify_feature_localization(
+                        max_token_activation=max_val,
+                        max_identity_span_activation=max_span,
+                        final_token_activation=final_value,
+                    )
                     for token_idx in range(valid_len):
                         start_char, end_char = offsets[batch_pos, token_idx]
                         is_special = not bool(end_char > start_char)

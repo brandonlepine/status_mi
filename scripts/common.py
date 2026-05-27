@@ -253,6 +253,50 @@ def residualize(
 
 
 # ---------------------------------------------------------------------------
+# Feature localization classifier (audit 5.10 — shared between Step 14 and 15)
+# ---------------------------------------------------------------------------
+
+DEFAULT_LOCALIZATION_THRESHOLD = 0.7
+LOCALIZATION_TYPES = (
+    "identity_span_local",
+    "final_token_integrated",
+    "template_context",
+    "diffuse_or_unclear",
+)
+
+
+def classify_feature_localization(
+    max_token_activation: float,
+    max_identity_span_activation: float,
+    final_token_activation: float,
+    threshold: float = DEFAULT_LOCALIZATION_THRESHOLD,
+) -> str:
+    """Assign a feature_localization_type given per-prompt activation stats.
+
+    Used by extract_token_level_sae_activations.py (per-prompt classification
+    inside the GPU loop) and build_sae_feature_cards.py (re-derived from the
+    persisted token table). Both call sites previously had their own copy of
+    the 4-branch decision with the same 0.7 threshold; audit 5.10 calls for
+    a single source of truth.
+
+    Branches (in order):
+    - identity_span_local: identity-span tokens capture ≥ threshold of the
+      prompt's max activation.
+    - final_token_integrated: the final token captures ≥ threshold of the max.
+    - template_context: max exists but it landed neither in the identity span
+      nor at the final token.
+    - diffuse_or_unclear: feature is silent or every token is at zero.
+    """
+    if max_token_activation <= 0:
+        return "diffuse_or_unclear"
+    if max_identity_span_activation >= threshold * max_token_activation:
+        return "identity_span_local"
+    if final_token_activation >= threshold * max_token_activation:
+        return "final_token_integrated"
+    return "template_context"
+
+
+# ---------------------------------------------------------------------------
 # Scalers (--scaling flag; audit 5.9)
 # ---------------------------------------------------------------------------
 
