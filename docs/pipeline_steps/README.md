@@ -65,8 +65,8 @@ Severity tags are aggregated per script from `issues_and_opportunities.md`. **B*
 | 04 | `extract_identity_activations.py` | 1 | **B** (1.1 — PARTIAL FIX LANDED) · m (1.5) | [04_extract_identity_activations.md](04_extract_identity_activations.md) |
 | 05 | `encode_identity_saes.py` | 1 | **B** (1.4 — FIX LANDED) · m (4.6) · **B** (1.1 — FIX LANDED) | [05_encode_identity_saes.md](05_encode_identity_saes.md) |
 | 06 | `validate_sae_hook_alignment.py` | 1 | **B** (1.4 — FIX LANDED with recon check) | [06_validate_sae_hook_alignment.md](06_validate_sae_hook_alignment.md) |
-| 07 | `analyze_identity_geometry.py` | 2 | **B** (2.2 — PROBE NULL LANDED) · M (2.1 — FIX LANDED, 4.1) · m (2.8, 5.9, 5.10) | [07_analyze_identity_geometry.md](07_analyze_identity_geometry.md) |
-| 08 | `analyze_identity_geometry_diagnostics.py` | 2 | **B** (2.2 — PROBE NULL LANDED) · M (2.1 — FIX LANDED, 4.1) · m (5.9, 5.10) — strengths to keep | [08_analyze_identity_geometry_diagnostics.md](08_analyze_identity_geometry_diagnostics.md) |
+| 07 | `analyze_identity_geometry.py` | 2 | **B** (2.2 — PROBE NULL LANDED) · M (2.1 — FIX LANDED, 4.1) · m (2.8 — VERIFIER LANDED, 5.9, 5.10) | [07_analyze_identity_geometry.md](07_analyze_identity_geometry.md) |
+| 08 | `analyze_identity_geometry_diagnostics.py` | 2 | **B** (2.2 — PROBE NULL LANDED) · M (2.1 — FIX LANDED, 4.1) · m (2.8 — VERIFIER LANDED, 5.9, 5.10) — strengths to keep | [08_analyze_identity_geometry_diagnostics.md](08_analyze_identity_geometry_diagnostics.md) |
 | 09 | `analyze_shared_social_subspace.py` | 2 | **B** (2.2 — SVD null still pending) · M (2.1 — FIX LANDED, 4.1) · m (5.10) | [09_analyze_shared_social_subspace.md](09_analyze_shared_social_subspace.md) |
 | 10 | `plot_identity_geometry.py` | 2 | m (2.1 visualization, 5.10) | [10_plot_identity_geometry.md](10_plot_identity_geometry.md) |
 | 11 | `plot_identity_directional_visualizations.py` | 2 | m (2.1 visualization, 5.10) | [11_plot_identity_directional_visualizations.md](11_plot_identity_directional_visualizations.md) |

@@ -154,6 +154,18 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="RNG seed for the permutation null. Defaults to --random_seed.",
     )
+    parser.add_argument(
+        "--verify_fold_internal_pca",
+        type=int,
+        default=None,
+        help=(
+            "Optional layer index to verify the global-PCA design choice (audit 2.8). "
+            "If set, runs each probe configuration on this layer a second time with "
+            "StandardScaler + PCA fit INSIDE each CV fold (no leakage) and writes "
+            "probes/pca_leakage_verification.csv comparing the two. Small "
+            "accuracy/macro-F1 deltas vindicate the speed-tradeoff design."
+        ),
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -368,9 +380,23 @@ def make_probe_features(
 ) -> np.ndarray | None:
     """Build fast probe features once per layer.
 
-    This intentionally fits the unsupervised scaler/PCA once on the full layer so
-    cross-validation only tests supervised label recovery. It avoids rerunning a
-    costly randomized SVD for every probe fold.
+    This intentionally fits the unsupervised StandardScaler + PCA once on the
+    *full* layer so cross-validation only tests supervised label recovery.
+    Fitting inside each CV fold would multiply randomized-SVD cost by the
+    number of folds × number of probe configurations × residualizations × layers.
+
+    Audit issue 2.8 flags the technical leakage: the PCA basis is computed on
+    data that include the held-out fold. PCA is unsupervised, so the leakage
+    is mild in principle, but a careful reviewer will ask.
+
+    To verify the leakage is empirically negligible on this dataset, run
+    `--verify_fold_internal_pca <layer>` (default off). That triggers an extra
+    pass through `crossval_probe_fold_internal_pca` which fits StandardScaler +
+    PCA inside each CV fold on the train rows only, then writes
+    `probes/pca_leakage_verification.csv` next to the existing probe CSVs
+    with side-by-side global-PCA and fold-internal-PCA numbers. If the
+    accuracy_delta is small (< the per-fold SD), the design choice is
+    defensible to a reviewer.
     """
     if not np.isfinite(x).all():
         print(f"Skipping probes for layer {layer}: activations contain non-finite values.")
@@ -449,6 +475,82 @@ def _run_cv_folds(
                     print(f"Skipping failed probe fold ({split_type}, layer {layer}): {exc}")
                 continue
     return accuracies, macro_f1s
+
+
+def crossval_probe_fold_internal_pca(
+    x_raw: np.ndarray,
+    y: pd.Series,
+    groups: pd.Series,
+    probe_pca_dim: int,
+    random_seed: int,
+    split_type: str,
+    layer: int,
+) -> dict[str, float | int | str] | None:
+    """Audit-2.8 verifier: same GroupKFold probe as `crossval_probe` but fits
+    StandardScaler + PCA inside each fold on the train rows only.
+
+    Used when `--verify_fold_internal_pca <layer>` is set, to confirm the
+    fast in-place global-PCA path (`make_probe_features`) produces equivalent
+    numbers. No null distribution is computed here — the comparison is
+    accuracy / macro-F1 only.
+    """
+    y = y.reset_index(drop=True)
+    groups = groups.reset_index(drop=True)
+    n_classes = y.nunique()
+    n_groups = groups.nunique()
+    if n_classes < 2 or n_groups < 2 or not np.isfinite(x_raw).all():
+        return None
+    n_splits = min(5, n_groups)
+    try:
+        splits = list(GroupKFold(n_splits=n_splits).split(x_raw, y, groups))
+    except ValueError as exc:
+        print(f"Skipping fold-internal-PCA split ({split_type}, layer {layer}): {exc}")
+        return None
+    accuracies: list[float] = []
+    macro_f1s: list[float] = []
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ConvergenceWarning)
+        warnings.simplefilter("ignore", RuntimeWarning)
+        for train_idx, test_idx in splits:
+            if y.iloc[train_idx].nunique() < 2 or y.iloc[test_idx].nunique() < 2:
+                continue
+            x_tr_raw = x_raw[train_idx]
+            x_te_raw = x_raw[test_idx]
+            scaler = StandardScaler().fit(x_tr_raw)
+            x_tr = scaler.transform(x_tr_raw)
+            x_te = scaler.transform(x_te_raw)
+            if not np.isfinite(x_tr).all() or not np.isfinite(x_te).all():
+                continue
+            if probe_pca_dim and probe_pca_dim > 0:
+                n_components = min(probe_pca_dim, x_tr.shape[0] - 1, x_tr.shape[1])
+                if 1 <= n_components < x_tr.shape[1]:
+                    pca = PCA(n_components=n_components, random_state=random_seed, svd_solver="randomized")
+                    pca.fit(x_tr)
+                    x_tr = pca.transform(x_tr)
+                    x_te = pca.transform(x_te)
+            x_tr = np.nan_to_num(x_tr).astype(np.float32, copy=False)
+            x_te = np.nan_to_num(x_te).astype(np.float32, copy=False)
+            try:
+                model = build_probe_model()
+                model.fit(x_tr, y.iloc[train_idx])
+                pred = model.predict(x_te)
+                accuracies.append(accuracy_score(y.iloc[test_idx], pred))
+                macro_f1s.append(f1_score(y.iloc[test_idx], pred, average="macro"))
+            except Exception as exc:
+                print(f"Skipping failed fold-internal-PCA fold ({split_type}, layer {layer}): {exc}")
+                continue
+    if not accuracies:
+        return None
+    return {
+        "layer": layer,
+        "split_type": split_type,
+        "n_classes": int(n_classes),
+        "n_samples": int(len(y)),
+        "fold_internal_pca_accuracy_mean": float(np.mean(accuracies)),
+        "fold_internal_pca_accuracy_sd": float(np.std(accuracies, ddof=1)) if len(accuracies) > 1 else 0.0,
+        "fold_internal_pca_macro_f1_mean": float(np.mean(macro_f1s)),
+        "fold_internal_pca_macro_f1_sd": float(np.std(macro_f1s, ddof=1)) if len(macro_f1s) > 1 else 0.0,
+    }
 
 
 def _empty_null_fields() -> dict[str, float | int]:
@@ -611,6 +713,91 @@ def run_probes(
             identity_rows.append(result)
 
     return axis_rows, identity_rows
+
+
+def run_fold_internal_pca_verification(
+    *,
+    x: np.ndarray,
+    metadata: pd.DataFrame,
+    layer: int,
+    axis_rows: list[dict[str, object]],
+    identity_rows: list[dict[str, object]],
+    probe_pca_dim: int,
+    random_seed: int,
+) -> list[dict[str, object]]:
+    """For the layer chosen by --verify_fold_internal_pca, re-run each probe
+    configuration with StandardScaler + PCA fit inside each CV fold and pair
+    those numbers up with the corresponding global-PCA rows.
+
+    Returns one row per (split_type [, axis]) with columns:
+        layer, split_type, axis, n_classes, n_samples,
+        global_pca_accuracy_mean / sd, global_pca_macro_f1_mean / sd,
+        fold_internal_pca_accuracy_mean / sd, fold_internal_pca_macro_f1_mean / sd,
+        accuracy_delta, macro_f1_delta
+    """
+    rows: list[dict[str, object]] = []
+    by_split = {row["split_type"]: row for row in axis_rows if row.get("layer") == layer}
+    for group_col in ["template_id", "family"]:
+        split_name = f"group_by_{group_col}"
+        global_row = by_split.get(split_name)
+        verification = crossval_probe_fold_internal_pca(
+            x_raw=x,
+            y=metadata["axis"],
+            groups=metadata[group_col],
+            probe_pca_dim=probe_pca_dim,
+            random_seed=random_seed,
+            split_type=split_name,
+            layer=layer,
+        )
+        if global_row is None or verification is None:
+            continue
+        rows.append(_pair_global_and_fold_internal(global_row, verification, axis=""))
+
+    by_axis = {row.get("axis"): row for row in identity_rows if row.get("layer") == layer}
+    for axis_name, axis_meta in metadata.groupby("axis", sort=True):
+        if axis_meta["identity_id"].nunique() < 2:
+            continue
+        idx = axis_meta.index.to_numpy()
+        global_row = by_axis.get(axis_name)
+        verification = crossval_probe_fold_internal_pca(
+            x_raw=x[idx],
+            y=axis_meta["identity_id"].reset_index(drop=True),
+            groups=axis_meta["template_id"].reset_index(drop=True),
+            probe_pca_dim=probe_pca_dim,
+            random_seed=random_seed,
+            split_type="group_by_template_id",
+            layer=layer,
+        )
+        if global_row is None or verification is None:
+            continue
+        rows.append(_pair_global_and_fold_internal(global_row, verification, axis=axis_name))
+    return rows
+
+
+def _pair_global_and_fold_internal(
+    global_row: dict[str, object], verification: dict[str, object], axis: str
+) -> dict[str, object]:
+    return {
+        "layer": global_row["layer"],
+        "split_type": global_row["split_type"],
+        "axis": axis,
+        "n_classes": global_row["n_classes"],
+        "n_samples": global_row["n_samples"],
+        "global_pca_accuracy_mean": global_row["accuracy_mean"],
+        "global_pca_accuracy_sd": global_row["accuracy_sd"],
+        "global_pca_macro_f1_mean": global_row["macro_f1_mean"],
+        "global_pca_macro_f1_sd": global_row["macro_f1_sd"],
+        "fold_internal_pca_accuracy_mean": verification["fold_internal_pca_accuracy_mean"],
+        "fold_internal_pca_accuracy_sd": verification["fold_internal_pca_accuracy_sd"],
+        "fold_internal_pca_macro_f1_mean": verification["fold_internal_pca_macro_f1_mean"],
+        "fold_internal_pca_macro_f1_sd": verification["fold_internal_pca_macro_f1_sd"],
+        "accuracy_delta": (
+            verification["fold_internal_pca_accuracy_mean"] - global_row["accuracy_mean"]
+        ),
+        "macro_f1_delta": (
+            verification["fold_internal_pca_macro_f1_mean"] - global_row["macro_f1_mean"]
+        ),
+    }
 
 
 def cosine(a: np.ndarray, b: np.ndarray) -> float:
@@ -870,6 +1057,22 @@ def main() -> None:
             )
             axis_probe_rows.extend(axis_rows)
             identity_probe_rows.extend(identity_rows)
+
+            if args.verify_fold_internal_pca is not None and layer == args.verify_fold_internal_pca:
+                print(f"  Fold-internal PCA verification on layer {layer:02d} (audit 2.8)")
+                verification_rows = run_fold_internal_pca_verification(
+                    x=x,
+                    metadata=metadata,
+                    layer=layer,
+                    axis_rows=axis_rows,
+                    identity_rows=identity_rows,
+                    probe_pca_dim=args.probe_pca_dim,
+                    random_seed=args.random_seed,
+                )
+                pd.DataFrame(verification_rows).to_csv(
+                    subdirs["probes"] / "pca_leakage_verification.csv", index=False
+                )
+                print(f"    wrote {subdirs['probes'] / 'pca_leakage_verification.csv'}")
 
         print("  Family stability")
         family_df = run_family_stability(

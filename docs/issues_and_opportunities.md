@@ -236,9 +236,17 @@ What to do:
 
 What to do: for final results, drop `--smoke`; use ≥10,000 bootstrap and ≥10,000 permutation samples; raise per-cell minimums (or coarsen grouping, per 2.6) so each tested unit has enough examples for the test to have power. Consider BCa instead of percentile bootstrap for small n.
 
-### 2.8 [MINOR] Probe dimensionality reduction leaks across CV folds
+### 2.8 [MINOR] Probe dimensionality reduction leaks across CV folds (VERIFIER LANDED 2026-05-27; RunPod verification run pending)
 
-`analyze_identity_geometry.py:make_probe_features` fits `StandardScaler` + PCA once on the *entire* layer, then `crossval_probe` does group-K-fold on the logistic layer only. The PCA basis is fit on data including the test fold. The code comment acknowledges this is a deliberate speed tradeoff. PCA is unsupervised so leakage is mild, but a careful reviewer will still flag it. Either fit the scaler/PCA inside each fold, or state the choice explicitly and show it does not change conclusions on one layer.
+**Status:** Audit's "show it does not change conclusions on one layer" path. The design is preserved (global StandardScaler + PCA in `make_probe_features`; refitting per fold is intractable across `n_folds × n_residualizations × n_probe_configs × n_layers`), and a fold-internal verifier is now in place.
+
+**What landed:**
+- `analyze_identity_geometry.py` and `analyze_identity_geometry_diagnostics.py` each gain a `crossval_probe_fold_internal_pca[_diag]` function and a `--verify_fold_internal_pca <layer>` CLI flag. When set, every probe configuration on that layer runs a second time with `StandardScaler + PCA` fit inside each fold on train rows only. The output `probes/pca_leakage_verification.csv` has side-by-side `global_pca_*` vs `fold_internal_pca_*` accuracy/macro-F1 means and SDs plus per-row `accuracy_delta` and `macro_f1_delta`.
+- `make_probe_features` docstring rewritten to explain the speed tradeoff, the technical leakage, and how to run the verifier.
+
+**Original audit (preserved):** `analyze_identity_geometry.py:make_probe_features` fits `StandardScaler` + PCA once on the *entire* layer, then `crossval_probe` does group-K-fold on the logistic layer only. The PCA basis is fit on data including the test fold. PCA is unsupervised so leakage is mild, but a careful reviewer will still flag it.
+
+**Remaining work:** Run on RunPod once (e.g. `python scripts/analyze_identity_geometry.py --verify_fold_internal_pca 24` and same for diagnostics) and check that `|accuracy_delta|` is smaller than the per-fold `global_pca_accuracy_sd` for every row in the CSV. Record the verification numbers in the methods writeup.
 
 ---
 

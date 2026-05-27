@@ -71,6 +71,10 @@ Do not collapse the residualization grid into a single "best" residualization �
 - Add a null for the shared-subspace SVD spectrum in [Step 9](09_analyze_shared_social_subspace.md): random unit vectors vs shuffled-identity directions.
 - Probe nulls are surfaced in the existing CSV columns; the remaining nulls will need new sidecar CSVs (`variance_decomposition_null.csv`, `contrast_null_distribution.csv`).
 
+### 2.8 [MINOR] — Probe dimensionality reduction leaks across CV folds (VERIFIER LANDED 2026-05-27)
+
+Same design and same fix as [Step 7](07_analyze_identity_geometry.md#28-minor--probe-dimensionality-reduction-leaks-across-cv-folds-verifier-landed-2026-05-27). The diagnostics script also fits `StandardScaler + PCA` once globally in `make_probe_features`. New `crossval_probe_fold_internal_pca_diag` mirrors the LogisticRegression configuration (`solver`, `max_iter`, `n_jobs`) so the global-vs-fold-internal comparison is apples-to-apples. `--verify_fold_internal_pca <layer>` runs the verifier at `residualization == "raw"` across all three probe configurations (axis, identity-within-axis, surface-form) and writes `probes/pca_leakage_verification.csv`.
+
 ### 4.1 [MAJOR] — Contrast lists reference identities that do not exist (silently skipped)
 
 **What's wrong:** The `CONTRASTS` list here is identical to [Step 7](07_analyze_identity_geometry.md)'s and contains the same nonexistent identity IDs — `ses_low_income`, `ses_high_socioeconomic_status` — that get silently filtered out. The diagnostics CSVs therefore have fewer rows for SES than expected.

@@ -60,13 +60,18 @@ First-pass characterization of identity geometry from the final-token residual s
 
 **Remaining work:** the shared-subspace SVD spectrum in [Step 9](09_analyze_shared_social_subspace.md) still lacks its own null (random-direction baseline + shuffled-identity SVD spectrum). That fix is a separate commit.
 
-### 2.8 [MINOR] — Probe dimensionality reduction leaks across CV folds
+### 2.8 [MINOR] — Probe dimensionality reduction leaks across CV folds (VERIFIER LANDED 2026-05-27)
 
-**What's wrong:** `make_probe_features` fits `StandardScaler` + `PCA(n_components=probe_pca_dim)` **once on the entire layer** before `crossval_probe` does `GroupKFold`. The unsupervised PCA basis is thus fit on data that include the held-out fold. The code comment acknowledges this as a deliberate speed tradeoff.
+**Status:** The design is preserved (fit StandardScaler + PCA once globally; refitting per fold is computationally intractable across `n_folds × n_residualizations × n_probe_configs × n_layers`). A verifier is now in place to empirically vindicate the choice on a chosen layer.
 
-**Why it matters:** PCA is unsupervised so the leakage is mild, but a careful reviewer will flag it.
+**What landed:**
+- `make_probe_features` docstring rewritten to explain the speed tradeoff, the technical leakage, and how to verify it on a chosen layer.
+- New `crossval_probe_fold_internal_pca`: identical CV structure to `crossval_probe`, but `StandardScaler` and `PCA` are fit inside each fold on the train rows only.
+- New CLI: `--verify_fold_internal_pca <layer_index>` (default off). When set, runs every probe configuration on that layer a second time through `crossval_probe_fold_internal_pca` and writes `probes/pca_leakage_verification.csv` with side-by-side `global_pca_*` and `fold_internal_pca_*` accuracy and macro-F1 means/SDs, plus `accuracy_delta` and `macro_f1_delta`. Synthetic tests confirm the verifier reproduces the global-PCA numbers when the design is sound.
 
-**Targeted fix:** Either fit `StandardScaler`/`PCA` inside each CV fold (`Pipeline` + `cross_val_score`), or keep the current design but show on one layer that fold-internal PCA reproduces the same accuracy ± SD. Document the choice in a docstring.
+**How to read the verification CSV:** if `|accuracy_delta|` is smaller than the per-fold `global_pca_accuracy_sd`, the fold-internal-PCA path produces statistically indistinguishable numbers and the global-PCA shortcut is defensible. A `|accuracy_delta|` of, say, +0.05 on a 0.04-SD probe would indicate real leakage; in that case the cost of fold-internal PCA becomes justifiable for the headline run even if not for development iterations.
+
+**Original audit (preserved):** `make_probe_features` fits `StandardScaler` + `PCA(n_components=probe_pca_dim)` once on the entire layer before `crossval_probe` does `GroupKFold`. The unsupervised PCA basis is thus fit on data that include the held-out fold; a careful reviewer would flag it. PCA is unsupervised so the leakage is mild in principle, but unverified.
 
 ### 4.1 [MAJOR] — Contrast lists reference identities that do not exist (silently skipped)
 

@@ -187,7 +187,150 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="RNG seed for the permutation null. Defaults to --random_seed.",
     )
+    parser.add_argument(
+        "--verify_fold_internal_pca",
+        type=int,
+        default=None,
+        help=(
+            "Optional layer index to verify the global-PCA design choice (audit 2.8). "
+            "If set, runs each probe configuration on this layer at residualization='raw' "
+            "a second time with StandardScaler + PCA fit INSIDE each CV fold and writes "
+            "probes/pca_leakage_verification.csv. Run once; small deltas vindicate the "
+            "speed-tradeoff in make_probe_features."
+        ),
+    )
     return parser.parse_args()
+
+
+def run_fold_internal_pca_verification_diag(
+    *,
+    x_raw_for_layer: np.ndarray,
+    metadata: pd.DataFrame,
+    layer: int,
+    axis_probe_rows: list[dict[str, object]],
+    identity_probe_rows: list[dict[str, object]],
+    surface_probe_rows: list[dict[str, object]],
+    args: argparse.Namespace,
+) -> list[dict[str, object]]:
+    """For the layer chosen by --verify_fold_internal_pca, run the same
+    axis / identity-within-axis / surface-form probes at residualization='raw'
+    with fold-internal PCA and pair the numbers with the existing global-PCA
+    rows. Returns one row per probe configuration; the caller writes the CSV.
+    """
+    rows: list[dict[str, object]] = []
+    null_seed = args.null_random_seed if args.null_random_seed is not None else args.random_seed
+
+    def _global_row(rows_list: list[dict[str, object]], **filters) -> dict[str, object] | None:
+        for row in rows_list:
+            if row.get("layer") != layer:
+                continue
+            if row.get("residualization") != "raw":
+                continue
+            if all(row.get(k) == v for k, v in filters.items()):
+                return row
+        return None
+
+    # Axis probes
+    for group_col in ["template_id", "family"]:
+        split_name = f"group_by_{group_col}"
+        global_row = _global_row(axis_probe_rows, split_type=split_name, task="axis_prediction")
+        verification = crossval_probe_fold_internal_pca_diag(
+            x_raw=x_raw_for_layer,
+            y=metadata["axis"],
+            groups=metadata[group_col],
+            probe_pca_dim=args.probe_pca_dim,
+            random_seed=args.random_seed,
+            layer=layer,
+            task="axis_prediction",
+            split_type=split_name,
+            n_splits=args.n_splits,
+            solver=args.solver,
+            max_iter=args.max_iter,
+            n_jobs=args.n_jobs,
+        )
+        if global_row and verification:
+            rows.append(_pair_global_and_fold_internal_diag(global_row, verification))
+
+    # Identity-within-axis probes
+    for axis_name, axis_meta in metadata.groupby("axis", sort=True):
+        if axis_meta["identity_id"].nunique() < 2:
+            continue
+        idx = axis_meta.index.to_numpy()
+        global_row = _global_row(
+            identity_probe_rows,
+            split_type="group_by_template_id",
+            task="identity_within_axis_prediction",
+            axis=axis_name,
+        )
+        verification = crossval_probe_fold_internal_pca_diag(
+            x_raw=x_raw_for_layer[idx],
+            y=axis_meta["identity_id"].reset_index(drop=True),
+            groups=axis_meta["template_id"].reset_index(drop=True),
+            probe_pca_dim=args.probe_pca_dim,
+            random_seed=args.random_seed,
+            layer=layer,
+            task=f"identity_within_axis_prediction[{axis_name}]",
+            split_type="group_by_template_id",
+            n_splits=args.n_splits,
+            solver=args.solver,
+            max_iter=args.max_iter,
+            n_jobs=args.n_jobs,
+        )
+        if global_row and verification:
+            rows.append(_pair_global_and_fold_internal_diag(global_row, verification, axis=axis_name))
+
+    # Surface-form probes (raw residualization only)
+    surface_tasks = ["required_form", "family"]
+    if getattr(args, "run_template_id_probe", False) and not args.skip_template_id_probe:
+        surface_tasks.append("template_id")
+    for task_col in surface_tasks:
+        task_name = f"{task_col}_prediction"
+        global_row = _global_row(surface_probe_rows, task=task_name)
+        verification = crossval_probe_fold_internal_pca_diag(
+            x_raw=x_raw_for_layer,
+            y=metadata[task_col],
+            groups=metadata["identity_id"],
+            probe_pca_dim=args.probe_pca_dim,
+            random_seed=args.random_seed,
+            layer=layer,
+            task=task_name,
+            split_type="group_by_identity_id",
+            n_splits=args.n_splits,
+            solver=args.solver,
+            max_iter=args.max_iter,
+            n_jobs=args.n_jobs,
+        )
+        if global_row and verification:
+            rows.append(_pair_global_and_fold_internal_diag(global_row, verification))
+    return rows
+
+
+def _pair_global_and_fold_internal_diag(
+    global_row: dict[str, object], verification: dict[str, object], axis: str = "",
+) -> dict[str, object]:
+    return {
+        "layer": global_row["layer"],
+        "residualization": "raw",
+        "task": global_row["task"],
+        "split_type": global_row["split_type"],
+        "axis": axis or global_row.get("axis", ""),
+        "n_classes": global_row["n_classes"],
+        "n_samples": global_row["n_samples"],
+        "global_pca_accuracy_mean": global_row["accuracy_mean"],
+        "global_pca_accuracy_sd": global_row["accuracy_sd"],
+        "global_pca_macro_f1_mean": global_row["macro_f1_mean"],
+        "global_pca_macro_f1_sd": global_row["macro_f1_sd"],
+        "fold_internal_pca_accuracy_mean": verification["fold_internal_pca_accuracy_mean"],
+        "fold_internal_pca_accuracy_sd": verification["fold_internal_pca_accuracy_sd"],
+        "fold_internal_pca_macro_f1_mean": verification["fold_internal_pca_macro_f1_mean"],
+        "fold_internal_pca_macro_f1_sd": verification["fold_internal_pca_macro_f1_sd"],
+        "accuracy_delta": (
+            verification["fold_internal_pca_accuracy_mean"] - global_row["accuracy_mean"]
+        ),
+        "macro_f1_delta": (
+            verification["fold_internal_pca_macro_f1_mean"] - global_row["macro_f1_mean"]
+        ),
+    }
 
 
 def parse_layers(layer_arg: str | None, activation_dir: Path) -> list[int]:
@@ -427,6 +570,20 @@ def make_probe_features(
     random_seed: int,
     label: str,
 ) -> np.ndarray | None:
+    """Build probe features by fitting StandardScaler + randomized PCA once on
+    the full layer/residualization.
+
+    Audit issue 2.8: PCA is fit on data that include the held-out CV fold.
+    The leakage is mild (PCA is unsupervised) but technically present. The
+    design choice is for speed: refitting the randomized SVD inside every
+    (fold × residualization × probe configuration × layer) is intractable
+    on the full corpus. To empirically vindicate the choice, run with
+    `--verify_fold_internal_pca <layer>`: that triggers an extra pass through
+    `crossval_probe_fold_internal_pca_diag` which fits the scaler + PCA
+    inside each fold on train rows only, and writes
+    `probes/pca_leakage_verification.csv` with side-by-side numbers. If the
+    accuracy_delta is < the per-fold SD, the global-PCA path is defensible.
+    """
     if not np.isfinite(x).all():
         print(f"Skipping probes for {label}: non-finite activations.")
         return None
@@ -444,6 +601,83 @@ def make_probe_features(
                 svd_solver="randomized",
             ).fit_transform(x_scaled)
     return np.asarray(np.nan_to_num(x_scaled), dtype=np.float32)
+
+
+def crossval_probe_fold_internal_pca_diag(
+    x_raw: np.ndarray,
+    y: pd.Series,
+    groups: pd.Series,
+    probe_pca_dim: int,
+    random_seed: int,
+    layer: int,
+    task: str,
+    split_type: str,
+    n_splits: int,
+    solver: str,
+    max_iter: int,
+    n_jobs: int,
+) -> dict[str, object] | None:
+    """Audit-2.8 verifier (diagnostics flavor). Fits StandardScaler + PCA
+    inside each CV fold on the train rows only. Mirrors `crossval_probe`'s
+    LogisticRegression configuration so the comparison is apples-to-apples.
+    """
+    y = y.reset_index(drop=True)
+    groups = groups.reset_index(drop=True)
+    if y.nunique() < 2 or groups.nunique() < 2 or not np.isfinite(x_raw).all():
+        return None
+    n_splits = min(n_splits, groups.nunique())
+    if n_splits < 2:
+        return None
+    try:
+        splits = list(GroupKFold(n_splits=n_splits).split(x_raw, y, groups))
+    except ValueError as exc:
+        print(f"Skipping fold-internal-PCA verifier {task} layer {layer}: {exc}")
+        return None
+    accuracies: list[float] = []
+    macro_f1s: list[float] = []
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ConvergenceWarning)
+        warnings.simplefilter("ignore", RuntimeWarning)
+        warnings.simplefilter("ignore", FutureWarning)
+        for train_idx, test_idx in splits:
+            if y.iloc[train_idx].nunique() < 2 or y.iloc[test_idx].nunique() < 2:
+                continue
+            x_tr_raw = x_raw[train_idx]
+            x_te_raw = x_raw[test_idx]
+            scaler = StandardScaler().fit(x_tr_raw)
+            x_tr = scaler.transform(x_tr_raw)
+            x_te = scaler.transform(x_te_raw)
+            if not np.isfinite(x_tr).all() or not np.isfinite(x_te).all():
+                continue
+            if probe_pca_dim and probe_pca_dim > 0:
+                n_components = min(probe_pca_dim, x_tr.shape[0] - 1, x_tr.shape[1])
+                if 1 <= n_components < x_tr.shape[1]:
+                    pca = PCA(n_components=n_components, random_state=random_seed, svd_solver="randomized")
+                    pca.fit(x_tr)
+                    x_tr = pca.transform(x_tr)
+                    x_te = pca.transform(x_te)
+            x_tr = np.nan_to_num(x_tr).astype(np.float32, copy=False)
+            x_te = np.nan_to_num(x_te).astype(np.float32, copy=False)
+            model = LogisticRegression(max_iter=max_iter, class_weight="balanced", solver=solver, n_jobs=n_jobs)
+            try:
+                model.fit(x_tr, y.iloc[train_idx])
+                pred = model.predict(x_te)
+            except Exception as exc:
+                print(f"Skipping failed fold-internal-PCA fold {task} layer {layer}: {exc}")
+                continue
+            accuracies.append(accuracy_score(y.iloc[test_idx], pred))
+            macro_f1s.append(f1_score(y.iloc[test_idx], pred, average="macro"))
+    if not accuracies:
+        return None
+    return {
+        "layer": layer,
+        "task": task,
+        "split_type": split_type,
+        "fold_internal_pca_accuracy_mean": float(np.mean(accuracies)),
+        "fold_internal_pca_accuracy_sd": float(np.std(accuracies, ddof=1)) if len(accuracies) > 1 else 0.0,
+        "fold_internal_pca_macro_f1_mean": float(np.mean(macro_f1s)),
+        "fold_internal_pca_macro_f1_sd": float(np.std(macro_f1s, ddof=1)) if len(macro_f1s) > 1 else 0.0,
+    }
 
 
 def sample_probe_rows(
@@ -1525,6 +1759,28 @@ def main() -> None:
                         surface_probe_rows.extend(
                             run_surface_probes(probe_features, metadata, layer, args)
                         )
+
+                    if (
+                        residualization == "raw"
+                        and args.verify_fold_internal_pca is not None
+                        and layer == args.verify_fold_internal_pca
+                    ):
+                        print(f"  Fold-internal-PCA verification on layer {layer:02d} (audit 2.8)")
+                        verification_rows = run_fold_internal_pca_verification_diag(
+                            x_raw_for_layer=x,
+                            metadata=metadata,
+                            layer=layer,
+                            axis_probe_rows=axis_probe_rows,
+                            identity_probe_rows=identity_probe_rows,
+                            surface_probe_rows=surface_probe_rows,
+                            args=args,
+                        )
+                        probes_dir = args.output_dir / "probes"
+                        probes_dir.mkdir(parents=True, exist_ok=True)
+                        pd.DataFrame(verification_rows).to_csv(
+                            probes_dir / "pca_leakage_verification.csv", index=False
+                        )
+                        print(f"    wrote {probes_dir / 'pca_leakage_verification.csv'}")
                 print(f"  Probes finished in {elapsed(start)}")
 
             if not args.only_pca and not args.only_variance:
