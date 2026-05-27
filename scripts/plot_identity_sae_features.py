@@ -22,14 +22,9 @@ except ImportError:  # pragma: no cover
 
 DEFAULT_ANALYSIS_DIR = Path("/workspace/status_mi/results/sae_identity/llama-3.1-8b/final_token/analysis")
 DEFAULT_OUTPUT_DIR = Path("/workspace/status_mi/results/sae_identity/llama-3.1-8b/final_token/figures")
-KEY_CONTRASTS = [
-    "sexuality_gay_vs_sexuality_straight",
-    "race_black_vs_race_white",
-    "gender_transgender_vs_gender_cisgender",
-    "appearance_obese_vs_appearance_thin",
-    "ses_low_income_vs_ses_rich",
-    "disability_disabled_vs_disability_able_bodied",
-]
+# Canonical contrast registry — see scripts/contrast_registry.py. Audit 4.1.
+# Note: this list previously had ses_low_income; the registry corrects it.
+from contrast_registry import KEY_CONTRAST_NAMES as KEY_CONTRASTS  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:

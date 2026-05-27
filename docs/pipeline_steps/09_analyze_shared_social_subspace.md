@@ -53,13 +53,13 @@ Decomposes the set of identity contrast directions into a **shared social subspa
 
 **Targeted fix:** Build a null distribution of SVD spectra by (a) shuffling identity assignments within each axis and re-deriving the contrast directions, or (b) splitting each axis's prompts randomly into two halves and computing differences of half-means. Run ≥100 nulls. Report concentration metrics (participation ratio, variance in top-k) against the null. Only PCs whose singular value exceeds, e.g., the 95th percentile of the null are reported as "shared."
 
-### 4.1 [MAJOR] — `DEFAULT_CONTRASTS` references identities that do not exist (silently skipped)
+### 4.1 [MAJOR] — `DEFAULT_CONTRASTS` references identities that do not exist (FIX LANDED 2026-05-27)
 
-**What's wrong:** `DEFAULT_CONTRASTS` includes `ses_low_income_vs_ses_rich` and `ses_low_income_vs_ses_high_socioeconomic_status` — neither `ses_low_income` nor `ses_high_socioeconomic_status` is present in `bbq_identity_normalized_forms.csv`. Pairs whose identities are missing are filtered out before SVD, silently reducing `C`. This changes the dimensionality of the shared subspace as a function of which contrasts happen to exist in the data.
+**Status:** `DEFAULT_CONTRASTS` is now imported from `scripts/contrast_registry.py` (commit `6eafb4d`); the typos are fixed in the registry so SES has 4 valid contrasts. `KEY_CONTRASTS` and `SELECTED_CROSS_AXIS_ORDERINGS` also imported from the registry. `load_contrasts(path, metadata, output_dir=...)` writes `metrics/contrasts_skipped.csv` with per-row reasons and emits warnings per skipped pair. **No startup assertion** — partial-axis runs work.
 
-**Why it matters:** The "rank" and "spectrum" of the shared subspace depend on `C`. Silent dropping of contrasts changes the reported spectrum without flagging it.
+**Original audit (preserved):** `DEFAULT_CONTRASTS` included `ses_low_income_vs_ses_rich` and `ses_low_income_vs_ses_high_socioeconomic_status` — neither `ses_low_income` nor `ses_high_socioeconomic_status` was present in `bbq_identity_normalized_forms.csv`. Pairs whose identities were missing were filtered out before SVD, silently reducing `C`. This changed the dimensionality of the shared subspace as a function of which contrasts happened to exist in the data; the realized `C` was never reported.
 
-**Targeted fix:** Source `DEFAULT_CONTRASTS` from the shared, validated registry; fail loudly if any contrast identity is missing. Record the realized `C` (post-validation) in `run_config.json` and in each spectrum row.
+**Remaining tightening (optional):** Record the realized `C` (post-validation) in `run_config.json` and in each spectrum row so paper claims about the "rank" of the shared subspace cite a specific, reproducible number.
 
 ### 5.10 [MINOR] — Heavy code duplication across analysis scripts
 

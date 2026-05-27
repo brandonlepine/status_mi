@@ -73,13 +73,16 @@ First-pass characterization of identity geometry from the final-token residual s
 
 **Original audit (preserved):** `make_probe_features` fits `StandardScaler` + `PCA(n_components=probe_pca_dim)` once on the entire layer before `crossval_probe` does `GroupKFold`. The unsupervised PCA basis is thus fit on data that include the held-out fold; a careful reviewer would flag it. PCA is unsupervised so the leakage is mild in principle, but unverified.
 
-### 4.1 [MAJOR] — Contrast lists reference identities that do not exist (silently skipped)
+### 4.1 [MAJOR] — Contrast lists reference identities that do not exist (FIX LANDED 2026-05-27)
 
-**What's wrong:** `CONTRASTS` includes pairs whose identity IDs are not in `bbq_identity_normalized_forms.csv`. Concretely, `ses_low_income` (used in `ses_low_income_vs_ses_rich` and `ses_low_income_vs_ses_high_socioeconomic_status`) and `ses_high_socioeconomic_status` do not exist; the dataset's SES identities are `ses_low`, `ses_high`, `ses_poor`, `ses_rich`, `ses_lower_class`, etc. The loop runs `if identity_a not in identity_set or identity_b not in identity_set: continue` — these pairs are dropped with no warning.
+**Status:** Two-stage fix across four commits (`1e242c9`, `398ffee`, `6eafb4d`). The literal CONTRASTS list is gone; a single validated registry now feeds every consumer, the typos are fixed, and a `contrasts_skipped.csv` sidecar lands next to the analysis outputs.
 
-**Why it matters:** The SES axis runs with fewer contrasts than the code implies. Anything that aggregates "all SES contrasts" understates coverage; rerunning after a dataset edit will silently change the count.
+**What landed:**
+- New `scripts/contrast_registry.py` is the canonical source. Two typos fixed: `ses_low_income` → `ses_low`, `ses_high_socioeconomic_status` → `ses_high`. All 21 registry entries validate against `data/bbq_identity_normalized_forms.csv`. **SES axis now runs all 4 contrasts (`ses_low_vs_ses_rich`, `ses_low_vs_ses_high`, `ses_lower_class_vs_ses_upper_class`, `ses_blue_collar_vs_ses_white_collar`) instead of the silently-2 from before.**
+- This script's `CONTRASTS` literal is removed. `resolve_contrasts_from_registry(metadata, subdirs)` runs at `main()` startup, validates the registry against the loaded `identity_id` set, and writes `contrasts/contrasts_skipped.csv` (with a per-row `reason` column: `missing_identity_a`, `missing_identity_b`, or both). A warning emits per skipped pair.
+- **No startup assertion.** Running with a subset of identities (e.g., to validate end-to-end behavior on a single axis) is supported — the skipped CSV preserves the audit trail without aborting.
 
-**Targeted fix:** (1) Replace the literal `CONTRASTS` list with references to a single validated contrast registry (per 5.10) keyed by IDs that exist in `bbq_identity_normalized_forms.csv`. (2) Make the skip loud — log a warning per missing identity and write a `contrasts_skipped.csv` listing skipped pairs. (3) Add a startup assertion that every contrast identity is present.
+**Original audit (preserved):** `CONTRASTS` included pairs whose identity IDs were not in `bbq_identity_normalized_forms.csv`. Concretely, `ses_low_income` and `ses_high_socioeconomic_status` did not exist; the dataset's SES identities are `ses_low`, `ses_high`, `ses_poor`, `ses_rich`, `ses_lower_class`, etc. The loop ran `if identity_a not in identity_set or identity_b not in identity_set: continue` — these pairs were dropped with no warning. The SES axis ran with fewer contrasts than the code implied.
 
 ### 5.9 [MINOR] — PCA on StandardScaler-ed activations changes the geometry
 

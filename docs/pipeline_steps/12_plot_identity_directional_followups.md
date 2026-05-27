@@ -41,13 +41,11 @@ A still-larger followup-plotting script that re-derives contrast directions and 
 
 **Targeted fix:** Recompute the key-contrast AUC for the paper panel using cross-family direction estimation (re-fit direction on `~heldout` family, evaluate on `heldout` family, average across heldout families). Mirror the centroid-ordering CIs by bootstrapping over (a) family-held-out direction estimation, and (b) the prompts being projected. Demote in-sample to diagnostic small multiples.
 
-### 4.1 [MAJOR] — `DEFAULT_CONTRASTS` references identities that do not exist (silently skipped)
+### 4.1 [MAJOR] — `DEFAULT_CONTRASTS` references identities that do not exist (FIX LANDED 2026-05-27)
 
-**What's wrong:** Identical to [Step 9](09_analyze_shared_social_subspace.md) and [Step 11](11_plot_identity_directional_visualizations.md) — `DEFAULT_CONTRASTS` lists `ses_low_income_vs_ses_rich` and `ses_low_income_vs_ses_high_socioeconomic_status`. `KEY_CONTRASTS` and `CENTROID_ORDERING_CONTRASTS` *both* include `ses_low_income_vs_ses_rich`. Because `ses_low_income` is not in the dataset, the SES row of the paper-panel ends up missing or visually inconsistent (different sample sizes, different identity coverage).
+**Status:** `DEFAULT_CONTRASTS` and `KEY_CONTRASTS` now import from `scripts/contrast_registry.py`. The `ses_low_income_vs_ses_rich` references in `RESIDUALIZATION_COMPARISON_CONTRASTS` and `CENTROID_ORDERING_CONTRASTS` are rewritten to `ses_low_vs_ses_rich` to match the registry's typo-fixed contrast names. The SES row of the paper-summary panel now points at a contrast that actually exists in the upstream analysis CSVs.
 
-**Why it matters:** The paper-summary panel is the artifact a reviewer will look at first. A silent skip on `KEY_CONTRASTS` produces a panel with an empty subplot or a SES curve that does not match the per-axis text.
-
-**Targeted fix:** Audit `KEY_CONTRASTS` and `CENTROID_ORDERING_CONTRASTS` against the validated registry. Replace `ses_low_income` with an existing identity (`ses_low`, `ses_poor`, or `ses_lower_class`) so the SES headline is actually plotted. Fail loudly at startup if any of these "featured" contrasts is missing.
+**Original audit (preserved):** `DEFAULT_CONTRASTS` listed `ses_low_income_vs_ses_rich` and `ses_low_income_vs_ses_high_socioeconomic_status`. `KEY_CONTRASTS` and `CENTROID_ORDERING_CONTRASTS` *both* included `ses_low_income_vs_ses_rich`. Because `ses_low_income` was not in the dataset, the SES row of the paper-panel was missing or visually inconsistent.
 
 ### 5.10 [MAJOR severity-by-impact, listed as MINOR in source] — Code duplication; this is the largest of the duplicated copies
 

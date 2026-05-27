@@ -75,13 +75,9 @@ Do not collapse the residualization grid into a single "best" residualization �
 
 Same design and same fix as [Step 7](07_analyze_identity_geometry.md#28-minor--probe-dimensionality-reduction-leaks-across-cv-folds-verifier-landed-2026-05-27). The diagnostics script also fits `StandardScaler + PCA` once globally in `make_probe_features`. New `crossval_probe_fold_internal_pca_diag` mirrors the LogisticRegression configuration (`solver`, `max_iter`, `n_jobs`) so the global-vs-fold-internal comparison is apples-to-apples. `--verify_fold_internal_pca <layer>` runs the verifier at `residualization == "raw"` across all three probe configurations (axis, identity-within-axis, surface-form) and writes `probes/pca_leakage_verification.csv`.
 
-### 4.1 [MAJOR] — Contrast lists reference identities that do not exist (silently skipped)
+### 4.1 [MAJOR] — Contrast lists reference identities that do not exist (FIX LANDED 2026-05-27)
 
-**What's wrong:** The `CONTRASTS` list here is identical to [Step 7](07_analyze_identity_geometry.md)'s and contains the same nonexistent identity IDs — `ses_low_income`, `ses_high_socioeconomic_status` — that get silently filtered out. The diagnostics CSVs therefore have fewer rows for SES than expected.
-
-**Why it matters:** Any cross-residualization summary that says "mean AUC across SES contrasts" silently averages a smaller set than the code implies. After a dataset edit, the row count changes without anyone noticing.
-
-**Targeted fix:** Import the validated contrast registry from `status_mi/common.py` (per 5.10). Fail loudly at startup if any contrast identity is missing.
+**Status:** Same fix as [Step 7](07_analyze_identity_geometry.md#41-major--contrast-lists-reference-identities-that-do-not-exist-fix-landed-2026-05-27). This script's `CONTRASTS` literal is gone; `resolve_contrasts_from_registry(metadata, args.output_dir)` populates the module-level list at `main()` startup and writes `output_dir/contrasts/contrasts_skipped.csv`. The shared registry lives in `scripts/contrast_registry.py`. **No startup assertion** — partial-axis runs work and the skipped CSV preserves the audit trail. SES axis runs all 4 contrasts now.
 
 ### 5.9 [MINOR] — PCA on StandardScaler-ed activations changes the geometry
 

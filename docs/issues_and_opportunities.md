@@ -300,15 +300,21 @@ What to do: for headline results, restrict to `mapped_contrast_confidence == exa
 
 ## 4. Data construction and conceptual coverage
 
-### 4.1 [MAJOR] Contrast lists reference identities that do not exist — silently skipped
+### 4.1 [MAJOR] Contrast lists reference identities that do not exist (FIX LANDED 2026-05-27 for geometry/subspace/SAE/plots; BBQ side still pending)
 
-The `CONTRASTS` / `DEFAULT_CONTRASTS` lists in `analyze_identity_geometry.py`, `analyze_identity_geometry_diagnostics.py`, `analyze_shared_social_subspace.py`, and the plotting scripts include `ses_low_income` and `ses_high_socioeconomic_status`. The identity-forms CSV has no such IDs (its SES identities are `ses_low`, `ses_high`, `ses_poor`, `ses_rich`, `ses_middle_class`, `ses_wealthy`, `ses_working_class`, `ses_upper_class`, `ses_lower_class`, `ses_high_earning`, `ses_blue_collar`, `ses_white_collar`). Every analysis does `if identity_a not in identity_set: continue` — so `ses_low_income_vs_ses_rich` and `ses_low_income_vs_ses_high_socioeconomic_status` are **dropped with no error**. The SES axis quietly has fewer contrasts than the code implies.
+**Status:** Four commits closed the geometry/subspace/SAE/plot side. `prepare_bbq_for_steering.py:MANUAL_ALIASES` is separate and still has the same class of problem — it's tracked here as remaining work.
 
-`prepare_bbq_for_steering.py:MANUAL_ALIASES` similarly maps to non-existent IDs: `ses_low_income`, `age_old`, `age_nonold`, `nationality_asia_pacific`, `nationality_african`, `nationality_european`, and the `sexuality_*`/`appearance_obese` targets need an existence audit too. There is also **no `age` axis** in the dataset at all, so any BBQ Age handling via these aliases is dead.
+**What landed:**
+- `1e242c9` — new `scripts/contrast_registry.py` is the single source of truth. 21 canonical contrasts as 4-tuples (`contrast_name, identity_a, identity_b, axis`). Two typos fixed: `ses_low_income → ses_low`, `ses_high_socioeconomic_status → ses_high`. All 21 entries validate against `data/bbq_identity_normalized_forms.csv`. Module also exposes `KEY_CONTRAST_NAMES`, `SELECTED_CROSS_AXIS_ORDERINGS`, `load_validated_contrasts(...)`, `write_contrasts_skipped(...)`, `get_contrast_pairs(...)`, `filter_to_key_contrasts(...)`. **No startup assertion** — partial-axis runs work.
+- `398ffee` — `analyze_identity_geometry.py` + `analyze_identity_geometry_diagnostics.py` source `CONTRASTS` from the registry at `main()` startup and write `contrasts/contrasts_skipped.csv` with per-row `reason` annotations + warning per skipped pair.
+- `6eafb4d` — `analyze_shared_social_subspace.py` + `analyze_identity_sae_features.py` import `DEFAULT_CONTRASTS` (+ `KEY_CONTRASTS`, `SELECTED_CROSS_AXIS_ORDERINGS` in subspace). Local `load_contrasts(path, metadata, output_dir=...)` reworked to route through the registry validator and emit the skipped CSV.
+- `<plot-commit>` — `plot_identity_directional_followups.py` + `plot_identity_directional_visualizations.py` + `plot_identity_sae_features.py` import their `DEFAULT_CONTRASTS` / `KEY_CONTRASTS` from the registry. The followups script's `RESIDUALIZATION_COMPARISON_CONTRASTS` and `CENTROID_ORDERING_CONTRASTS` get the `ses_low_income_vs_ses_rich → ses_low_vs_ses_rich` rename so the paper-summary panel actually plots a real contrast.
 
-What to do:
-- Audit every identity ID referenced in every `CONTRASTS`/`ALIASES` constant against `bbq_identity_normalized_forms.csv`. Make a single shared, validated contrast registry.
-- Make the skip **loud**: log a warning (or fail) when a configured contrast/alias references a missing identity. Silent skips are how a paper ends up reporting "we analyzed 21 contrasts" when 19 ran.
+**Headline numerical effect:** SES axis now runs 4 contrasts (`ses_low_vs_ses_rich`, `ses_low_vs_ses_high`, `ses_lower_class_vs_ses_upper_class`, `ses_blue_collar_vs_ses_white_collar`) instead of the silently-2 from before. Any paper claim about "SES" coverage now matches the code's count.
+
+**Original audit (preserved):** The `CONTRASTS` / `DEFAULT_CONTRASTS` lists across six scripts included `ses_low_income` and `ses_high_socioeconomic_status`. The identity-forms CSV had no such IDs. Every analysis did `if identity_a not in identity_set: continue` — so the typo contrasts were dropped with no error, and the SES axis quietly had fewer contrasts than the code implied. `prepare_bbq_for_steering.py:MANUAL_ALIASES` similarly maps to non-existent IDs.
+
+**Remaining work — BBQ side:** `prepare_bbq_for_steering.py:MANUAL_ALIASES` still maps to non-existent IDs (`ses_low_income`, `age_old`, `age_nonold`, `nationality_asia_pacific`, `nationality_african`, `nationality_european`, plus a possible `sexuality_*` / `appearance_obese` audit). There is also no `age` axis in the dataset at all, so any BBQ Age handling via these aliases is dead. Fold these into the BBQ prepare-side fix (separate commit; conceptually distinct from the geometry contrast registry).
 
 ### 4.2 [MAJOR] Intersectional BBQ categories are flattened to a single axis
 

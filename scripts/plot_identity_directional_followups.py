@@ -67,50 +67,27 @@ METADATA_COLUMNS = [
     "family",
     "required_form",
 ]
-DEFAULT_CONTRASTS = [
-    ("race_black_vs_race_white", "race_black", "race_white", "race_ethnicity"),
-    ("race_black_vs_race_asian", "race_black", "race_asian", "race_ethnicity"),
-    ("race_black_vs_race_caucasian", "race_black", "race_caucasian", "race_ethnicity"),
-    ("sexuality_gay_vs_sexuality_straight", "sexuality_gay", "sexuality_straight", "sexual_orientation"),
-    ("sexuality_gay_vs_sexuality_heterosexual", "sexuality_gay", "sexuality_heterosexual", "sexual_orientation"),
-    ("sexuality_lesbian_vs_sexuality_straight", "sexuality_lesbian", "sexuality_straight", "sexual_orientation"),
-    ("sexuality_bisexual_vs_sexuality_straight", "sexuality_bisexual", "sexuality_straight", "sexual_orientation"),
-    ("disability_disabled_vs_disability_nondisabled", "disability_disabled", "disability_nondisabled", "disability_status"),
-    ("disability_disabled_vs_disability_able_bodied", "disability_disabled", "disability_able_bodied", "disability_status"),
-    ("appearance_short_vs_appearance_tall", "appearance_short", "appearance_tall", "physical_appearance"),
-    ("appearance_obese_vs_appearance_thin", "appearance_obese", "appearance_thin", "physical_appearance"),
-    ("appearance_poorly_dressed_vs_appearance_well_dressed", "appearance_poorly_dressed", "appearance_well_dressed", "physical_appearance"),
-    ("ses_low_income_vs_ses_rich", "ses_low_income", "ses_rich", "socioeconomic_status"),
-    ("ses_low_income_vs_ses_high_socioeconomic_status", "ses_low_income", "ses_high_socioeconomic_status", "socioeconomic_status"),
-    ("ses_lower_class_vs_ses_upper_class", "ses_lower_class", "ses_upper_class", "socioeconomic_status"),
-    ("ses_blue_collar_vs_ses_white_collar", "ses_blue_collar", "ses_white_collar", "socioeconomic_status"),
-    ("gender_transgender_vs_gender_cisgender", "gender_transgender", "gender_cisgender", "gender_identity"),
-    ("gender_transgender_man_vs_gender_cisgender_man", "gender_transgender_man", "gender_cisgender_man", "gender_identity"),
-    ("gender_transgender_woman_vs_gender_cisgender_woman", "gender_transgender_woman", "gender_cisgender_woman", "gender_identity"),
-    ("religion_muslim_vs_religion_christian", "religion_muslim", "religion_christian", "religion"),
-    ("religion_jewish_vs_religion_christian", "religion_jewish", "religion_christian", "religion"),
-]
-KEY_CONTRASTS = [
-    "sexuality_gay_vs_sexuality_straight",
-    "race_black_vs_race_white",
-    "gender_transgender_vs_gender_cisgender",
-    "appearance_obese_vs_appearance_thin",
-    "ses_low_income_vs_ses_rich",
-    "disability_disabled_vs_disability_able_bodied",
-]
+# Canonical contrast registry — see scripts/contrast_registry.py. Audit 4.1.
+# Note: KEY_CONTRASTS / RESIDUALIZATION_COMPARISON_CONTRASTS / CENTROID_ORDERING_CONTRASTS
+# below previously listed ses_low_income; the registry corrects it to ses_low.
+from contrast_registry import (
+    CONTRASTS as _REGISTRY_CONTRASTS,
+    KEY_CONTRAST_NAMES as KEY_CONTRASTS,
+)
+DEFAULT_CONTRASTS = _REGISTRY_CONTRASTS
 RESIDUALIZATION_COMPARISON_CONTRASTS = [
     "appearance_obese_vs_appearance_thin",
     "gender_transgender_vs_gender_cisgender",
     "sexuality_gay_vs_sexuality_straight",
     "race_black_vs_race_white",
-    "ses_low_income_vs_ses_rich",
+    "ses_low_vs_ses_rich",
 ]
 CENTROID_ORDERING_CONTRASTS = [
     "sexuality_gay_vs_sexuality_straight",
     "sexuality_bisexual_vs_sexuality_straight",
     "race_black_vs_race_white",
     "gender_transgender_vs_gender_cisgender",
-    "ses_low_income_vs_ses_rich",
+    "ses_low_vs_ses_rich",
     "ses_lower_class_vs_ses_upper_class",
     "appearance_obese_vs_appearance_thin",
     "appearance_short_vs_appearance_tall",
