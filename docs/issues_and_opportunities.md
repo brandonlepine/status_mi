@@ -220,18 +220,24 @@ Within-example *deltas* (intervened − base) cancel the length bias because len
 
 What to do: length-normalize (mean per-token logprob) for any argmax/accuracy metric, or score the answer letter (1.3) which has constant length and dissolves the problem.
 
-### 2.5 [MAJOR] Selection-induced bias ("winner's curse") in feature effect sizes
+### 2.5 [MAJOR] Selection-induced bias ("winner's curse") in feature effect sizes (PARTIAL FIX LANDED 2026-05-27)
 
-Two places:
+**Status:** Identity-prompt selectivity half closed in commit `4481445` (`scripts/analyze_identity_sae_features.py`). The BBQ half (`analyze_bbq_feature_level_causal_effects.py`) and the held-out confirmation-set work are still open.
 
-1. `analyze_identity_sae_features.py:feature_selectivity_for_contrast` filters to the top `5·top_n` features by `|diff_mean|`, *then* computes Cohen's d / AUC only on those, *then* keeps top `top_n` by `|d|`. Because `diff_mean` and `d` are highly correlated, the reported `d`/`auc` are conditioned on having survived a selection screen — inflated.
-2. `analyze_bbq_feature_level_causal_effects.py:make_rankings` ranks the top-100 features by effect and `final_intervention_candidates_table.html` sorts by `beneficial_score`; their CIs and q-values are computed on the *same* BBQ examples used to rank them.
+**What landed (identity-prompt selectivity half):**
+- The `|diff_mean|` prefilter is gone in both `feature_selectivity_for_contrast` (was 5·top_n) and `identity_selectivity` (was 3·top_n). Cohen's d and AUC are now computed analytically for every feature, then the top `top_n` is selected by `|d|`.
+- New helper `compute_cohens_d_and_auc_for_all_features` does this with closed-form formulas: Cohen's d from sum/sum_sq/count (sample variance, `ddof=1`), and AUC from a sparse 4-bucket decomposition (both-zero / a-only-nonzero / b-only-nonzero / both-nonzero). Vectorized helpers match the per-feature `roc_auc_score` + `common.cohens_d` reference to ~1e-16 across all four buckets on synthetic sparse data. Output schemas of `feature_selectivity.csv` and `feature_identity_selectivity.csv` unchanged.
+- Newly visible: features with consistent but small mean differences and tiny pooled SD (large standardized d) — the old prefilter silently discarded these.
+
+**Original audit (two places):**
+
+1. ~~`analyze_identity_sae_features.py:feature_selectivity_for_contrast` filters to the top `5·top_n` features by `|diff_mean|`, *then* computes Cohen's d / AUC only on those, *then* keeps top `top_n` by `|d|`. Because `diff_mean` and `d` are highly correlated, the reported `d`/`auc` are conditioned on having survived a selection screen — inflated.~~ **Closed 2026-05-27.**
+2. `analyze_bbq_feature_level_causal_effects.py:make_rankings` ranks the top-100 features by effect and `final_intervention_candidates_table.html` sorts by `beneficial_score`; their CIs and q-values are computed on the *same* BBQ examples used to rank them. **STILL OPEN.**
 
 Why it matters: the top features' effect sizes and significance are over-stated. A paper that says "feature 12345 reduces stereotype preference by Δ" with a CI computed post-selection is reporting a biased estimate.
 
-What to do:
-- Split BBQ examples into a **selection set** and a **confirmation set**. Rank/select features on the selection set; report effect sizes, CIs, and q-values **only** from the confirmation set. (BBQ is large enough; even a 50/50 split per axis works.)
-- For the identity-prompt selectivity screen, either compute `d`/`auc` for *all* features (it is cheap on sparse data) or explicitly frame the `|diff_mean|` filter as a screening stage and re-estimate effect sizes for kept features on held-out prompts.
+What to do (remaining):
+- Split BBQ examples into a **selection set** and a **confirmation set**. Rank/select features on the selection set; report effect sizes, CIs, and q-values **only** from the confirmation set. (BBQ is large enough; even a 50/50 split per axis works.) Same plumbing should be applied to the identity-prompt screen to add a holdout-set confirmation column to `feature_selectivity.csv`, bundled with audit 2.1's held-out reconstruction math.
 
 ### 2.6 [MAJOR] Multiplicity is inflated by the alpha × position grid
 
@@ -477,7 +483,7 @@ Ordered by what most threatens a defensible result.
 
 **Tier 2 — required for the numbers to be honest**
 
-7. Held-out split for feature selection vs. effect estimation (2.5).
+7. Held-out split for feature selection vs. effect estimation (2.5 — PARTIAL FIX LANDED 2026-05-27: identity-prompt selectivity half closed in commit `4481445`; BBQ-side rankings + held-out confirmation set still open).
 8. Null models for geometry probes and the shared-subspace spectrum (2.2).
 9. Make held-out (cross-family/cross-template) AUC the headline; demote in-sample AUC (2.1).
 10. Fix answer scoring: score the letter A/B/C, or length-normalize `answer_logprob` (1.3, 2.4).

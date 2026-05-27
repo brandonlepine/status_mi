@@ -32,7 +32,7 @@ The bridge from "geometric contrast directions" to "individual SAE features." Fo
 
 - Residualization (default `family_residualized`) is applied to the **activations** (`residualize()`, line 102): subtract per-family mean, add back the global mean. This affects the contrast `direction` and `evaluate_direction` scores — but the SAE encodings in `long_df` come from `encode_identity_saes.py`, which encoded **raw** activations. The two representations are mixed. See issue 5.4.
 - Contrast direction (`compute_direction`, line 121) is the unit-normalized centered `mean(A) − mean(B)`, sign-flipped so identity_a scores higher.
-- `feature_selectivity_for_contrast` (line 199): first filters to top `5 × top_n` features by `|diff_mean|`, then computes Cohen's d / AUC only on that subset, then keeps top `top_n` by `|d|`. This selection screen biases the reported `d`/`auc` upward. See issue 2.5.
+- `feature_selectivity_for_contrast` (line 199): computes Cohen's d and AUC analytically for **all** `n_features` via `compute_cohens_d_and_auc_for_all_features` (Cohen's d from sum/sum_sq/count using sample variance; AUC via the sparse 4-bucket decomposition), then ranks and keeps top `top_n` by `|d|`. The prior code prefiltered to `5 × top_n` by `|diff_mean|` before computing d/AUC, which biased the reported effect sizes upward. Audit 2.5 closed 2026-05-27.
 - `reconstruct_direction` (line 323) does `coeff = basis @ direction; recon = coeff @ basis` — i.e. `BᵀB d` with `B` having unit-norm but **not orthogonal** rows. This is not an orthogonal projection. See issue 5.1.
 - `combined_score` (line 481) sums three z-scored magnitudes: `|d|`, `|cos|`, `|auc − 0.5|`. Since `d` and `auc` measure the same A/B separation, this double-weights selectivity vs alignment. See issue 5.3.
 - Output CSVs are **appended** (`append_csv`) per layer/contrast, so the existing run requires `--overwrite` to rebuild cleanly.
@@ -53,13 +53,26 @@ The bridge from "geometric contrast directions" to "individual SAE features." Fo
 - For each held-out template family `f`: re-derive the contrast direction on non-`f` rows, re-rank features by Cohen's d / decoder alignment / combined score using the non-`f` direction, reconstruct using the new top-`k`, evaluate on `f`. Write `direction_reconstruction_holdout.csv` and a per-(contrast, method, k) summary.
 - The `random_baseline` selection method is direction-independent and gets the held-out treatment for free (just re-run the reconstruction on held-out rows).
 
-### 2.5 [MAJOR] — Selection-induced bias ("winner's curse") in feature effect sizes
+### 2.5 [MAJOR] — Selection-induced bias ("winner's curse") in feature effect sizes (FIX LANDED 2026-05-27)
 
-**What's wrong:** `feature_selectivity_for_contrast` filters to the top `5 · top_n` features by `|diff_mean|`, then computes Cohen's d and AUC only on that surviving subset, then re-ranks and keeps the top `top_n` by `|d|`. Because `diff_mean` and `d` are highly correlated, the reported `d`/`auc` are conditioned on having survived a selection screen and are inflated.
+**Status:** Closed in commit `4481445`. The `|diff_mean|` prefilter (5×top_n in `feature_selectivity_for_contrast`, 3×top_n in `identity_selectivity`) is gone — Cohen's d and AUC are now computed for every feature in closed form, then the ranking selects top `top_n`. The held-out-confirmation half (audit's option b) is still open and bundled with the 2.1 holdout decomposition.
 
-**Why it matters:** Every downstream "this feature has Cohen's d = X" number in `feature_selectivity.csv` (and the `combined_score` derived from it, and the triage thresholds keyed off `|d|`, and the steering pool) is a post-selection estimate without a confirmation set.
+**What landed:**
+- New helper `compute_cohens_d_and_auc_for_all_features(long_df, mask_a, mask_b, df_groups, prefix_a, prefix_b)` computes both metrics for every row of `df_groups` (i.e. every feature) without a screening prefilter.
+- Cohen's d is derived from `(sum, sum_sq, count)` per (feature, group) — sample variance with `ddof=1`, matching `common.cohens_d` to floating-point precision.
+- AUC uses a sparse 4-bucket decomposition that exploits the fact that `long_df` only holds positive activations:
+  - **B1 (both zero):** AUC = 0.5 (all pairs tie at 0).
+  - **B2 (a-only nonzeros):** AUC = `(k_a + 0.5·(n_a − k_a)) / n_a` (a's zeros tie b's zeros; a's nonzeros beat b's zeros).
+  - **B3 (b-only nonzeros):** AUC = `0.5·(n_b − k_b) / n_b` (a's zeros tie b's zeros; a's zeros lose to b's nonzeros).
+  - **B4 (both groups have nonzeros):** direct comparison of the (typically small) nonzero arrays plus the closed-form contributions from the three zero-pair buckets.
+- B1-B3 are fully vectorized; only B4 features (typically a small subset for identity-selective SAE features) loop. `summarize_feature_groups` was extended to also return `sum_sq_{prefix}` so variance is derivable per feature.
+- `feature_selectivity_for_contrast` and `identity_selectivity` were both refactored to use the helper. Output schemas (`feature_selectivity.csv`, `feature_identity_selectivity.csv`) are unchanged.
 
-**Targeted fix:** Either (a) compute `d`/`auc` for **all** features (cheap on sparse `long_df`) or (b) split prompts into a selection set and a confirmation set per identity pair, screen on the first and report effect sizes on the second. At minimum, drop the `5 · top_n` `|diff_mean|` prefilter — the cost of computing AUC on `n_features` is tractable. Reflect this in `feature_selectivity.csv` schema by labeling current columns as "screening-set" and adding "holdout" columns.
+**Validation:** Synthetic sparse data covering all four AUC buckets — vectorized helpers match the per-feature reference loop (`sklearn.roc_auc_score` + `common.cohens_d`) to ~1e-16. Hidden low-variance high-d features (e.g. `diff_mean = 0.005` with tiny pooled SD) now surface at the top of the ranking; under the old prefilter they were silently discarded.
+
+**Remaining (folded into 2.1 / 2.5 held-out work):** Split prompts into a selection set and a confirmation set per contrast; report selected features' effect sizes on the held-out half, not the screening half. This is the proper winner's-curse correction and shares its plumbing with the held-out reconstruction math (audit 2.1).
+
+**Original audit (preserved):** `feature_selectivity_for_contrast` filtered to the top `5 · top_n` features by `|diff_mean|`, then computed Cohen's d and AUC only on that surviving subset, then re-ranked and kept the top `top_n` by `|d|`. Because `diff_mean` and `d` are highly correlated, the reported `d`/`auc` were conditioned on having survived a selection screen and inflated. Every downstream "this feature has Cohen's d = X" number — in `feature_selectivity.csv`, in the `combined_score` derived from it, in the triage thresholds keyed off `|d|`, and in the steering pool — was a post-selection estimate without a confirmation set.
 
 ### 5.1 [MAJOR] — Direction reconstruction treats decoder rows as an orthonormal basis
 
@@ -108,7 +121,7 @@ Add the chosen mode to `run_config.json` and assert downstream.
 
 - [ ] Audit `DEFAULT_CONTRASTS` (lines 22-44) against `bbq_identity_normalized_forms.csv`. Drop or rename `ses_low_income`, `ses_high_socioeconomic_status`; replace with `ses_low_income → ses_low` or `ses_poor`, and add the contrasts that should have been there. Tie this to the shared registry (5.10).
 - [ ] Decide on a single representation: residualize end-to-end (re-encode through SAE on residualized activations) **or** keep everything raw. Document in `run_config.json`. (5.4)
-- [ ] Replace `feature_selectivity_for_contrast`'s `|diff_mean|` prefilter with full computation, or split prompts into selection/confirmation halves and add holdout columns. (2.5)
+- [x] Replace `feature_selectivity_for_contrast`'s `|diff_mean|` prefilter with full computation. (2.5) *(Done 2026-05-27: commit `4481445` — analytical d/AUC for all features; identity_selectivity also fixed.)* **Still open:** holdout-set confirmation columns, bundled with 2.1 winner's-curse correction.
 - [ ] Replace `reconstruct_direction` with a proper least-squares projection (`np.linalg.lstsq` or QR). Re-derive `fraction_norm_captured` as the normalized squared norm. (5.1)
 - [ ] Rebalance `combined_score`: use one of `|d|`/`|auc-0.5|` plus `|cos|` with a documented weighting. (5.3)
 - [x] Extract canonical SAE intervention primitives into a shared module so `run_bbq_sae_steering.py` can consume them. (3.1) *(Done 2026-05-27: torch primitives in `scripts/encode_identity_saes.py`, commits `11d4a4d` + `84c87b5`.)*
