@@ -61,7 +61,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sae_dir", type=Path, default=DEFAULT_SAE_DIR)
     parser.add_argument("--output_dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--layers", default="24")
-    parser.add_argument("--activation_mode", default="final_token", choices=["final_token", "token_span"])
+    parser.add_argument(
+        "--activation_mode",
+        default="final_token",
+        choices=["final_token", "identity_span_last", "identity_span_mean"],
+        help=(
+            "Mirrors --token_mode in extract_identity_activations.py (audit 1.1). "
+            "Purely informational — this script encodes whatever (n_prompts, hidden_dim) "
+            "array the upstream Step 4 produced, regardless of the locus. The label is "
+            "recorded in run_config.json for the audit trail."
+        ),
+    )
     parser.add_argument("--batch_size", type=int, default=2048)
     parser.add_argument("--top_k_save", type=int, default=64)
     parser.add_argument("--save_dense_top_features", action="store_true")
@@ -449,8 +459,6 @@ def maybe_save_dense_top_features(layer_dir: Path, indices: np.ndarray, values: 
 
 def main() -> None:
     args = parse_args()
-    if args.activation_mode != "final_token":
-        raise NotImplementedError("token_span mode is scaffolded for later work; final_token mode is implemented first.")
     if args.device == "cuda" and not torch.cuda.is_available():
         print("CUDA requested but unavailable; falling back to CPU.")
         args.device = "cpu"
