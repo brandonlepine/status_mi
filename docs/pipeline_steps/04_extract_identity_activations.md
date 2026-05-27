@@ -72,16 +72,19 @@ Rerun this whenever `data/mi_identity_prompts.csv` regenerates (e.g., after a te
 - Run Stage 2 (geometry) on each and compare contrast AUC, probe accuracy, and shared-subspace spectrum across modes.
 - Pick the locus that carries signal, justify it, and report the comparison itself as a finding in the methods writeup.
 
-### 1.5 [MINOR] — Activations are bf16-precision stored as float32
+### 1.5 [MINOR] — Activations are bf16-precision stored as float32 (PARTIAL FIX LANDED 2026-05-27)
 
-**What's wrong:** The model runs in bf16 on GPU, and `final_hidden.detach().float()` upcasts to fp32 *before* the memmap write. So the storage dtype is fp32 but the actual significant precision is bf16 (≈3 decimal digits). The fp32 size is paid on disk and in downstream RAM without any precision benefit.
+**What landed:**
+- New `--store_dtype {fp32, fp16}` flag. `fp32` is the default (zero behavior change). `fp16` halves disk vs. fp32 but may lose precision on Llama's outlier "rogue" residual dimensions; the help text documents the tradeoff.
+- `run_config.json` now records `forward_dtype` and `storage_dtype` separately so the asymmetry is explicit. The legacy `dtype` field is preserved for any downstream readers that already consume it.
 
-**Why it matters:** Mean-difference contrast directions average the noise away, but per-prompt projections, per-prompt SAE top-k encodings, and individual cosines inherit bf16 noise. Reproducibility tables in the paper should state this; small numerical differences across runs/hardware will follow from the bf16 forward.
+**Remaining work:** flip the default to `bf16` storage once the necessary multi-script coordination is in. Tracked in [GH issue #1](https://github.com/brandonlepine/status_mi/issues/1) — that issue covers:
 
-**Targeted fix:**
-- Disclose in the reproducibility section: "Activations computed in bf16, stored as fp32." Add the dtype to `run_config.json` (already present) and reference it from the methods text.
-- Optional: add `--store_dtype {fp32, fp16, bf16}` and use fp16 for storage to halve disk usage with no precision loss vs. the current setup.
-- For the final headline run, if VRAM allows, run the forward in fp32 and store fp32 — eliminates the asymmetry entirely. Otherwise note it and move on.
+1. Adding `bf16` as a third `--store_dtype` choice via a `uint16`-view save format (numpy has no native bf16 dtype).
+2. Coordinating [Step 5](05_encode_identity_saes.md) to decode the bf16-via-uint16 format.
+3. Flipping the default to `bf16` once the round-trip is verified on RunPod.
+
+**Original audit:** The model runs in bf16 on GPU, and `final_hidden.detach().float()` upcasts to fp32 before the memmap write. So the storage dtype was fp32 but the actual significant precision was bf16 (≈3 decimal digits). The fp32 size was paid on disk and in downstream RAM without any precision benefit. Mean-difference contrast directions average the noise away, but per-prompt projections, per-prompt SAE top-k encodings, and individual cosines inherit bf16 noise — worth disclosing in the reproducibility section regardless.
 
 ## Rebuild checklist
 - [x] Implement `--token_mode` with three options and the span pre-pass. (Done.)
@@ -93,6 +96,6 @@ Rerun this whenever `data/mi_identity_prompts.csv` regenerates (e.g., after a te
 - [ ] Disclose bf16 forward / fp32 storage in `run_config.json` (already there) and propagate to the methods write-up.
 
 ## Notes from the doc audit
-- The script asserts right-padding implicitly via `tokenizer.padding_side = "right"` but never re-asserts that the eventual `encoded["attention_mask"]` rows are right-padded. If a custom tokenizer subclass overrode that, the final-token index would silently be wrong. A defensive check (e.g. `assert attention_mask[:, 0].all()` for every batch) would catch a future regression.
-- `outputs.hidden_states` is requested twice: once via `from_pretrained(..., output_hidden_states=True)` and again on the forward call. Harmless but redundant.
-- The `--max_length 128` default is fine for the current template corpus but should be re-checked if longer templates are added in the future.
+- ~~Right-padding never re-asserted in the loop.~~ **Fixed:** the inference loop now `assert attention_mask[:, 0].all()` per batch, so a future tokenizer override that flipped padding_side fails loudly.
+- ~~`outputs.hidden_states` requested twice (`from_pretrained` and per-call).~~ **Fixed:** removed the redundant `output_hidden_states=True` from `from_pretrained`; the per-forward call still passes it explicitly.
+- ~~`--max_length 128` truncates silently.~~ **Fixed:** `warn_if_truncation_will_occur` runs a one-time CPU-only length pre-pass at script start and prints a WARNING with counts, percentiles, and the longest-truncated `prompt_id`s if any prompt exceeds `--max_length`. The pre-pass summary (`n_truncated`, `token_length_p99`, etc.) is also written to `run_config.json["length_pre_pass"]` for the audit trail.

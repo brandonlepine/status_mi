@@ -46,6 +46,16 @@ DEFAULT_TOKEN_MODE = "final_token"
 DEFAULT_OUTPUT_DIR = DEFAULT_OUTPUT_BASE / f"identity_prompts_{DEFAULT_TOKEN_MODE}"
 CHECKPOINT_FILENAME = "checkpoint.json"
 
+STORE_DTYPE_CHOICES = ("fp32", "fp16")
+DEFAULT_STORE_DTYPE = "fp32"
+NUMPY_DTYPE_BY_NAME = {
+    "fp32": np.float32,
+    "fp16": np.float16,
+    # 'bf16' storage is a planned follow-up; numpy has no native bf16 so it
+    # requires a uint16-view save format + a coordinated Step 5 decoder.
+    # Tracked in the GitHub issue accompanying this change.
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -72,6 +82,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--max_length", type=int, default=128)
+    parser.add_argument(
+        "--store_dtype",
+        choices=STORE_DTYPE_CHOICES,
+        default=DEFAULT_STORE_DTYPE,
+        help=(
+            "Storage dtype for the saved layer_XX.npy memmaps. fp32 preserves "
+            "legacy behavior. fp16 halves disk usage; values are downcast at "
+            "save time (Llama residuals may have outlier dimensions that "
+            "approach the fp16 dynamic-range limit, ~65k). The forward dtype "
+            "is chosen separately by choose_torch_dtype() and recorded as "
+            "forward_dtype in run_config.json."
+        ),
+    )
     parser.add_argument(
         "--limit",
         type=int,
@@ -255,6 +278,66 @@ def load_prompts(input_csv: Path, limit: int | None) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
+def warn_if_truncation_will_occur(
+    df: pd.DataFrame,
+    tokenizer: AutoTokenizer,
+    max_length: int,
+) -> dict[str, object]:
+    """One-time CPU-only length pre-pass.
+
+    Tokenize every prompt without truncation, compute the token-length
+    distribution, and warn loudly if any prompt exceeds --max_length. Returns
+    a small dict suitable for embedding in run_config.json so downstream
+    consumers know whether truncation was active.
+    """
+    prompts = df["prompt"].astype(str).tolist()
+    # Avoid forcing a tensor return; we just want list-of-list-of-int.
+    encoded = tokenizer(prompts, truncation=False, padding=False, add_special_tokens=True)
+    lengths = [len(ids) for ids in encoded["input_ids"]]
+    arr = np.asarray(lengths, dtype=np.int64)
+    n_truncated = int((arr > max_length).sum())
+
+    summary: dict[str, object] = {
+        "max_length": max_length,
+        "n_prompts": int(arr.size),
+        "n_truncated": n_truncated,
+        "token_length_min": int(arr.min()),
+        "token_length_max": int(arr.max()),
+        "token_length_mean": float(arr.mean()),
+        "token_length_p50": float(np.percentile(arr, 50)),
+        "token_length_p95": float(np.percentile(arr, 95)),
+        "token_length_p99": float(np.percentile(arr, 99)),
+    }
+
+    if n_truncated == 0:
+        print(
+            f"Length pre-pass: 0 / {arr.size:,} prompts exceed --max_length={max_length} "
+            f"(max observed = {arr.max()}). No truncation will occur."
+        )
+        return summary
+
+    examples = (
+        df.assign(_len=arr)
+        .loc[arr > max_length, ["prompt_id", "_len", "prompt"]]
+        .nlargest(5, "_len")
+        .to_dict("records")
+    )
+    bullet = "\n".join(
+        f"      - prompt_id={r['prompt_id']!r}  tokens={r['_len']}  prompt={r['prompt'][:80]!r}{'...' if len(r['prompt']) > 80 else ''}"
+        for r in examples
+    )
+    print(
+        f"WARNING: {n_truncated:,} / {arr.size:,} prompts exceed --max_length={max_length} "
+        f"and will be truncated by the tokenizer.\n"
+        f"  token_length percentiles: min={arr.min()} p50={summary['token_length_p50']:.0f} "
+        f"p95={summary['token_length_p95']:.0f} p99={summary['token_length_p99']:.0f} max={arr.max()}\n"
+        f"  longest 5 truncated prompts:\n{bullet}\n"
+        f"  Either raise --max_length to >= {arr.max()} or accept the truncation; the run will proceed."
+    )
+    summary["truncated_prompt_ids_top5"] = [r["prompt_id"] for r in examples]
+    return summary
+
+
 def precompute_span_locations(
     df: pd.DataFrame,
     tokenizer: AutoTokenizer,
@@ -395,6 +478,7 @@ def extract_final_token_activations(
     output_dir: Path,
     batch_size: int,
     max_length: int,
+    storage_np_dtype: type,
     resume: bool,
 ) -> tuple[int, int]:
     prompts = df["prompt"].astype(str).tolist()
@@ -460,6 +544,13 @@ def extract_final_token_activations(
                 encoded.pop("offset_mapping")
             encoded = {key: value.to(input_device) for key, value in encoded.items()}
             attention_mask = encoded["attention_mask"]
+            # Right-padding invariant: final_idx = attention_mask.sum(-1) - 1
+            # only works if every row's first position is a content token.
+            # Catches a future tokenizer override that flipped padding_side.
+            assert attention_mask[:, 0].all(), (
+                "Tokenizer batch is not right-padded — attention_mask[:, 0] has zeros. "
+                "Final-token / span-token gathers depend on right-padding."
+            )
 
             outputs = model(
                 **encoded,
@@ -490,7 +581,7 @@ def extract_final_token_activations(
                     arr = np.lib.format.open_memmap(
                         layer_path,
                         mode=mode,
-                        dtype=np.float32,
+                        dtype=storage_np_dtype,
                         shape=(num_prompts, hidden_dim),
                     )
                     layer_arrays.append(arr)
@@ -525,8 +616,11 @@ def extract_final_token_activations(
                     hidden_state, token_mode, final_idx, span_gather, span_mask
                 )
 
+                # Explicit cast to storage dtype catches overflow/precision-loss
+                # at write time rather than silently on memmap assignment.
                 layer_arrays[layer_idx][start:end, :] = (
                     final_hidden.detach().float().cpu().numpy()
+                    .astype(storage_np_dtype, copy=False)
                 )
 
             rows_written = end
@@ -585,6 +679,8 @@ def main() -> None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
+    length_summary = warn_if_truncation_will_occur(df, tokenizer, args.max_length)
+
     span_df: pd.DataFrame | None = None
     if args.token_mode != "final_token":
         print(f"Token mode '{args.token_mode}': pre-locating identity spans for {len(df):,} prompts...")
@@ -604,10 +700,10 @@ def main() -> None:
         args.model_path,
         torch_dtype=torch_dtype,
         device_map="auto",
-        output_hidden_states=True,
     )
     model.eval()
 
+    storage_np_dtype = NUMPY_DTYPE_BY_NAME[args.store_dtype]
     num_layers_saved, hidden_dim = extract_final_token_activations(
         df=df,
         span_df=span_df,
@@ -617,6 +713,7 @@ def main() -> None:
         output_dir=output_dir,
         batch_size=args.batch_size,
         max_length=args.max_length,
+        storage_np_dtype=storage_np_dtype,
         resume=args.resume,
     )
 
@@ -624,6 +721,7 @@ def main() -> None:
 
     assert len(df) == len(pd.read_csv(metadata_path, keep_default_na=False))
 
+    forward_dtype_label = str(torch_dtype).replace("torch.", "")
     run_config = {
         "model_path": str(args.model_path),
         "input_csv": str(args.input_csv),
@@ -634,7 +732,15 @@ def main() -> None:
         "num_prompts": len(df),
         "num_layers_saved": num_layers_saved,
         "hidden_dim": hidden_dim,
-        "dtype": str(torch_dtype).replace("torch.", ""),
+        # The script's forward pass uses `forward_dtype`; storage uses
+        # `storage_dtype`. Prior to commit-XYZ these were always (bf16, fp32),
+        # producing fp32-sized files with only bf16-precision content. The
+        # legacy `dtype` field is kept for backward compatibility with any
+        # downstream code that already reads it.
+        "forward_dtype": forward_dtype_label,
+        "storage_dtype": args.store_dtype,
+        "dtype": forward_dtype_label,
+        "length_pre_pass": length_summary,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 

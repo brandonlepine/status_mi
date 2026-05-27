@@ -130,9 +130,20 @@ For the proper feature-level intervention in `run_bbq_sae_steering.py` (issue 3.
 
 Per-layer constants must be loaded from each layer's `hyperparameters.json` — `dataset_average_activation_norm` and `jump_relu_threshold` vary by layer; do not hardcode the L24 numbers.
 
-### 1.5 [MINOR] Activations are bf16-precision stored as float32
+### 1.5 [MINOR] Activations are bf16-precision stored as float32 (PARTIAL FIX LANDED 2026-05-27; GH #1 tracks remainder)
 
-`extract_identity_activations.py` runs the model in bf16, then casts the final hidden state to float32 for storage. Stored values therefore carry ~bf16 precision (~3 significant digits). Mean-difference directions average this away, but per-prompt projections, per-prompt SAE encodings, and individual cosines inherit the noise. Note it in the reproducibility section; consider fp32 (or fp16) extraction for the final run if VRAM allows.
+**Status:** Disclosure landed. The default still stores fp32 (no breaking change). `bf16` storage is the right end-state but requires a coordinated multi-script change tracked in [GH issue #1](https://github.com/brandonlepine/status_mi/issues/1).
+
+**What landed in `extract_identity_activations.py`:**
+- New `--store_dtype {fp32, fp16}` flag. `fp32` default. `fp16` halves disk vs. fp32 but may lose precision on Llama's outlier residual dimensions; the help text documents the tradeoff.
+- `run_config.json` records `forward_dtype` and `storage_dtype` separately so the asymmetry is no longer hidden.
+
+**Also landed alongside (per-batch defensive checks the original audit's Notes section flagged):**
+- Right-padding is now asserted per batch (`assert attention_mask[:, 0].all()`), so a future tokenizer override that flipped `padding_side` fails loudly instead of producing silently-wrong `final_idx` gathers.
+- The redundant `output_hidden_states=True` on `AutoModelForCausalLM.from_pretrained` is gone; the per-forward call still passes it explicitly.
+- A one-time CPU-only length pre-pass (`warn_if_truncation_will_occur`) prints a WARNING with counts + percentiles + offending `prompt_id`s if any prompt exceeds `--max_length`. The summary is also written to `run_config.json["length_pre_pass"]`. The run still proceeds — the audit's "explicit message" requirement is met without forcing a re-run.
+
+**Original audit:** `extract_identity_activations.py` runs the model in bf16, then casts the final hidden state to float32 for storage. Stored values therefore carry ~bf16 precision (~3 significant digits). Mean-difference directions average this away, but per-prompt projections, per-prompt SAE encodings, and individual cosines inherit the noise.
 
 ---
 
