@@ -27,6 +27,41 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 from sklearn.model_selection import GroupKFold
 from sklearn.preprocessing import StandardScaler
+
+
+SCALING_MODES = ("standardize", "center_only")
+DEFAULT_SCALING = "center_only"
+
+
+class CenterOnlyScaler:
+    """Drop-in replacement for sklearn StandardScaler that subtracts the
+    per-dim mean only (no z-scoring). See `make_scaler` and audit 5.9."""
+    def __init__(self) -> None:
+        self.mean_: np.ndarray | None = None
+
+    def fit(self, x: np.ndarray) -> "CenterOnlyScaler":
+        self.mean_ = x.mean(axis=0, keepdims=True)
+        return self
+
+    def transform(self, x: np.ndarray) -> np.ndarray:
+        if self.mean_ is None:
+            raise RuntimeError("CenterOnlyScaler.transform called before fit.")
+        return x - self.mean_
+
+    def fit_transform(self, x: np.ndarray) -> np.ndarray:
+        return self.fit(x).transform(x)
+
+
+def make_scaler(mode: str):
+    """Factory for the --scaling flag. Audit 5.9: 'center_only' preserves
+    the activation-space variance structure (rogue / high-norm dimensions);
+    'standardize' z-scores per dim — legacy behavior — and was shown by the
+    audit to upweight low-variance dimensions."""
+    if mode == "standardize":
+        return StandardScaler()
+    if mode == "center_only":
+        return CenterOnlyScaler()
+    raise ValueError(f"Unknown scaling mode: {mode!r}; expected one of {SCALING_MODES}.")
 from tqdm.auto import tqdm
 
 try:
@@ -174,6 +209,17 @@ def parse_args() -> argparse.Namespace:
         help="RNG seed for the permutation null. Defaults to --random_seed.",
     )
     parser.add_argument(
+        "--scaling",
+        choices=SCALING_MODES,
+        default=DEFAULT_SCALING,
+        help=(
+            "Pre-PCA scaling (audit 5.9). 'center_only' subtracts per-dim mean "
+            "only — preserves the activation-space variance structure including "
+            "rogue / high-norm dimensions, so explained_variance_ratio describes "
+            "activation space. 'standardize' z-scores per dim (legacy)."
+        ),
+    )
+    parser.add_argument(
         "--verify_fold_internal_pca",
         type=int,
         default=None,
@@ -233,6 +279,7 @@ def run_fold_internal_pca_verification_diag(
             solver=args.solver,
             max_iter=args.max_iter,
             n_jobs=args.n_jobs,
+            scaling=args.scaling,
         )
         if global_row and verification:
             rows.append(_pair_global_and_fold_internal_diag(global_row, verification))
@@ -261,6 +308,7 @@ def run_fold_internal_pca_verification_diag(
             solver=args.solver,
             max_iter=args.max_iter,
             n_jobs=args.n_jobs,
+            scaling=args.scaling,
         )
         if global_row and verification:
             rows.append(_pair_global_and_fold_internal_diag(global_row, verification, axis=axis_name))
@@ -285,6 +333,7 @@ def run_fold_internal_pca_verification_diag(
             solver=args.solver,
             max_iter=args.max_iter,
             n_jobs=args.n_jobs,
+            scaling=args.scaling,
         )
         if global_row and verification:
             rows.append(_pair_global_and_fold_internal_diag(global_row, verification))
@@ -514,11 +563,12 @@ def run_pca(
     output_dir: Path,
     pca_components: int,
     random_seed: int,
+    scaling: str = DEFAULT_SCALING,
 ) -> pd.DataFrame:
     n_components = min(pca_components, x.shape[0] - 1, x.shape[1])
     if n_components < 1:
         raise ValueError("Need at least two rows for PCA.")
-    x_scaled = StandardScaler().fit_transform(x)
+    x_scaled = make_scaler(scaling).fit_transform(x)
     total_variance = float(np.var(x_scaled, axis=0).sum())
     if total_variance <= 0 or not np.isfinite(total_variance):
         pcs = np.zeros((len(x), n_components), dtype=np.float32)
@@ -555,6 +605,7 @@ def make_probe_features(
     probe_pca_dim: int,
     random_seed: int,
     label: str,
+    scaling: str = DEFAULT_SCALING,
 ) -> np.ndarray | None:
     """Build probe features by fitting StandardScaler + randomized PCA once on
     the full layer/residualization.
@@ -576,7 +627,7 @@ def make_probe_features(
     if float(np.var(x, axis=0).sum()) <= 0:
         print(f"Skipping probes for {label}: zero variance.")
         return None
-    x_scaled = StandardScaler().fit_transform(x)
+    x_scaled = make_scaler(scaling).fit_transform(x)
     n_components = min(probe_pca_dim, x_scaled.shape[0] - 1, x_scaled.shape[1])
     if probe_pca_dim and n_components >= 1 and n_components < x_scaled.shape[1]:
         with warnings.catch_warnings():
@@ -602,10 +653,10 @@ def crossval_probe_fold_internal_pca_diag(
     solver: str,
     max_iter: int,
     n_jobs: int,
+    scaling: str = DEFAULT_SCALING,
 ) -> dict[str, object] | None:
-    """Audit-2.8 verifier (diagnostics flavor). Fits StandardScaler + PCA
-    inside each CV fold on the train rows only. Mirrors `crossval_probe`'s
-    LogisticRegression configuration so the comparison is apples-to-apples.
+    """Audit-2.8 verifier (diagnostics flavor). Fits scaler + PCA inside each
+    CV fold on the train rows only. The scaler honors --scaling (audit 5.9).
     """
     y = y.reset_index(drop=True)
     groups = groups.reset_index(drop=True)
@@ -630,7 +681,7 @@ def crossval_probe_fold_internal_pca_diag(
                 continue
             x_tr_raw = x_raw[train_idx]
             x_te_raw = x_raw[test_idx]
-            scaler = StandardScaler().fit(x_tr_raw)
+            scaler = make_scaler(scaling).fit(x_tr_raw)
             x_tr = scaler.transform(x_tr_raw)
             x_te = scaler.transform(x_te_raw)
             if not np.isfinite(x_tr).all() or not np.isfinite(x_te).all():
@@ -1531,6 +1582,8 @@ def write_run_config(args: argparse.Namespace, layers: list[int], metadata: pd.D
         "make_umap": args.make_umap,
         "resume": args.resume,
         "random_seed": args.random_seed,
+        "scaling": args.scaling,
+        "n_permutations": args.n_permutations,
         "num_rows": len(metadata),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
@@ -1752,14 +1805,16 @@ def main() -> None:
                         pca_dir,
                         args.pca_components,
                         args.random_seed,
+                        scaling=args.scaling,
                     )
                 )
-                print(f"  PCA finished in {elapsed(start)}")
+                print(f"  PCA finished in {elapsed(start)} (scaling={args.scaling})")
 
             if not args.only_pca and not args.only_contrasts and not args.skip_probes:
                 start = time.perf_counter()
                 probe_features = make_probe_features(
-                    x, args.probe_pca_dim, args.random_seed, f"{residualization} layer {layer}"
+                    x, args.probe_pca_dim, args.random_seed, f"{residualization} layer {layer}",
+                    scaling=args.scaling,
                 )
                 if probe_features is not None:
                     axis_rows, identity_rows = run_identity_probes(

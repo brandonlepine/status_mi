@@ -398,9 +398,17 @@ The cleanest measurement of "how identity changes the model's answer" is a count
 
 SAEs are encoded/steered only at layer 24. The geometry diagnostics show identity structure evolving across layers 0/8/16/24/32. A single layer cannot tell you *where* identity-bias features live or whether the causal locus shifts. Download/encode SAEs for at least layers 16 and 32 and run the feature pipeline across them; "the causal layer" is itself a result.
 
-### 5.9 [MINOR] PCA on StandardScaler-ed activations changes the geometry
+### 5.9 [MINOR] PCA on StandardScaler-ed activations changes the geometry (FIX LANDED 2026-05-27)
+
+**Status:** Both geometry scripts now expose `--scaling {standardize, center_only}` with default `center_only`. The flag is plumbed through `run_pca`, `make_probe_features`, and the fold-internal-PCA verifier from audit 2.8, and recorded in `run_config.json`. A `CenterOnlyScaler` class is a drop-in replacement for `StandardScaler` (just subtracts per-dim mean), routed via a `make_scaler(mode)` factory at every call site.
+
+**Empirical effect:** unit-tested on synthetic data with a 10× rogue dimension — `center_only` PCA gives PC1 = 92.6% explained variance (rogue dim dominates, faithful to activation-space geometry); `standardize` PCA gives PC1 = 15.7% (z-scoring spreads variance evenly and hides the rogue dim). The two modes describe different geometries.
+
+**Original audit (preserved):**
 
 `run_pca`/`make_probe_features` apply `StandardScaler` (per-dimension z-scoring) before PCA. Residual-stream dimensions have meaningful, unequal scale (rogue/high-norm dimensions carry real signal); z-scoring upweights low-variance dimensions, and the resulting explained-variance ratios describe *standardized* space, not activation space. This is defensible for visualization but should be stated, and ideally compared against centered-only (no scaling) PCA. For probes the choice matters less (logistic regression is scale-tolerant) but be consistent and explicit.
+
+**Optional follow-up:** run with both `--scaling center_only` and `--scaling standardize` once on RunPod, confirm the cross-residualization conclusions (η², probe AUC, contrast AUC) are stable under both, and document the stability in the methods writeup.
 
 ### 5.10 [MINOR] Heavy code duplication across analysis scripts
 

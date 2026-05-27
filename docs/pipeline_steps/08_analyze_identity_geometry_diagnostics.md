@@ -79,13 +79,11 @@ Same design and same fix as [Step 7](07_analyze_identity_geometry.md#28-minor--p
 
 **Status:** Same fix as [Step 7](07_analyze_identity_geometry.md#41-major--contrast-lists-reference-identities-that-do-not-exist-fix-landed-2026-05-27). This script's `CONTRASTS` literal is gone; `resolve_contrasts_from_registry(metadata, args.output_dir)` populates the module-level list at `main()` startup and writes `output_dir/contrasts/contrasts_skipped.csv`. The shared registry lives in `scripts/contrast_registry.py`. **No startup assertion** — partial-axis runs work and the skipped CSV preserves the audit trail. SES axis runs all 4 contrasts now.
 
-### 5.9 [MINOR] — PCA on StandardScaler-ed activations changes the geometry
+### 5.9 [MINOR] — PCA on StandardScaler-ed activations changes the geometry (FIX LANDED 2026-05-27)
 
-**What's wrong:** Same as in [Step 7](07_analyze_identity_geometry.md): `StandardScaler` before `PCA` for both `pca_residualized/...` outputs and `make_probe_features`.
+**Status:** Same fix shape as [Step 7](07_analyze_identity_geometry.md#59-minor--pca-on-standardscaler-ed-activations-changes-the-geometry-fix-landed-2026-05-27). The diagnostics script now exposes `--scaling {standardize, center_only}` (default `center_only`) and threads it through `run_pca`, `make_probe_features`, and `crossval_probe_fold_internal_pca_diag`. Recorded in `run_config.json`. `CenterOnlyScaler` + `make_scaler` factory live at the top of the script.
 
-**Why it matters:** Explained-variance ratios describe standardized space; comparing them across residualizations is still meaningful, but absolute values should be stated as "post-z-score."
-
-**Targeted fix:** Add `--scaling {standardize, center_only}` and record in `run_config.json`. Show that residualization conclusions are stable under both.
+**Remaining tightening (optional):** Run with both `--scaling center_only` and `--scaling standardize` once on RunPod and confirm the cross-residualization conclusions (η², probe AUC, contrast AUC) are stable under both. The audit recommends documenting this stability explicitly in the methods writeup.
 
 ### 5.10 [MINOR] — Heavy code duplication across analysis scripts
 

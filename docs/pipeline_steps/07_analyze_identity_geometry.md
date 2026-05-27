@@ -84,13 +84,18 @@ First-pass characterization of identity geometry from the final-token residual s
 
 **Original audit (preserved):** `CONTRASTS` included pairs whose identity IDs were not in `bbq_identity_normalized_forms.csv`. Concretely, `ses_low_income` and `ses_high_socioeconomic_status` did not exist; the dataset's SES identities are `ses_low`, `ses_high`, `ses_poor`, `ses_rich`, `ses_lower_class`, etc. The loop ran `if identity_a not in identity_set or identity_b not in identity_set: continue` — these pairs were dropped with no warning. The SES axis ran with fewer contrasts than the code implied.
 
-### 5.9 [MINOR] — PCA on StandardScaler-ed activations changes the geometry
+### 5.9 [MINOR] — PCA on StandardScaler-ed activations changes the geometry (FIX LANDED 2026-05-27)
 
-**What's wrong:** `run_pca` and `make_probe_features` both apply `StandardScaler` (per-dim z-scoring) before PCA. Residual-stream dimensions carry meaningfully unequal scale (rogue / high-norm dimensions carry real signal); z-scoring upweights low-variance dimensions, so the resulting `explained_variance_ratio` describes standardized space, not activation space.
+**Status:** New `--scaling {standardize, center_only}` flag with default `center_only`. Applied at every `StandardScaler()` site in `run_pca`, `make_probe_features`, and `crossval_probe_fold_internal_pca` so a run is internally consistent. Recorded in `run_config.json` for the audit trail.
 
-**Why it matters:** Defensible for visualization, but should be stated and ideally compared with centered-only PCA. The probe choice matters less (logistic regression is scale-tolerant) but should be consistent and explicit.
+**What landed:**
+- New `CenterOnlyScaler` class (drop-in replacement for `StandardScaler`) and `make_scaler(mode)` factory at the top of the script. `center_only` subtracts the per-dim mean only; preserves the activation-space variance structure including rogue / high-norm dimensions.
+- `--scaling` flag default `center_only` (the audit-defensible default for PCA). `standardize` available for backwards-compatible runs or visualization comparisons.
+- Three call sites updated: `run_pca`, `make_probe_features`, `crossval_probe_fold_internal_pca`. All take `scaling=` and pipe it through.
 
-**Targeted fix:** Add a `--scaling {standardize, center_only}` flag; default to `center_only` for PCA, keep `standardize` available. Or write both variants and document the choice in `run_config.json`.
+**Empirical effect (unit-tested):** On synthetic data with a 10× rogue dimension, `center_only` PCA gives PC1 = 92.6% explained variance (the rogue dim dominates, as it should in activation space). `standardize` PCA gives PC1 = 15.7% (z-scoring distributes variance evenly across dims and effectively hides the rogue structure). The two modes describe different geometries.
+
+**Original audit (preserved):** `run_pca` and `make_probe_features` both applied `StandardScaler` (per-dim z-scoring) before PCA. Residual-stream dimensions carry meaningfully unequal scale (rogue / high-norm dimensions carry real signal); z-scoring upweighted low-variance dimensions, so the resulting `explained_variance_ratio` described standardized space, not activation space. Defensible for visualization but it should have been stated and ideally compared with centered-only PCA.
 
 ### 5.10 [MINOR] — Heavy code duplication across analysis scripts
 

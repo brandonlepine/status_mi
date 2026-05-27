@@ -18,6 +18,44 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 from sklearn.model_selection import GroupKFold
 from sklearn.preprocessing import StandardScaler
+
+
+SCALING_MODES = ("standardize", "center_only")
+DEFAULT_SCALING = "center_only"
+
+
+class CenterOnlyScaler:
+    """Drop-in replacement for sklearn StandardScaler that subtracts the
+    per-dim mean only (no z-scoring). Audit 5.9: Llama residual-stream
+    dimensions carry meaningfully unequal scale (rogue/high-norm dimensions
+    carry real signal); z-scoring upweights low-variance dimensions and
+    changes what `explained_variance_ratio` is measuring. center_only
+    preserves the activation-space variance structure, which is what
+    downstream PCA interpretation actually wants.
+    """
+    def __init__(self) -> None:
+        self.mean_: np.ndarray | None = None
+
+    def fit(self, x: np.ndarray) -> "CenterOnlyScaler":
+        self.mean_ = x.mean(axis=0, keepdims=True)
+        return self
+
+    def transform(self, x: np.ndarray) -> np.ndarray:
+        if self.mean_ is None:
+            raise RuntimeError("CenterOnlyScaler.transform called before fit.")
+        return x - self.mean_
+
+    def fit_transform(self, x: np.ndarray) -> np.ndarray:
+        return self.fit(x).transform(x)
+
+
+def make_scaler(mode: str):
+    """Factory for the --scaling flag. Audit 5.9."""
+    if mode == "standardize":
+        return StandardScaler()
+    if mode == "center_only":
+        return CenterOnlyScaler()
+    raise ValueError(f"Unknown scaling mode: {mode!r}; expected one of {SCALING_MODES}.")
 from tqdm.auto import tqdm
 
 
@@ -143,6 +181,19 @@ def parse_args() -> argparse.Namespace:
         help="RNG seed for the permutation null. Defaults to --random_seed.",
     )
     parser.add_argument(
+        "--scaling",
+        choices=SCALING_MODES,
+        default=DEFAULT_SCALING,
+        help=(
+            "Pre-PCA scaling (audit 5.9). 'center_only' subtracts per-dim mean only; "
+            "preserves the activation-space variance structure including rogue / "
+            "high-norm dimensions, so explained_variance_ratio describes activation "
+            "space. 'standardize' z-scores per dim — the legacy behavior — and was "
+            "shown by the audit to upweight low-variance dimensions. Applies to "
+            "both run_pca and make_probe_features so a run is internally consistent."
+        ),
+    )
+    parser.add_argument(
         "--verify_fold_internal_pca",
         type=int,
         default=None,
@@ -263,6 +314,7 @@ def run_pca(
     pca_components: int,
     max_pca_points: int | None,
     random_seed: int,
+    scaling: str = DEFAULT_SCALING,
 ) -> pd.DataFrame:
     indices = stratified_sample_indices(metadata, max_pca_points, random_seed)
     x_sample = x[indices]
@@ -270,7 +322,7 @@ def run_pca(
     if n_components < 1:
         raise ValueError("Need at least two rows to compute PCA.")
 
-    x_scaled = StandardScaler().fit_transform(x_sample)
+    x_scaled = make_scaler(scaling).fit_transform(x_sample)
     total_variance = float(np.var(x_scaled, axis=0).sum())
     if total_variance <= 0 or not np.isfinite(total_variance):
         pcs = np.zeros((len(x_sample), n_components), dtype=np.float32)
@@ -364,7 +416,8 @@ def run_means(
 
 
 def make_probe_features(
-    x: np.ndarray, probe_pca_dim: int, random_seed: int, layer: int
+    x: np.ndarray, probe_pca_dim: int, random_seed: int, layer: int,
+    scaling: str = DEFAULT_SCALING,
 ) -> np.ndarray | None:
     """Build fast probe features once per layer.
 
@@ -395,7 +448,7 @@ def make_probe_features(
         print(f"Skipping probes for layer {layer}: activations have zero variance.")
         return None
 
-    x_scaled = StandardScaler().fit_transform(x)
+    x_scaled = make_scaler(scaling).fit_transform(x)
     if not np.isfinite(x_scaled).all():
         print(f"Skipping probes for layer {layer}: scaled activations are non-finite.")
         return None
@@ -473,6 +526,7 @@ def crossval_probe_fold_internal_pca(
     random_seed: int,
     split_type: str,
     layer: int,
+    scaling: str = DEFAULT_SCALING,
 ) -> dict[str, float | int | str] | None:
     """Audit-2.8 verifier: same GroupKFold probe as `crossval_probe` but fits
     StandardScaler + PCA inside each fold on the train rows only.
@@ -504,7 +558,7 @@ def crossval_probe_fold_internal_pca(
                 continue
             x_tr_raw = x_raw[train_idx]
             x_te_raw = x_raw[test_idx]
-            scaler = StandardScaler().fit(x_tr_raw)
+            scaler = make_scaler(scaling).fit(x_tr_raw)
             x_tr = scaler.transform(x_tr_raw)
             x_te = scaler.transform(x_te_raw)
             if not np.isfinite(x_tr).all() or not np.isfinite(x_te).all():
@@ -655,8 +709,9 @@ def run_probes(
     random_seed: int,
     n_permutations: int = 0,
     null_rng_seed: int = 42,
+    scaling: str = DEFAULT_SCALING,
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
-    x_probe = make_probe_features(x, probe_pca_dim, random_seed, layer)
+    x_probe = make_probe_features(x, probe_pca_dim, random_seed, layer, scaling=scaling)
     if x_probe is None:
         return [], []
 
@@ -712,6 +767,7 @@ def run_fold_internal_pca_verification(
     identity_rows: list[dict[str, object]],
     probe_pca_dim: int,
     random_seed: int,
+    scaling: str = DEFAULT_SCALING,
 ) -> list[dict[str, object]]:
     """For the layer chosen by --verify_fold_internal_pca, re-run each probe
     configuration with StandardScaler + PCA fit inside each CV fold and pair
@@ -736,6 +792,7 @@ def run_fold_internal_pca_verification(
             random_seed=random_seed,
             split_type=split_name,
             layer=layer,
+            scaling=scaling,
         )
         if global_row is None or verification is None:
             continue
@@ -755,6 +812,7 @@ def run_fold_internal_pca_verification(
             random_seed=random_seed,
             split_type="group_by_template_id",
             layer=layer,
+            scaling=scaling,
         )
         if global_row is None or verification is None:
             continue
@@ -1005,6 +1063,8 @@ def write_run_config(
         "probe_pca_dim": args.probe_pca_dim,
         "skip_probes": args.skip_probes,
         "random_seed": args.random_seed,
+        "scaling": args.scaling,
+        "n_permutations": args.n_permutations,
         "num_rows": len(metadata),
         "hidden_dim": hidden_dim,
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -1046,7 +1106,7 @@ def main() -> None:
         x = load_layer(args.activation_dir, layer, len(metadata))
         hidden_dim = x.shape[1]
 
-        print("  PCA")
+        print(f"  PCA (scaling={args.scaling})")
         pca_evr_rows.append(
             run_pca(
                 x=x,
@@ -1056,6 +1116,7 @@ def main() -> None:
                 pca_components=args.pca_components,
                 max_pca_points=args.max_pca_points,
                 random_seed=args.random_seed,
+                scaling=args.scaling,
             )
         )
 
@@ -1065,7 +1126,7 @@ def main() -> None:
         if args.skip_probes:
             print("  Probes skipped")
         else:
-            print(f"  Probes (null n_permutations={args.n_permutations})")
+            print(f"  Probes (null n_permutations={args.n_permutations}, scaling={args.scaling})")
             null_seed = args.null_random_seed if args.null_random_seed is not None else args.random_seed
             axis_rows, identity_rows = run_probes(
                 x=x,
@@ -1075,6 +1136,7 @@ def main() -> None:
                 random_seed=args.random_seed,
                 n_permutations=args.n_permutations,
                 null_rng_seed=null_seed,
+                scaling=args.scaling,
             )
             axis_probe_rows.extend(axis_rows)
             identity_probe_rows.extend(identity_rows)
@@ -1089,6 +1151,7 @@ def main() -> None:
                     identity_rows=identity_rows,
                     probe_pca_dim=args.probe_pca_dim,
                     random_seed=args.random_seed,
+                    scaling=args.scaling,
                 )
                 pd.DataFrame(verification_rows).to_csv(
                     subdirs["probes"] / "pca_leakage_verification.csv", index=False
