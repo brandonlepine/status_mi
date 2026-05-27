@@ -51,12 +51,17 @@ def prepare_output(output_dir: Path, overwrite: bool) -> None:
         (output_dir / subdir).mkdir(parents=True, exist_ok=True)
 
 
-def save_fig(fig: plt.Figure, path_no_suffix: Path) -> None:
-    path_no_suffix.parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout()
-    fig.savefig(path_no_suffix.with_suffix(".png"), dpi=220)
-    fig.savefig(path_no_suffix.with_suffix(".pdf"))
-    plt.close(fig)
+# Audit 5.10: save_fig sourced from common; thin wrapper preserves prior style.
+import sys
+from pathlib import Path as _Path
+_SCRIPT_DIR = _Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+from common import save_fig as _save_fig_common  # noqa: E402
+
+
+def save_fig(fig, path_no_suffix) -> None:
+    _save_fig_common(fig, path_no_suffix, dpi=220, bbox_inches=None, tight_layout=True)
 
 
 def safe_read(path: Path) -> pd.DataFrame:

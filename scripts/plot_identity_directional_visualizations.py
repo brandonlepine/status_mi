@@ -92,7 +92,26 @@ PLANE_SPECS = {
         ("short - tall", "appearance_short", "appearance_tall"),
     ],
 }
-OKABE_ITO = ["#0072B2", "#E69F00", "#009E73", "#CC79A7", "#56B4E9", "#D55E00", "#F0E442", "#000000"]
+# OKABE_ITO sourced from common (audit 5.10).
+import sys
+from pathlib import Path as _Path
+_SCRIPT_DIR = _Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+from common import (  # noqa: E402, F401
+    OKABE_ITO,
+    cohens_d, cosine, normalize,
+    compute_direction as _compute_direction_lowlevel,
+    save_fig as _save_fig_common,
+    residualize as _residualize_by_column,
+)
+
+
+def save_fig(fig, path_no_suffix) -> None:
+    """Wraps common.save_fig preserving this script's prior tight_layout+dpi=220 style."""
+    _save_fig_common(fig, path_no_suffix, dpi=220, bbox_inches=None, tight_layout=True)
+
+
 MARKERS = ["o", "s", "^", "D", "P", "X", "v", "<", ">", "*", "h", "8"]
 LINESTYLES = ["-", "--", "-.", ":"]
 
@@ -197,16 +216,9 @@ def load_contrasts(path: Path | None, metadata: pd.DataFrame) -> pd.DataFrame:
 
 
 def residualize(x: np.ndarray, metadata: pd.DataFrame, residualization: str) -> np.ndarray:
-    group_col = RESIDUALIZATION_GROUPS[residualization]
-    if group_col is None:
-        return x
-    global_mean = x.mean(axis=0, keepdims=True)
-    x_resid = x.copy()
-    for _, idx in metadata.groupby(group_col, sort=True).groups.items():
-        idx_array = np.fromiter(idx, dtype=int)
-        group_mean = x[idx_array].mean(axis=0, keepdims=True)
-        x_resid[idx_array] = x[idx_array] - group_mean + global_mean
-    return x_resid
+    """Adapter: residualization NAME -> column via RESIDUALIZATION_GROUPS;
+    routes to common.residualize. Audit 5.10."""
+    return _residualize_by_column(x, metadata, RESIDUALIZATION_GROUPS[residualization])
 
 
 def category_colors(values: pd.Series) -> dict[str, str]:
@@ -235,14 +247,6 @@ def add_legend(ax: plt.Axes, labels: list[str], colors: dict[str, str], markers:
     ax.legend(handles=handles, bbox_to_anchor=(1.02, 1), loc="upper left", frameon=False, fontsize=8, ncol=1 if len(labels) <= 20 else 2)
 
 
-def save_fig(fig: plt.Figure, path_no_suffix: Path) -> None:
-    path_no_suffix.parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout()
-    fig.savefig(path_no_suffix.with_suffix(".png"), dpi=220)
-    fig.savefig(path_no_suffix.with_suffix(".pdf"))
-    plt.close(fig)
-
-
 def sample_plot_rows(df: pd.DataFrame, max_points: int, seed: int) -> pd.DataFrame:
     if len(df) <= max_points:
         return df
@@ -257,37 +261,16 @@ def sample_plot_rows(df: pd.DataFrame, max_points: int, seed: int) -> pd.DataFra
     return sampled
 
 
-def normalize(vec: np.ndarray) -> np.ndarray | None:
-    norm = np.linalg.norm(vec)
-    if norm == 0 or not np.isfinite(norm):
-        return None
-    return vec / norm
-
-
 def compute_direction(x_centered: np.ndarray, metadata: pd.DataFrame, identity_a: str, identity_b: str) -> tuple[np.ndarray | None, bool]:
+    """Adapter — x is assumed already centered (callers pass x_centered).
+    Returns (direction, sign_flipped) per this script's prior contract.
+    Routes to common.compute_direction with center=False. Audit 5.10."""
     mask_a = metadata["identity_id"].eq(identity_a).to_numpy()
     mask_b = metadata["identity_id"].eq(identity_b).to_numpy()
-    if mask_a.sum() == 0 or mask_b.sum() == 0:
+    cd = _compute_direction_lowlevel(x_centered, mask_a, mask_b, center=False)
+    if cd is None:
         return None, False
-    direction = x_centered[mask_a].mean(axis=0) - x_centered[mask_b].mean(axis=0)
-    direction = normalize(direction)
-    if direction is None:
-        return None, False
-    scores = x_centered @ direction
-    flipped = False
-    if scores[mask_a].mean() < scores[mask_b].mean():
-        direction = -direction
-        flipped = True
-    return direction, flipped
-
-
-def cohens_d(scores_a: np.ndarray, scores_b: np.ndarray) -> float:
-    if len(scores_a) < 2 or len(scores_b) < 2:
-        return float("nan")
-    pooled = (((len(scores_a) - 1) * np.var(scores_a, ddof=1)) + ((len(scores_b) - 1) * np.var(scores_b, ddof=1))) / (len(scores_a) + len(scores_b) - 2)
-    if pooled <= 0:
-        return float("nan")
-    return float((scores_a.mean() - scores_b.mean()) / np.sqrt(pooled))
+    return cd.direction, cd.sign_flipped
 
 
 def binary_metrics(scores: np.ndarray, metadata: pd.DataFrame, identity_a: str, identity_b: str) -> dict[str, float | int]:

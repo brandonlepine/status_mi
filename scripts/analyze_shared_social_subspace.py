@@ -36,6 +36,27 @@ except ImportError:  # pragma: no cover
     linkage = None
     squareform = None
 
+# Audit 5.10: shared utilities live in common; this script provides thin
+# adapters where the local signature differs from the canonical form.
+import sys
+from pathlib import Path as _Path
+_SCRIPT_DIR = _Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+from common import (
+    cohens_d, cosine, normalize, OKABE_ITO,
+    save_fig as _save_fig_common,
+    compute_direction as _compute_direction_lowlevel,
+    evaluate_projection as _evaluate_projection_canonical,
+    residualize as _residualize_by_column,
+)  # noqa: E402, F401
+
+
+def save_fig(fig, path_no_suffix) -> None:
+    """Wraps common.save_fig with this script's prior style:
+    tight_layout=True, dpi=220, bbox_inches=None. Audit 5.10."""
+    _save_fig_common(fig, path_no_suffix, dpi=220, bbox_inches=None, tight_layout=True)
+
 
 DEFAULT_ACTIVATION_DIR = Path(
     "/workspace/status_mi/results/activations/llama-3.1-8b/"
@@ -184,7 +205,7 @@ CROSS_AXIS_LONG_COLUMNS = [
     "canonical_label",
     "projection_score",
 ]
-OKABE_ITO = ["#0072B2", "#E69F00", "#009E73", "#CC79A7", "#56B4E9", "#D55E00", "#F0E442", "#000000"]
+# OKABE_ITO is imported from common module (audit 5.10).
 
 
 @dataclass
@@ -242,12 +263,8 @@ def prepare_output(output_dir: Path, overwrite: bool) -> None:
         (output_dir / subdir).mkdir(parents=True, exist_ok=True)
 
 
-def save_fig(fig: plt.Figure, path_no_suffix: Path) -> None:
-    path_no_suffix.parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout()
-    fig.savefig(path_no_suffix.with_suffix(".png"), dpi=220)
-    fig.savefig(path_no_suffix.with_suffix(".pdf"))
-    plt.close(fig)
+# save_fig is imported from common module (audit 5.10). Local callers that
+# want the prior tight_layout+dpi=220 behavior can pass those kwargs.
 
 
 def append_rows(path: Path, rows: list[dict[str, object]], columns: list[str]) -> None:
@@ -301,43 +318,25 @@ def load_layer(activation_dir: Path, layer: int) -> np.ndarray:
 
 
 def residualize(x: np.ndarray, metadata: pd.DataFrame, residualization: str) -> np.ndarray:
+    """Adapter — translates a residualization NAME ('family_residualized' etc.)
+    to its column ('family' etc.) via RESIDUALIZATION_GROUPS, then calls
+    common.residualize. Audit 5.10."""
     if residualization not in RESIDUALIZATION_GROUPS:
         raise ValueError(f"Unknown residualization '{residualization}'. Expected one of {sorted(RESIDUALIZATION_GROUPS)}")
-    group_col = RESIDUALIZATION_GROUPS[residualization]
-    if group_col is None:
-        return x
-    global_mean = x.mean(axis=0, keepdims=True)
-    x_resid = x.copy()
-    for _, idx in metadata.groupby(group_col, sort=True).groups.items():
-        idx_array = np.fromiter(idx, dtype=int)
-        group_mean = x[idx_array].mean(axis=0, keepdims=True)
-        x_resid[idx_array] = x[idx_array] - group_mean + global_mean
-    return x_resid
-
-
-def normalize(vec: np.ndarray, eps: float = 1e-12) -> np.ndarray | None:
-    norm = np.linalg.norm(vec)
-    if norm <= eps or not np.isfinite(norm):
-        return None
-    return vec / norm
+    return _residualize_by_column(x, metadata, RESIDUALIZATION_GROUPS[residualization])
 
 
 def compute_direction(x: np.ndarray, metadata: pd.DataFrame, identity_a: str, identity_b: str) -> tuple[np.ndarray | None, np.ndarray, bool]:
+    """Adapter — calls common.compute_direction with the script's prior
+    3-tuple return convention. global_mean is always computed (and returned)
+    so callers can use it for downstream evaluation. Audit 5.10."""
     global_mean = x.mean(axis=0, keepdims=True)
-    centered = x - global_mean
     mask_a = metadata["identity_id"].eq(identity_a).to_numpy()
     mask_b = metadata["identity_id"].eq(identity_b).to_numpy()
-    if mask_a.sum() == 0 or mask_b.sum() == 0:
-        return None, global_mean, False
-    direction = normalize(centered[mask_a].mean(axis=0) - centered[mask_b].mean(axis=0))
-    if direction is None:
-        return None, global_mean, False
-    scores = centered @ direction
-    sign_flipped = False
-    if scores[mask_a].mean() < scores[mask_b].mean():
-        direction = -direction
-        sign_flipped = True
-    return direction.astype(np.float32), global_mean.astype(np.float32), sign_flipped
+    cd = _compute_direction_lowlevel(x, mask_a, mask_b, center=True, center_mean=global_mean)
+    if cd is None:
+        return None, global_mean.astype(np.float32), False
+    return cd.direction.astype(np.float32), global_mean.astype(np.float32), cd.sign_flipped
 
 
 def project_onto_subspace(direction: np.ndarray, basis: np.ndarray, eps: float = 1e-12) -> tuple[np.ndarray | None, np.ndarray | None, float, float]:
@@ -348,15 +347,6 @@ def project_onto_subspace(direction: np.ndarray, basis: np.ndarray, eps: float =
     shared_unit = shared_raw / shared_norm if shared_norm > eps and np.isfinite(shared_norm) else None
     residual_unit = residual_raw / residual_norm if residual_norm > eps and np.isfinite(residual_norm) else None
     return shared_unit, residual_unit, shared_norm, residual_norm
-
-
-def cohens_d(scores_a: np.ndarray, scores_b: np.ndarray) -> float:
-    if len(scores_a) < 2 or len(scores_b) < 2:
-        return float("nan")
-    pooled = (((len(scores_a) - 1) * np.var(scores_a, ddof=1)) + ((len(scores_b) - 1) * np.var(scores_b, ddof=1))) / (len(scores_a) + len(scores_b) - 2)
-    if pooled <= 0 or not np.isfinite(pooled):
-        return float("nan")
-    return float((scores_a.mean() - scores_b.mean()) / np.sqrt(pooled))
 
 
 def evaluate_component(

@@ -26,42 +26,13 @@ from sklearn.exceptions import ConvergenceWarning
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 from sklearn.model_selection import GroupKFold
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler  # noqa: F401 (kept; canonical scaler lives in common)
 
-
-SCALING_MODES = ("standardize", "center_only")
-DEFAULT_SCALING = "center_only"
-
-
-class CenterOnlyScaler:
-    """Drop-in replacement for sklearn StandardScaler that subtracts the
-    per-dim mean only (no z-scoring). See `make_scaler` and audit 5.9."""
-    def __init__(self) -> None:
-        self.mean_: np.ndarray | None = None
-
-    def fit(self, x: np.ndarray) -> "CenterOnlyScaler":
-        self.mean_ = x.mean(axis=0, keepdims=True)
-        return self
-
-    def transform(self, x: np.ndarray) -> np.ndarray:
-        if self.mean_ is None:
-            raise RuntimeError("CenterOnlyScaler.transform called before fit.")
-        return x - self.mean_
-
-    def fit_transform(self, x: np.ndarray) -> np.ndarray:
-        return self.fit(x).transform(x)
-
-
-def make_scaler(mode: str):
-    """Factory for the --scaling flag. Audit 5.9: 'center_only' preserves
-    the activation-space variance structure (rogue / high-norm dimensions);
-    'standardize' z-scores per dim — legacy behavior — and was shown by the
-    audit to upweight low-variance dimensions."""
-    if mode == "standardize":
-        return StandardScaler()
-    if mode == "center_only":
-        return CenterOnlyScaler()
-    raise ValueError(f"Unknown scaling mode: {mode!r}; expected one of {SCALING_MODES}.")
+from common import (
+    SCALING_MODES, DEFAULT_SCALING, CenterOnlyScaler, make_scaler,
+    cohens_d, cosine, normalize, compute_direction, compute_direction_for_pair,
+    evaluate_projection, residualize, OKABE_ITO, save_fig,
+)  # noqa: E402, F401  (audit 5.10 — single source of truth)
 from tqdm.auto import tqdm
 
 try:
@@ -142,16 +113,7 @@ AXES_TO_PLOT = [
 # typos corrected in the registry so the SES axis runs 4 contrasts not silently 2).
 # Populated at main() startup; see resolve_contrasts_from_registry.
 CONTRASTS: list[tuple[str, str]] = []
-OKABE_ITO = [
-    "#0072B2",
-    "#E69F00",
-    "#009E73",
-    "#CC79A7",
-    "#56B4E9",
-    "#D55E00",
-    "#F0E442",
-    "#000000",
-]
+# OKABE_ITO sourced from common module (audit 5.10).
 MARKERS = ["o", "s", "^", "D", "P", "X", "v", "<", ">", "*", "h", "8"]
 LINESTYLES = ["-", "--", "-.", ":"]
 
@@ -497,13 +459,6 @@ def add_legend(
     )
 
 
-def save_figure(fig: plt.Figure, path_no_suffix: Path) -> None:
-    fig.tight_layout()
-    fig.savefig(path_no_suffix.with_suffix(".png"), dpi=220)
-    fig.savefig(path_no_suffix.with_suffix(".pdf"))
-    plt.close(fig)
-
-
 def safe_read_csv(path: Path) -> pd.DataFrame | None:
     if not path.exists():
         return None
@@ -542,18 +497,6 @@ def variance_decomposition_layer(
             }
         )
     return rows
-
-
-def residualize(x: np.ndarray, metadata: pd.DataFrame, group_col: str | None) -> np.ndarray:
-    if group_col is None:
-        return x
-    global_mean = x.mean(axis=0, keepdims=True)
-    x_resid = x.copy()
-    for _, idx in metadata.groupby(group_col, sort=True).groups.items():
-        idx_array = np.fromiter(idx, dtype=int)
-        group_mean = x[idx_array].mean(axis=0, keepdims=True)
-        x_resid[idx_array] = x[idx_array] - group_mean + global_mean
-    return x_resid
 
 
 def run_pca(
@@ -1033,44 +976,54 @@ def run_surface_probes(
     return rows
 
 
-def cohens_d(scores_a: np.ndarray, scores_b: np.ndarray) -> float:
-    if len(scores_a) < 2 or len(scores_b) < 2:
-        return float("nan")
-    pooled_var = (
-        ((len(scores_a) - 1) * np.var(scores_a, ddof=1))
-        + ((len(scores_b) - 1) * np.var(scores_b, ddof=1))
-    ) / (len(scores_a) + len(scores_b) - 2)
-    if pooled_var <= 0:
-        return float("nan")
-    return float((np.mean(scores_a) - np.mean(scores_b)) / np.sqrt(pooled_var))
+# cohens_d sourced from common. make_contrast_direction and evaluate_projection
+# below are thin adapters around common.compute_direction / evaluate_projection
+# that preserve this script's prior signatures (audit 5.10).
 
 
 def make_contrast_direction(
     x: np.ndarray, mask_a: np.ndarray, mask_b: np.ndarray, center_mean: np.ndarray
 ) -> np.ndarray | None:
-    if mask_a.sum() == 0 or mask_b.sum() == 0:
-        return None
-    x_centered = x - center_mean
-    direction = x_centered[mask_a].mean(axis=0) - x_centered[mask_b].mean(axis=0)
-    norm = np.linalg.norm(direction)
-    if norm == 0:
-        return None
-    return direction / norm
+    """Compute the unit-normed difference-of-means direction using the
+    supplied `center_mean` (typically a train-subset mean for held-out
+    evaluation). Returns the array directly so existing callers' tuple
+    contracts are unchanged; common.compute_direction is the underlying
+    implementation."""
+    cd = compute_direction(x, mask_a, mask_b, center=True, center_mean=center_mean)
+    return cd.direction if cd is not None else None
 
 
-def evaluate_projection(
+def _evaluate_with_centering(
     x: np.ndarray,
     direction: np.ndarray,
     center_mean: np.ndarray,
     mask_a: np.ndarray,
     mask_b: np.ndarray,
 ) -> tuple[float, float]:
+    """Thin wrapper around common.evaluate_projection that does the
+    (x - center_mean) @ direction projection first; returns (auc, cohens_d)
+    in the 2-tuple shape this script's existing call sites use."""
     scores = (x - center_mean) @ direction
-    pair_mask = mask_a | mask_b
-    y = mask_a[pair_mask].astype(int)
-    pair_scores = scores[pair_mask]
-    auc = float(roc_auc_score(y, pair_scores)) if len(np.unique(y)) == 2 else float("nan")
-    return auc, cohens_d(scores[mask_a], scores[mask_b])
+    metrics = evaluate_projection(scores, mask_a, mask_b)
+    return metrics["auc"], metrics["cohens_d"]
+
+
+# Preserve the in-file name `evaluate_projection` for back-compat with this
+# script's existing call sites. common.evaluate_projection has a different
+# (cleaner) signature; we shadow it here only inside this script.
+def evaluate_projection_local(  # noqa: D401 - shim
+    x: np.ndarray,
+    direction: np.ndarray,
+    center_mean: np.ndarray,
+    mask_a: np.ndarray,
+    mask_b: np.ndarray,
+) -> tuple[float, float]:
+    return _evaluate_with_centering(x, direction, center_mean, mask_a, mask_b)
+
+
+# Existing callers use the bare name `evaluate_projection`; route them to the
+# local shim that preserves the old 2-tuple signature.
+evaluate_projection = evaluate_projection_local  # type: ignore[assignment]
 
 
 def _write_holdout_summary(
@@ -1223,7 +1176,7 @@ def line_plot(
         linestyle_map=linestyle_map,
         max_items=40,
     )
-    save_figure(fig, path_no_suffix)
+    save_fig(fig, path_no_suffix, dpi=220, bbox_inches=None, tight_layout=True)
 
 
 def plot_variance_decomposition(output_dir: Path) -> None:
@@ -1404,7 +1357,7 @@ def scatter_identity(
         marker_map=marker_map,
         max_items=60,
     )
-    save_figure(fig, path_no_suffix)
+    save_fig(fig, path_no_suffix, dpi=220, bbox_inches=None, tight_layout=True)
 
 
 def pca_progression_plot(
@@ -1456,7 +1409,7 @@ def pca_progression_plot(
         marker_map=marker_map,
         max_items=60,
     )
-    save_figure(fig, out_dir / f"{axis}_layer_progression")
+    save_fig(fig, out_dir / f"{axis}_layer_progression", dpi=220, bbox_inches=None, tight_layout=True)
 
 
 def plot_axis_specific_pca(

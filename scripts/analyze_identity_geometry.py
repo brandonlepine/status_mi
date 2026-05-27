@@ -17,45 +17,13 @@ from sklearn.exceptions import ConvergenceWarning
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 from sklearn.model_selection import GroupKFold
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler  # noqa: F401 (kept for back-compat; canonical scaler lives in common)
 
-
-SCALING_MODES = ("standardize", "center_only")
-DEFAULT_SCALING = "center_only"
-
-
-class CenterOnlyScaler:
-    """Drop-in replacement for sklearn StandardScaler that subtracts the
-    per-dim mean only (no z-scoring). Audit 5.9: Llama residual-stream
-    dimensions carry meaningfully unequal scale (rogue/high-norm dimensions
-    carry real signal); z-scoring upweights low-variance dimensions and
-    changes what `explained_variance_ratio` is measuring. center_only
-    preserves the activation-space variance structure, which is what
-    downstream PCA interpretation actually wants.
-    """
-    def __init__(self) -> None:
-        self.mean_: np.ndarray | None = None
-
-    def fit(self, x: np.ndarray) -> "CenterOnlyScaler":
-        self.mean_ = x.mean(axis=0, keepdims=True)
-        return self
-
-    def transform(self, x: np.ndarray) -> np.ndarray:
-        if self.mean_ is None:
-            raise RuntimeError("CenterOnlyScaler.transform called before fit.")
-        return x - self.mean_
-
-    def fit_transform(self, x: np.ndarray) -> np.ndarray:
-        return self.fit(x).transform(x)
-
-
-def make_scaler(mode: str):
-    """Factory for the --scaling flag. Audit 5.9."""
-    if mode == "standardize":
-        return StandardScaler()
-    if mode == "center_only":
-        return CenterOnlyScaler()
-    raise ValueError(f"Unknown scaling mode: {mode!r}; expected one of {SCALING_MODES}.")
+from common import (
+    SCALING_MODES, DEFAULT_SCALING, CenterOnlyScaler, make_scaler,
+    cohens_d, cosine, normalize, compute_direction, compute_direction_for_pair,
+    evaluate_projection, residualize, OKABE_ITO, save_fig,
+)  # noqa: E402, F401  (audit 5.10 — single source of truth)
 from tqdm.auto import tqdm
 
 
@@ -846,13 +814,6 @@ def _pair_global_and_fold_internal(
     }
 
 
-def cosine(a: np.ndarray, b: np.ndarray) -> float:
-    denom = np.linalg.norm(a) * np.linalg.norm(b)
-    if denom == 0:
-        return float("nan")
-    return float(np.dot(a, b) / denom)
-
-
 def run_family_stability(
     x: np.ndarray,
     metadata: pd.DataFrame,
@@ -898,38 +859,6 @@ def run_family_stability(
         index=False,
     )
     return family_df
-
-
-def cohens_d(scores_a: np.ndarray, scores_b: np.ndarray) -> float:
-    if len(scores_a) < 2 or len(scores_b) < 2:
-        return float("nan")
-    pooled_var = (
-        ((len(scores_a) - 1) * np.var(scores_a, ddof=1))
-        + ((len(scores_b) - 1) * np.var(scores_b, ddof=1))
-    ) / (len(scores_a) + len(scores_b) - 2)
-    if pooled_var <= 0:
-        return float("nan")
-    return float((np.mean(scores_a) - np.mean(scores_b)) / np.sqrt(pooled_var))
-
-
-def contrast_direction(x_centered: np.ndarray, mask_a: np.ndarray, mask_b: np.ndarray) -> np.ndarray | None:
-    if mask_a.sum() == 0 or mask_b.sum() == 0:
-        return None
-    d = x_centered[mask_a].mean(axis=0) - x_centered[mask_b].mean(axis=0)
-    norm = np.linalg.norm(d)
-    if norm == 0:
-        return None
-    return d / norm
-
-
-def evaluate_contrast_scores(scores: np.ndarray, mask_a: np.ndarray, mask_b: np.ndarray) -> tuple[float, float, float, float]:
-    pair_mask = mask_a | mask_b
-    y = mask_a[pair_mask].astype(int)
-    pair_scores = scores[pair_mask]
-    auc = float(roc_auc_score(y, pair_scores)) if len(np.unique(y)) == 2 else float("nan")
-    scores_a = scores[mask_a]
-    scores_b = scores[mask_b]
-    return auc, cohens_d(scores_a, scores_b), float(np.mean(scores_a)), float(np.mean(scores_b))
 
 
 def resolve_contrasts_from_registry(
@@ -978,12 +907,16 @@ def run_contrasts(
 
         mask_a = metadata["identity_id"].eq(identity_a).to_numpy()
         mask_b = metadata["identity_id"].eq(identity_b).to_numpy()
-        direction = contrast_direction(x_centered, mask_a, mask_b)
-        if direction is None:
+        # common.compute_direction sign-flips so projection of A has higher
+        # mean than projection of B. x_centered is already mean-zero, so
+        # we pass center=False to avoid double-centering. Audit 5.10.
+        cd = compute_direction(x_centered, mask_a, mask_b, center=False)
+        if cd is None:
             continue
+        direction = cd.direction
 
         scores = x_centered @ direction
-        auc, d_all, mean_a, mean_b = evaluate_contrast_scores(scores, mask_a, mask_b)
+        metrics = evaluate_projection(scores, mask_a, mask_b)
         contrast_name = f"{identity_a}_vs_{identity_b}"
         score_rows.append(
             {
@@ -992,10 +925,10 @@ def run_contrasts(
                 "identity_a": identity_a,
                 "identity_b": identity_b,
                 "axis": axis_lookup.get(identity_a, ""),
-                "auc_in_sample": auc,
-                "cohens_d_in_sample": d_all,
-                "mean_a": mean_a,
-                "mean_b": mean_b,
+                "auc_in_sample": metrics["auc"],
+                "cohens_d_in_sample": metrics["cohens_d"],
+                "mean_a": metrics["mean_a"],
+                "mean_b": metrics["mean_b"],
                 "n_a": int(mask_a.sum()),
                 "n_b": int(mask_b.sum()),
             }
@@ -1010,13 +943,14 @@ def run_contrasts(
             if min(train_mask_a.sum(), train_mask_b.sum(), eval_mask_a.sum(), eval_mask_b.sum()) == 0:
                 continue
 
-            heldout_direction = contrast_direction(x_centered, train_mask_a, train_mask_b)
-            if heldout_direction is None:
+            heldout_cd = compute_direction(x_centered, train_mask_a, train_mask_b, center=False)
+            if heldout_cd is None:
                 continue
+            heldout_direction = heldout_cd.direction
             heldout_scores = x_centered @ heldout_direction
-            heldout_auc, heldout_d, _, _ = evaluate_contrast_scores(
-                heldout_scores, eval_mask_a, eval_mask_b
-            )
+            heldout_metrics = evaluate_projection(heldout_scores, eval_mask_a, eval_mask_b)
+            heldout_auc = heldout_metrics["auc"]
+            heldout_d = heldout_metrics["cohens_d"]
             holdout_rows.append(
                 {
                     "layer": layer,

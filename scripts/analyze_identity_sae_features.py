@@ -103,60 +103,47 @@ def load_contrasts(path: Path | None, metadata: pd.DataFrame, output_dir: Path |
     return result.valid.reset_index(drop=True)
 
 
+# Audit 5.10: shared utilities imported from common; local adapters preserve
+# this script's prior return-tuple shapes.
+import sys
+from pathlib import Path as _Path
+_SCRIPT_DIR = _Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+from common import (  # noqa: E402
+    cohens_d, cosine, normalize,
+    compute_direction as _compute_direction_lowlevel,
+    evaluate_projection as _evaluate_projection_canonical,
+    residualize as _residualize_by_column,
+)
+
+
 def residualize(x: np.ndarray, metadata: pd.DataFrame, residualization: str) -> np.ndarray:
-    group_col = RESIDUALIZATION_GROUPS[residualization]
-    if group_col is None:
-        return x
-    global_mean = x.mean(axis=0, keepdims=True)
-    x_resid = x.copy()
-    for _, idx in metadata.groupby(group_col, sort=True).groups.items():
-        idx_array = np.fromiter(idx, dtype=int)
-        x_resid[idx_array] = x[idx_array] - x[idx_array].mean(axis=0, keepdims=True) + global_mean
-    return x_resid
-
-
-def normalize(vec: np.ndarray) -> np.ndarray | None:
-    norm = np.linalg.norm(vec)
-    if norm == 0 or not np.isfinite(norm):
-        return None
-    return vec / norm
+    """Adapter that maps residualization NAME -> column via RESIDUALIZATION_GROUPS.
+    Routes to common.residualize. Audit 5.10."""
+    return _residualize_by_column(x, metadata, RESIDUALIZATION_GROUPS[residualization])
 
 
 def compute_direction(x: np.ndarray, metadata: pd.DataFrame, identity_a: str, identity_b: str) -> tuple[np.ndarray | None, np.ndarray]:
+    """Adapter — calls common.compute_direction and returns this script's
+    2-tuple (direction, global_mean) shape. Audit 5.10."""
     global_mean = x.mean(axis=0, keepdims=True)
-    centered = x - global_mean
     mask_a = metadata["identity_id"].eq(identity_a).to_numpy()
     mask_b = metadata["identity_id"].eq(identity_b).to_numpy()
-    if min(mask_a.sum(), mask_b.sum()) == 0:
-        return None, global_mean
-    direction = normalize(centered[mask_a].mean(axis=0) - centered[mask_b].mean(axis=0))
-    if direction is None:
-        return None, global_mean
-    scores = centered @ direction
-    if scores[mask_a].mean() < scores[mask_b].mean():
-        direction = -direction
-    return direction.astype(np.float32), global_mean.astype(np.float32)
-
-
-def cohens_d(a: np.ndarray, b: np.ndarray) -> float:
-    if len(a) < 2 or len(b) < 2:
-        return float("nan")
-    pooled = (((len(a) - 1) * np.var(a, ddof=1)) + ((len(b) - 1) * np.var(b, ddof=1))) / (len(a) + len(b) - 2)
-    if pooled <= 0 or not np.isfinite(pooled):
-        return float("nan")
-    return float((a.mean() - b.mean()) / np.sqrt(pooled))
+    cd = _compute_direction_lowlevel(x, mask_a, mask_b, center=True, center_mean=global_mean)
+    if cd is None:
+        return None, global_mean.astype(np.float32)
+    return cd.direction.astype(np.float32), global_mean.astype(np.float32)
 
 
 def evaluate_direction(x: np.ndarray, metadata: pd.DataFrame, identity_a: str, identity_b: str, direction: np.ndarray, global_mean: np.ndarray) -> tuple[float, float]:
+    """Adapter — projects then routes to common.evaluate_projection; returns
+    the 2-tuple (auc, cohens_d) this script's callers use. Audit 5.10."""
     scores = (x - global_mean) @ direction
     mask_a = metadata["identity_id"].eq(identity_a).to_numpy()
     mask_b = metadata["identity_id"].eq(identity_b).to_numpy()
-    a = scores[mask_a]
-    b = scores[mask_b]
-    labels = np.concatenate([np.ones(len(a)), np.zeros(len(b))])
-    vals = np.concatenate([a, b])
-    auc = float(roc_auc_score(labels, vals)) if len(np.unique(labels)) == 2 else float("nan")
-    return auc, cohens_d(a, b)
+    metrics = _evaluate_projection_canonical(scores, mask_a, mask_b)
+    return metrics["auc"], metrics["cohens_d"]
 
 
 def find_topk_files(layer_dir: Path) -> tuple[Path, Path, int]:

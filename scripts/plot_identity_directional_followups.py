@@ -105,7 +105,25 @@ PLANE_SPECS = {
         ("transgender woman - cisgender woman", "gender_transgender_woman", "gender_cisgender_woman"),
     ],
 }
-OKABE_ITO = ["#0072B2", "#E69F00", "#009E73", "#CC79A7", "#56B4E9", "#D55E00", "#F0E442", "#000000"]
+# OKABE_ITO sourced from common (audit 5.10).
+import sys
+from pathlib import Path as _Path
+_SCRIPT_DIR = _Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+from common import (  # noqa: E402, F401
+    OKABE_ITO,
+    cohens_d, cosine, normalize,
+    save_fig as _save_fig_common,
+    residualize as _residualize_by_column,
+)
+
+
+def save_fig(fig, path_no_suffix) -> None:
+    """Wraps common.save_fig preserving this script's prior style."""
+    _save_fig_common(fig, path_no_suffix, dpi=220, bbox_inches=None, tight_layout=True)
+
+
 MARKERS = ["o", "s", "^", "D", "P", "X", "v", "<", ">", "*", "h", "8"]
 LINESTYLES = ["-", "--", "-.", ":"]
 LAYERWISE_COLUMNS = [
@@ -212,14 +230,6 @@ def parse_str_list(value: str) -> list[str]:
     return [part.strip() for part in value.split(",") if part.strip()]
 
 
-def save_fig(fig: plt.Figure, path_no_suffix: Path) -> None:
-    path_no_suffix.parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout()
-    fig.savefig(path_no_suffix.with_suffix(".png"), dpi=220)
-    fig.savefig(path_no_suffix.with_suffix(".pdf"))
-    plt.close(fig)
-
-
 def append_rows(path: Path, rows: list[dict[str, object]], columns: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
@@ -292,25 +302,11 @@ def discover_layers(activation_dir: Path) -> list[int]:
 
 
 def residualize(x: np.ndarray, metadata: pd.DataFrame, residualization: str) -> np.ndarray:
+    """Adapter: NAME -> column via RESIDUALIZATION_GROUPS; routes to
+    common.residualize (audit 5.10)."""
     if residualization not in RESIDUALIZATION_GROUPS:
         raise ValueError(f"Unknown residualization '{residualization}'. Expected one of {sorted(RESIDUALIZATION_GROUPS)}")
-    group_col = RESIDUALIZATION_GROUPS[residualization]
-    if group_col is None:
-        return x
-    global_mean = x.mean(axis=0, keepdims=True)
-    x_resid = x.copy()
-    for _, idx in metadata.groupby(group_col, sort=True).groups.items():
-        idx_array = np.fromiter(idx, dtype=int)
-        group_mean = x[idx_array].mean(axis=0, keepdims=True)
-        x_resid[idx_array] = x[idx_array] - group_mean + global_mean
-    return x_resid
-
-
-def normalize(vec: np.ndarray) -> np.ndarray | None:
-    norm = np.linalg.norm(vec)
-    if norm == 0 or not np.isfinite(norm):
-        return None
-    return vec / norm
+    return _residualize_by_column(x, metadata, RESIDUALIZATION_GROUPS[residualization])
 
 
 def compute_contrast_direction(
@@ -363,15 +359,6 @@ def compute_masked_contrast_direction(
 
 def project_scores(x: np.ndarray, direction: np.ndarray, global_mean: np.ndarray) -> np.ndarray:
     return (x - global_mean) @ direction
-
-
-def cohens_d(scores_a: np.ndarray, scores_b: np.ndarray) -> float:
-    if len(scores_a) < 2 or len(scores_b) < 2:
-        return float("nan")
-    pooled = (((len(scores_a) - 1) * np.var(scores_a, ddof=1)) + ((len(scores_b) - 1) * np.var(scores_b, ddof=1))) / (len(scores_a) + len(scores_b) - 2)
-    if pooled <= 0 or not np.isfinite(pooled):
-        return float("nan")
-    return float((scores_a.mean() - scores_b.mean()) / np.sqrt(pooled))
 
 
 def compute_auc_cohens_d(scores: np.ndarray, labels: np.ndarray) -> tuple[float, float]:

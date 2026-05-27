@@ -36,16 +36,20 @@ AXES_TO_PLOT = [
     "religion",
     "nationality",
 ]
-OKABE_ITO = [
-    "#0072B2",  # blue
-    "#E69F00",  # orange
-    "#009E73",  # bluish green
-    "#CC79A7",  # reddish purple
-    "#56B4E9",  # sky blue
-    "#D55E00",  # vermillion
-    "#F0E442",  # yellow
-    "#000000",  # black
-]
+# OKABE_ITO sourced from common (audit 5.10).
+import sys
+from pathlib import Path as _Path
+_SCRIPT_DIR = _Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+from common import OKABE_ITO, save_fig as _save_fig_common  # noqa: E402, F401
+
+
+def save_figure(fig, path_no_suffix) -> None:
+    """Wraps common.save_fig preserving this script's style (audit 5.10)."""
+    _save_fig_common(fig, path_no_suffix, dpi=220, bbox_inches=None, tight_layout=True)
+
+
 MARKERS = ["o", "s", "^", "D", "P", "X", "v", "<", ">", "*", "h", "8"]
 LINESTYLES = ["-", "--", "-.", ":"]
 
@@ -169,13 +173,6 @@ def add_category_legend(
         fontsize=8,
         ncol=ncol,
     )
-
-
-def save_figure(fig: plt.Figure, path_no_suffix: Path) -> None:
-    fig.tight_layout()
-    fig.savefig(path_no_suffix.with_suffix(".png"), dpi=220)
-    fig.savefig(path_no_suffix.with_suffix(".pdf"))
-    plt.close(fig)
 
 
 def scatter_pca(
