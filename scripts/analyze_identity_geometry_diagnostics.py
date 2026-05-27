@@ -170,6 +170,22 @@ def parse_args() -> argparse.Namespace:
         help="Reuse existing per-layer outputs when present instead of recomputing them.",
     )
     parser.add_argument("--random_seed", type=int, default=42)
+    parser.add_argument(
+        "--n_permutations",
+        type=int,
+        default=20,
+        help=(
+            "Number of label-permutation null replicates per probe (audit 2.2). "
+            "Default 20 keeps the diagnostics run tractable; bump to >=100 for "
+            "the headline number. Set 0 to disable; null fields are NaN."
+        ),
+    )
+    parser.add_argument(
+        "--null_random_seed",
+        type=int,
+        default=None,
+        help="RNG seed for the permutation null. Defaults to --random_seed.",
+    )
     return parser.parse_args()
 
 
@@ -458,35 +474,21 @@ def sample_probe_rows(
     return x[idx], metadata.iloc[idx].reset_index(drop=True), target.iloc[idx].reset_index(drop=True)
 
 
-def crossval_probe(
+def _run_cv_folds_diag(
     x: np.ndarray,
     y: pd.Series,
-    groups: pd.Series,
+    splits: list[tuple[np.ndarray, np.ndarray]],
     layer: int,
     residualization: str,
-    split_type: str,
     task: str,
-    n_splits: int,
     solver: str,
     max_iter: int,
     n_jobs: int,
-    axis: str | None = None,
-) -> dict[str, object] | None:
-    y = y.reset_index(drop=True)
-    groups = groups.reset_index(drop=True)
-    if y.nunique() < 2 or groups.nunique() < 2:
-        return None
-    n_splits = min(n_splits, groups.nunique())
-    if n_splits < 2:
-        return None
-    try:
-        splits = list(GroupKFold(n_splits=n_splits).split(x, y, groups))
-    except ValueError as exc:
-        print(f"Skipping probe {task} {residualization} layer {layer}: {exc}")
-        return None
-
-    accuracies = []
-    macro_f1s = []
+    verbose: bool = True,
+) -> tuple[list[float], list[float]]:
+    """Inner CV loop. Returns (accuracies, macro_f1s) over the provided folds."""
+    accuracies: list[float] = []
+    macro_f1s: list[float] = []
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", ConvergenceWarning)
         warnings.simplefilter("ignore", RuntimeWarning)
@@ -504,13 +506,74 @@ def crossval_probe(
                 model.fit(x[train_idx], y.iloc[train_idx])
                 pred = model.predict(x[test_idx])
             except Exception as exc:
-                print(f"Skipping failed probe fold {task} layer {layer}: {exc}")
+                if verbose:
+                    print(f"Skipping failed probe fold {task} layer {layer}: {exc}")
                 continue
             accuracies.append(accuracy_score(y.iloc[test_idx], pred))
             macro_f1s.append(f1_score(y.iloc[test_idx], pred, average="macro"))
+    return accuracies, macro_f1s
+
+
+def _empty_null_fields_diag() -> dict[str, float | int]:
+    return {
+        "null_n_permutations": 0,
+        "null_accuracy_mean": float("nan"),
+        "null_accuracy_sd": float("nan"),
+        "null_macro_f1_mean": float("nan"),
+        "null_macro_f1_sd": float("nan"),
+        "accuracy_z": float("nan"),
+        "macro_f1_z": float("nan"),
+        "accuracy_p_value": float("nan"),
+        "macro_f1_p_value": float("nan"),
+    }
+
+
+def crossval_probe(
+    x: np.ndarray,
+    y: pd.Series,
+    groups: pd.Series,
+    layer: int,
+    residualization: str,
+    split_type: str,
+    task: str,
+    n_splits: int,
+    solver: str,
+    max_iter: int,
+    n_jobs: int,
+    axis: str | None = None,
+    n_permutations: int = 0,
+    null_rng_seed: int = 42,
+) -> dict[str, object] | None:
+    """Probe with GroupKFold + optional label-permutation null (audit 2.2).
+
+    When n_permutations > 0, y is globally shuffled `n_permutations` times
+    against the same GroupKFold splits, and the observed accuracy /
+    macro-F1 are compared to that null distribution. Reports z-score and
+    Phipson-Smyth smoothed empirical p alongside the existing means/SDs.
+    """
+    y = y.reset_index(drop=True)
+    groups = groups.reset_index(drop=True)
+    if y.nunique() < 2 or groups.nunique() < 2:
+        return None
+    n_splits = min(n_splits, groups.nunique())
+    if n_splits < 2:
+        return None
+    try:
+        splits = list(GroupKFold(n_splits=n_splits).split(x, y, groups))
+    except ValueError as exc:
+        print(f"Skipping probe {task} {residualization} layer {layer}: {exc}")
+        return None
+
+    accuracies, macro_f1s = _run_cv_folds_diag(
+        x, y, splits, layer, residualization, task, solver, max_iter, n_jobs, verbose=True,
+    )
 
     if not accuracies:
         return None
+
+    obs_acc = float(np.mean(accuracies))
+    obs_f1 = float(np.mean(macro_f1s))
+
     row: dict[str, object] = {
         "layer": layer,
         "residualization": residualization,
@@ -519,11 +582,49 @@ def crossval_probe(
         "axis": axis or "",
         "n_classes": int(y.nunique()),
         "n_samples": int(len(y)),
-        "accuracy_mean": float(np.mean(accuracies)),
+        "accuracy_mean": obs_acc,
         "accuracy_sd": float(np.std(accuracies, ddof=1)) if len(accuracies) > 1 else 0.0,
-        "macro_f1_mean": float(np.mean(macro_f1s)),
+        "macro_f1_mean": obs_f1,
         "macro_f1_sd": float(np.std(macro_f1s, ddof=1)) if len(macro_f1s) > 1 else 0.0,
     }
+    row.update(_empty_null_fields_diag())
+
+    if n_permutations > 0:
+        rng = np.random.default_rng(null_rng_seed)
+        y_arr = y.to_numpy()
+        null_accs: list[float] = []
+        null_f1s: list[float] = []
+        for _ in range(n_permutations):
+            y_perm = pd.Series(rng.permutation(y_arr))
+            perm_accs, perm_f1s = _run_cv_folds_diag(
+                x, y_perm, splits, layer, residualization, task, solver, max_iter, n_jobs,
+                verbose=False,
+            )
+            if perm_accs:
+                null_accs.append(float(np.mean(perm_accs)))
+                null_f1s.append(float(np.mean(perm_f1s)))
+        if null_accs:
+            null_acc_arr = np.asarray(null_accs)
+            null_f1_arr = np.asarray(null_f1s)
+            n_obs = len(null_acc_arr)
+            null_acc_mean = float(null_acc_arr.mean())
+            null_acc_sd = float(null_acc_arr.std(ddof=1)) if n_obs > 1 else 0.0
+            null_f1_mean = float(null_f1_arr.mean())
+            null_f1_sd = float(null_f1_arr.std(ddof=1)) if n_obs > 1 else 0.0
+            row["null_n_permutations"] = int(n_obs)
+            row["null_accuracy_mean"] = null_acc_mean
+            row["null_accuracy_sd"] = null_acc_sd
+            row["null_macro_f1_mean"] = null_f1_mean
+            row["null_macro_f1_sd"] = null_f1_sd
+            row["accuracy_z"] = (obs_acc - null_acc_mean) / (null_acc_sd + 1e-12)
+            row["macro_f1_z"] = (obs_f1 - null_f1_mean) / (null_f1_sd + 1e-12)
+            row["accuracy_p_value"] = float(
+                (1 + (null_acc_arr >= obs_acc).sum()) / (1 + n_obs)
+            )
+            row["macro_f1_p_value"] = float(
+                (1 + (null_f1_arr >= obs_f1).sum()) / (1 + n_obs)
+            )
+
     return row
 
 
@@ -564,6 +665,8 @@ def run_identity_probes(
                 solver=args.solver,
                 max_iter=args.max_iter,
                 n_jobs=args.n_jobs,
+                n_permutations=args.n_permutations,
+                null_rng_seed=(args.null_random_seed if args.null_random_seed is not None else args.random_seed),
             )
             print(f"Finished axis probes in {elapsed(start)}")
             if result:
@@ -606,6 +709,8 @@ def run_identity_probes(
                 max_iter=args.max_iter,
                 n_jobs=args.n_jobs,
                 axis=axis,
+                n_permutations=args.n_permutations,
+                null_rng_seed=(args.null_random_seed if args.null_random_seed is not None else args.random_seed),
             )
             print(f"Finished identity-within-axis probes in {elapsed(start)}")
             if result:
@@ -647,6 +752,8 @@ def run_surface_probes(
             solver=args.solver,
             max_iter=args.max_iter,
             n_jobs=args.n_jobs,
+            n_permutations=args.n_permutations,
+            null_rng_seed=(args.null_random_seed if args.null_random_seed is not None else args.random_seed),
         )
         print(f"Finished surface-form probe in {elapsed(start)}")
         if result:

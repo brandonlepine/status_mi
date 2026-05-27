@@ -38,7 +38,9 @@ Decomposes the set of identity contrast directions into a **shared social subspa
 
 **Targeted fix:** Re-estimate each contrast direction `d` on a held-out split of prompts (cross-family or cross-template), refit the SVD on those train-side directions, and evaluate `shared` / `residual` AUC on the held-out prompts only. Write a `decomposition_metrics_heldout.csv` alongside the in-sample version.
 
-### 2.2 [BLOCKER] — No null model for the SVD spectrum / "shared subspace" claim
+### 2.2 [BLOCKER] — No null model for the SVD spectrum / "shared subspace" claim (STILL OPEN)
+
+**Status:** The probe-side half of audit 2.2 landed in commits touching [Step 7](07_analyze_identity_geometry.md) and [Step 8](08_analyze_identity_geometry_diagnostics.md). This SVD-side half is still pending.
 
 **What's wrong:** The reported singular spectrum and PC structure are not compared with any null. Any set of ~19 unit vectors in 4096-d has *some* concentration in its leading SVD components; the question is whether the observed concentration exceeds chance. The script writes `shared_subspace_spectrum.csv` without a matched-null spectrum.
 

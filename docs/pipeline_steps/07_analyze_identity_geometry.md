@@ -39,13 +39,22 @@ First-pass characterization of identity geometry from the final-token residual s
 
 **Targeted fix:** Demote `auc_all` / `cohens_d_all` to a labeled diagnostic (or remove). Make the cross-family held-out AUC/d the headline everywhere they appear (here and in [Step 10](10_plot_identity_geometry.md), [Step 11](11_plot_identity_directional_visualizations.md), [Step 12](12_plot_identity_directional_followups.md)).
 
-### 2.2 [BLOCKER] — No null model for the central claims
+### 2.2 [BLOCKER] — No null model for probes (PROBE NULL LANDED 2026-05-27; SVD null still pending)
 
-**What's wrong:** `crossval_probe` reports accuracy / macro-F1 against chance only via `n_classes` arithmetic. There is no permutation null in which `identity_id` / `axis` labels are shuffled within the grouping structure and the probe re-run. With group structure / template leakage present in the data, the observed accuracy could reflect non-identity structure.
+**Status:** The probe permutation null landed; the shared-subspace SVD null (the other half of audit 2.2 in [Step 9](09_analyze_shared_social_subspace.md)) is still open.
 
-**Why it matters:** "Identity is linearly decodable from layer-X activations" needs a calibrated null to be a defensible claim. Without one, the probe accuracy numbers are uncalibrated.
+**What landed in this script:**
+- `_run_cv_folds` extracts the inner per-fold loop so the observed and null replicates share one implementation.
+- `crossval_probe` accepts `n_permutations` and `null_rng_seed`. When `n_permutations > 0`, `y` is globally shuffled per replicate and the GroupKFold split structure is preserved across all replicates (audit-recommended).
+- New CLI: `--n_permutations` (default `20`; bump to `>=100` for the headline number) and `--null_random_seed` (defaults to `--random_seed`).
+- Output rows gain `null_n_permutations`, `null_accuracy_mean`, `null_accuracy_sd`, `null_macro_f1_mean`, `null_macro_f1_sd`, `accuracy_z`, `macro_f1_z`, `accuracy_p_value`, `macro_f1_p_value`. The p-value uses the Phipson-Smyth `(1 + n_above) / (1 + N)` smoothing so `p > 0` always.
+- When `n_permutations == 0`, the null fields are written as `NaN` so downstream CSV readers can tell that no null was computed.
 
-**Targeted fix:** Add a label-permutation null: shuffle `identity_id` (respectively `axis`) within `template_id`/`family` strata, re-run `crossval_probe` ≥100 times, store the null distribution, and report observed accuracy as z-score / empirical p. Surface this in the output CSV (`accuracy_null_mean`, `accuracy_null_sd`, `z_score`, `p_value`).
+**Validation:** synthetic test cases confirm correct behavior (commit message documents these). Perfect-feature inputs hit p at the n-perm floor (1/(N+1)); noise inputs sit within the null with z ≈ 0 and high p; same seed reproduces the same null bit-for-bit.
+
+**Original audit (preserved for context):** `crossval_probe` reported accuracy / macro-F1 against chance only via `n_classes` arithmetic. With group structure / template leakage present in the data, the observed accuracy could reflect non-identity structure; without a calibrated null, "identity is linearly decodable from layer-X activations" is not a defensible claim.
+
+**Remaining work:** the shared-subspace SVD spectrum in [Step 9](09_analyze_shared_social_subspace.md) still lacks its own null (random-direction baseline + shuffled-identity SVD spectrum). That fix is a separate commit.
 
 ### 2.8 [MINOR] — Probe dimensionality reduction leaks across CV folds
 

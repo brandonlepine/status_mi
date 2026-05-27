@@ -49,13 +49,23 @@ Do not collapse the residualization grid into a single "best" residualization �
 
 **Targeted fix:** Make `plot_contrast_full_auc_residualized_by_layer` read from `contrast_family_holdout_residualized_scores.csv` instead (or add a held-out variant of that plot, demote the in-sample one to `*_in_sample`). Same change in [Step 10](10_plot_identity_geometry.md), [Step 11](11_plot_identity_directional_visualizations.md), [Step 12](12_plot_identity_directional_followups.md).
 
-### 2.2 [BLOCKER] — No null model for the central claims
+### 2.2 [BLOCKER] — No null model for the central claims (PROBE NULL LANDED 2026-05-27; η² / contrast / SVD nulls still pending)
 
-**What's wrong:** The residualized probe and contrast numbers are reported absolutely, with no permutation null. Across four residualizations the implicit comparison "raw vs residualized" is also uncalibrated — it is unclear how much the residualization-induced drop in AUC exceeds what shuffling `identity_id` labels would produce.
+**Status:** The probe permutation null landed in the diagnostics script. The other parts of audit 2.2 (η² under shuffled labels, contrast AUC null, shared-subspace SVD null) are still open.
 
-**Why it matters:** Without a null, "η² for identity is X" and "axis probe macro-F1 drops from A to B under family residualization" are descriptive statistics, not findings.
+**What landed in this script:**
+- `_run_cv_folds_diag` extracts the per-fold loop; observed and null share one implementation.
+- `crossval_probe` accepts `n_permutations` and `null_rng_seed`. Same shuffle strategy as [Step 7](07_analyze_identity_geometry.md): global y shuffle per replicate, GroupKFold split structure preserved.
+- New CLI: `--n_permutations` (default `20`) and `--null_random_seed` (defaults to `--random_seed`).
+- All three diagnostic probes (axis prediction, identity-within-axis prediction, surface-form probes for `required_form`/`family`/`template_id`) carry the null through. Output rows gain `null_n_permutations`, `null_accuracy_mean`, `null_accuracy_sd`, `null_macro_f1_mean`, `null_macro_f1_sd`, `accuracy_z`, `macro_f1_z`, `accuracy_p_value`, `macro_f1_p_value` (Phipson-Smyth smoothed).
 
-**Targeted fix:** Add a permutation null (shuffle `identity_id` within `family` strata, ≥100 reps) to the probes and contrasts; for variance decomposition, report η² alongside the null distribution of η² under shuffled labels. Save null summaries alongside the observed CSVs (`*_null_mean`, `*_null_sd`, `*_z_score`).
+**Original audit (preserved for context):** The residualized probe and contrast numbers were reported absolutely, with no permutation null. Across four residualizations the implicit comparison "raw vs residualized" was also uncalibrated — it was unclear how much the residualization-induced drop in AUC exceeds what shuffling `identity_id` labels would produce.
+
+**Remaining work:**
+- Add a permutation null for the variance decomposition (η²) under shuffled identity labels.
+- Add a permutation null for the per-contrast AUC / family-holdout AUC (similar shuffle, applied to the contrast-direction projection).
+- Add a null for the shared-subspace SVD spectrum in [Step 9](09_analyze_shared_social_subspace.md): random unit vectors vs shuffled-identity directions.
+- Probe nulls are surfaced in the existing CSV columns; the remaining nulls will need new sidecar CSVs (`variance_decomposition_null.csv`, `contrast_null_distribution.csv`).
 
 ### 4.1 [MAJOR] — Contrast lists reference identities that do not exist (silently skipped)
 

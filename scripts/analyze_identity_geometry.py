@@ -135,6 +135,22 @@ def parse_args() -> argparse.Namespace:
         help="Skip logistic probe analyses and compute only PCA/means/stability/contrasts.",
     )
     parser.add_argument("--random_seed", type=int, default=42)
+    parser.add_argument(
+        "--n_permutations",
+        type=int,
+        default=20,
+        help=(
+            "Number of label-permutation null replicates per probe (audit 2.2). "
+            "Default 20 keeps the run tractable; bump to >=100 for the headline number. "
+            "Set 0 to disable; null fields are then NaN."
+        ),
+    )
+    parser.add_argument(
+        "--null_random_seed",
+        type=int,
+        default=None,
+        help="RNG seed for the permutation null. Defaults to --random_seed.",
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -391,13 +407,80 @@ def build_probe_model() -> LogisticRegression:
     )
 
 
+def _run_cv_folds(
+    x: np.ndarray,
+    y: pd.Series,
+    splits: list[tuple[np.ndarray, np.ndarray]],
+    split_type: str,
+    layer: int,
+    verbose: bool = True,
+) -> tuple[list[float], list[float]]:
+    """Inner CV loop. Returns (accuracies, macro_f1s) over the provided folds.
+    Reused for both the observed probe and each permutation null replicate."""
+    accuracies: list[float] = []
+    macro_f1s: list[float] = []
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ConvergenceWarning)
+        warnings.simplefilter("ignore", RuntimeWarning)
+        for train_idx, test_idx in splits:
+            if y.iloc[train_idx].nunique() < 2 or y.iloc[test_idx].nunique() < 2:
+                continue
+            x_train = x[train_idx]
+            x_test = x[test_idx]
+            if not np.isfinite(x_train).all() or not np.isfinite(x_test).all():
+                if verbose:
+                    print(f"Skipping non-finite probe fold ({split_type}, layer {layer}).")
+                continue
+            if np.all(np.std(x_train, axis=0) == 0):
+                if verbose:
+                    print(f"Skipping zero-variance probe fold ({split_type}, layer {layer}).")
+                continue
+            model = build_probe_model()
+            try:
+                model.fit(x_train, y.iloc[train_idx])
+                pred = model.predict(x_test)
+                accuracies.append(accuracy_score(y.iloc[test_idx], pred))
+                macro_f1s.append(f1_score(y.iloc[test_idx], pred, average="macro"))
+            except Exception as exc:
+                if verbose:
+                    print(f"Skipping failed probe fold ({split_type}, layer {layer}): {exc}")
+                continue
+    return accuracies, macro_f1s
+
+
+def _empty_null_fields() -> dict[str, float | int]:
+    return {
+        "null_n_permutations": 0,
+        "null_accuracy_mean": float("nan"),
+        "null_accuracy_sd": float("nan"),
+        "null_macro_f1_mean": float("nan"),
+        "null_macro_f1_sd": float("nan"),
+        "accuracy_z": float("nan"),
+        "macro_f1_z": float("nan"),
+        "accuracy_p_value": float("nan"),
+        "macro_f1_p_value": float("nan"),
+    }
+
+
 def crossval_probe(
     x: np.ndarray,
     y: pd.Series,
     groups: pd.Series,
     split_type: str,
     layer: int,
+    n_permutations: int = 0,
+    null_rng_seed: int = 42,
 ) -> dict[str, float | int | str] | None:
+    """Probe a feature matrix on labels with GroupKFold cross-validation, and
+    optionally compute a label-permutation null (audit issue 2.2).
+
+    When n_permutations > 0, y is globally shuffled `n_permutations` times
+    (with the GroupKFold structure preserved across all replicates). The
+    observed accuracy / macro-F1 are reported alongside null mean / SD,
+    a z-score, and a Phipson-Smyth smoothed empirical p-value (the
+    fraction of null replicates that meet or exceed the observed value,
+    plus a +1 / +1 smoothing so p > 0 even with all-null-below).
+    """
     y = y.reset_index(drop=True)
     groups = groups.reset_index(drop=True)
     n_classes = y.nunique()
@@ -412,48 +495,63 @@ def crossval_probe(
     except ValueError as exc:
         print(f"Skipping probe split ({split_type}, layer {layer}): {exc}")
         return None
-    accuracies = []
-    macro_f1s = []
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", ConvergenceWarning)
-        warnings.simplefilter("ignore", RuntimeWarning)
-        for train_idx, test_idx in splits:
-            if y.iloc[train_idx].nunique() < 2 or y.iloc[test_idx].nunique() < 2:
-                continue
-            x_train = x[train_idx]
-            x_test = x[test_idx]
-            if not np.isfinite(x_train).all() or not np.isfinite(x_test).all():
-                print(
-                    f"Skipping non-finite probe fold ({split_type}, layer {layer})."
-                )
-                continue
-            if np.all(np.std(x_train, axis=0) == 0):
-                print(f"Skipping zero-variance probe fold ({split_type}, layer {layer}).")
-                continue
-            model = build_probe_model()
-            try:
-                model.fit(x_train, y.iloc[train_idx])
-                pred = model.predict(x_test)
-                accuracies.append(accuracy_score(y.iloc[test_idx], pred))
-                macro_f1s.append(f1_score(y.iloc[test_idx], pred, average="macro"))
-            except Exception as exc:
-                print(f"Skipping failed probe fold ({split_type}, layer {layer}): {exc}")
-                continue
-
+    accuracies, macro_f1s = _run_cv_folds(x, y, splits, split_type, layer, verbose=True)
     if not accuracies:
         return None
 
-    return {
+    obs_acc = float(np.mean(accuracies))
+    obs_f1 = float(np.mean(macro_f1s))
+
+    result: dict[str, float | int | str] = {
         "layer": layer,
         "split_type": split_type,
         "n_classes": int(n_classes),
         "n_samples": int(len(y)),
-        "accuracy_mean": float(np.mean(accuracies)),
+        "accuracy_mean": obs_acc,
         "accuracy_sd": float(np.std(accuracies, ddof=1)) if len(accuracies) > 1 else 0.0,
-        "macro_f1_mean": float(np.mean(macro_f1s)),
+        "macro_f1_mean": obs_f1,
         "macro_f1_sd": float(np.std(macro_f1s, ddof=1)) if len(macro_f1s) > 1 else 0.0,
     }
+    result.update(_empty_null_fields())
+
+    if n_permutations > 0:
+        rng = np.random.default_rng(null_rng_seed)
+        y_arr = y.to_numpy()
+        null_accs: list[float] = []
+        null_f1s: list[float] = []
+        for _ in range(n_permutations):
+            y_perm = pd.Series(rng.permutation(y_arr))
+            perm_accs, perm_f1s = _run_cv_folds(
+                x, y_perm, splits, split_type, layer, verbose=False
+            )
+            if perm_accs:
+                null_accs.append(float(np.mean(perm_accs)))
+                null_f1s.append(float(np.mean(perm_f1s)))
+        if null_accs:
+            null_acc_arr = np.asarray(null_accs)
+            null_f1_arr = np.asarray(null_f1s)
+            n_obs = len(null_acc_arr)
+            null_acc_mean = float(null_acc_arr.mean())
+            null_acc_sd = float(null_acc_arr.std(ddof=1)) if n_obs > 1 else 0.0
+            null_f1_mean = float(null_f1_arr.mean())
+            null_f1_sd = float(null_f1_arr.std(ddof=1)) if n_obs > 1 else 0.0
+            result["null_n_permutations"] = int(n_obs)
+            result["null_accuracy_mean"] = null_acc_mean
+            result["null_accuracy_sd"] = null_acc_sd
+            result["null_macro_f1_mean"] = null_f1_mean
+            result["null_macro_f1_sd"] = null_f1_sd
+            result["accuracy_z"] = (obs_acc - null_acc_mean) / (null_acc_sd + 1e-12)
+            result["macro_f1_z"] = (obs_f1 - null_f1_mean) / (null_f1_sd + 1e-12)
+            # Phipson-Smyth smoothed empirical p (Phipson & Smyth 2010).
+            result["accuracy_p_value"] = float(
+                (1 + (null_acc_arr >= obs_acc).sum()) / (1 + n_obs)
+            )
+            result["macro_f1_p_value"] = float(
+                (1 + (null_f1_arr >= obs_f1).sum()) / (1 + n_obs)
+            )
+
+    return result
 
 
 def run_probes(
@@ -462,6 +560,8 @@ def run_probes(
     layer: int,
     probe_pca_dim: int,
     random_seed: int,
+    n_permutations: int = 0,
+    null_rng_seed: int = 42,
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
     x_probe = make_probe_features(x, probe_pca_dim, random_seed, layer)
     if x_probe is None:
@@ -476,6 +576,8 @@ def run_probes(
                 groups=metadata[group_col],
                 split_type=f"group_by_{group_col}",
                 layer=layer,
+                n_permutations=n_permutations,
+                null_rng_seed=null_rng_seed,
             )
         except Exception as exc:
             print(f"Skipping axis probe ({group_col}, layer {layer}): {exc}")
@@ -495,6 +597,8 @@ def run_probes(
                 groups=axis_meta["template_id"].reset_index(drop=True),
                 split_type="group_by_template_id",
                 layer=layer,
+                n_permutations=n_permutations,
+                null_rng_seed=null_rng_seed,
             )
         except Exception as exc:
             print(f"Skipping identity-within-axis probe ({axis}, layer {layer}): {exc}")
@@ -750,13 +854,16 @@ def main() -> None:
         if args.skip_probes:
             print("  Probes skipped")
         else:
-            print("  Probes")
+            print(f"  Probes (null n_permutations={args.n_permutations})")
+            null_seed = args.null_random_seed if args.null_random_seed is not None else args.random_seed
             axis_rows, identity_rows = run_probes(
                 x=x,
                 metadata=metadata,
                 layer=layer,
                 probe_pca_dim=args.probe_pca_dim,
                 random_seed=args.random_seed,
+                n_permutations=args.n_permutations,
+                null_rng_seed=null_seed,
             )
             axis_probe_rows.extend(axis_rows)
             identity_probe_rows.extend(identity_rows)

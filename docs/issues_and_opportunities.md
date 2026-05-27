@@ -159,17 +159,31 @@ What to do:
 - Demote in-sample AUC to a clearly-labeled diagnostic, or remove it. Make the **held-out** AUC (cross-template, cross-family) the headline number everywhere.
 - For the shared-subspace decomposition, evaluate shared/residual components with the *direction estimated on held-out prompts* too.
 
-### 2.2 [BLOCKER] No null model for the central claims
+### 2.2 [BLOCKER] No null model for the central claims (PROBE NULL LANDED 2026-05-27; SVD null still pending)
+
+**Status:** The probe-side null landed for both `analyze_identity_geometry.py` and `analyze_identity_geometry_diagnostics.py`. The shared-subspace SVD null in `analyze_shared_social_subspace.py` is still pending.
+
+**What landed:**
+- `_run_cv_folds` (geometry) / `_run_cv_folds_diag` (diagnostics) extract the inner CV loop so observed and null share one implementation.
+- `crossval_probe` in both scripts accepts `n_permutations` and `null_rng_seed`. When `n_permutations > 0`, `y` is globally shuffled per replicate while the GroupKFold split structure is preserved across all replicates.
+- New CLI flags on both scripts: `--n_permutations` (default `20`; bump to `>=100` for the headline number) and `--null_random_seed` (defaults to `--random_seed`).
+- All probe output rows gain `null_n_permutations`, `null_accuracy_mean`, `null_accuracy_sd`, `null_macro_f1_mean`, `null_macro_f1_sd`, `accuracy_z`, `macro_f1_z`, `accuracy_p_value`, `macro_f1_p_value`. The p-value uses Phipson-Smyth `(1 + n_above) / (1 + N)` smoothing.
+- When `n_permutations == 0` the null fields are `NaN` so downstream readers can tell that no null was computed.
+- Unit-tested on synthetic data: perfect-feature inputs hit p at the n-perm floor (1/(N+1)); noise inputs sit within the null distribution with z ≈ 0 and high p; same seed reproduces the same null bit-for-bit; both scripts produce equivalent numbers.
+
+**Original audit (preserved):**
 
 The geometry probes (`crossval_probe`) report accuracy/macro-F1 but never a **label-permutation null**. The shared-subspace SVD reports a singular-value spectrum but never compares it to the spectrum of *random* directions or directions from *shuffled* identity labels. Without a null:
 
 - "Identity is linearly decodable" — high CV accuracy could partly reflect group structure / template leakage rather than identity content.
 - "There is a shared social subspace" — *any* set of ~19 unit vectors in 4096-d has *some* SVD spectrum; concentration only means something relative to a null. As written, the "shared subspace" claim is not yet supported.
 
-What to do:
-- Probes: add a permutation null (shuffle `identity_id` / `axis` labels within the grouping structure, re-run CV, repeat ≥100×). Report observed accuracy as a z-score / empirical p against that null.
-- Shared subspace: build directions from shuffled identity assignments (or from random splits of each axis), re-SVD, and compare the real spectrum's concentration (e.g. participation ratio, or variance in top-k) to the null distribution. Only then is "shared subspace" a finding.
-- The BBQ analyzer already has a sign-flip permutation test — good. Bring the same discipline to the geometry side.
+**Remaining work:**
+- Shared subspace ([Step 9](pipeline_steps/09_analyze_shared_social_subspace.md)): build directions from shuffled identity assignments (or from random splits of each axis), re-SVD, and compare the real spectrum's concentration (e.g. participation ratio, or variance in top-k) to the null distribution. Only then is "shared subspace" a finding.
+- η² in [Step 8](pipeline_steps/08_analyze_identity_geometry_diagnostics.md): report under shuffled identity labels alongside observed.
+- Per-contrast AUC / family-holdout AUC nulls (also in Step 7 / Step 8): apply the same shuffle to the contrast direction projections.
+
+The BBQ analyzer already has a sign-flip permutation test — good. The geometry side now matches that discipline for probes; finishing the SVD and contrast-direction nulls completes 2.2.
 
 ### 2.3 [BLOCKER] Steering controls are disabled in the production run
 
