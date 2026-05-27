@@ -238,7 +238,7 @@ For each layer:
 - For each contrast in `DEFAULT_CONTRASTS` (a fixed list of identity pairs):
   - **Feature selectivity** (`feature_selectivity_for_contrast`): same idea but for the contrast pair. Records `mean_a`, `mean_b`, `freq_a`, `freq_b`, `diff_mean`, `cohens_d`, `auc`, plus ordinal ranks.
   - **Decoder alignment** (`decoder_alignment`): cosine between each decoder row and the centered difference-of-means direction `d_c`; also signed dot product. Ranks features by `|cosine|`.
-  - **Joined** table merges selectivity + alignment, adds `combined_score = z(|d|) + z(|cosine|) + z(|auc − 0.5|)`.
+  - **Joined** table merges selectivity + alignment, adds `combined_score = 0.5·z(|cohens_d|) + 0.5·z(|cosine_with_direction|)` (audit 5.3 closed 2026-05-27 in commit `3b48e5b`; the prior formula additionally included `z(|auc − 0.5|)`, which double-weighted selectivity vs decoder alignment since d and auc are monotonically related). Weights and rationale are written to `run_config.json`.
   - **Direction reconstruction** (`reconstruction_rows`): given different feature selection methods (`decoder_alignment`, `selectivity`, `combined_score`, `random_baseline`), pick top-k decoder rows and compute the true orthogonal projection of the contrast direction onto `span(rows of basis)` via `np.linalg.lstsq` (audit 5.1 closed 2026-05-27 in commit `1a569c3`), unit-normalize, and re-score AUC/d. Records `cosine_with_full_direction`, `fraction_norm_captured` (now correctly in `[0, 1]`, with `fraction = cosine²` by the projection identity), and post-reconstruction AUC/d for `k ∈ {5,10,20,50,100,200}`.
   - **Intervention candidates** (`intervention_candidates`): top-N features by `combined_score` with a `direction_side` flag and "recommended_intervention: ablate".
 

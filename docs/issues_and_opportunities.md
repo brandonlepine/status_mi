@@ -401,9 +401,13 @@ What to do:
 - If a feature *taxonomy* is a paper contribution, validate it: human inter-rater agreement on a sample of feature cards, and/or a behavioral criterion (e.g. "identity-token-local" features should show their causal effect specifically at `target_identity_last_token` and not at `final_prompt_token` — that is a testable, falsifiable prediction the steering data can check).
 - Sensitivity analysis: show conclusions are stable to reasonable changes in the weights/thresholds.
 
-### 5.3 [MINOR] `combined_score` sums three near-duplicate, equally-weighted metrics
+### 5.3 [MINOR] `combined_score` sums three near-duplicate, equally-weighted metrics (FIX LANDED 2026-05-27)
 
-`analyze_identity_sae_features.py` sets `combined_score = z(|d|) + z(|cos|) + z(|auc − 0.5|)`. Cohen's d and AUC both measure the same A/B separation and are monotonically related, so the score effectively double-weights selectivity vs. decoder alignment. Use one selectivity metric (d *or* AUC) plus the decoder cosine, or justify the weighting. Minor, but it propagates into `per_contrast_topk` feature selection.
+**Status:** Closed in commit `3b48e5b` (`scripts/analyze_identity_sae_features.py`). The new formula is `combined_score = 0.5·z(|cohens_d|) + 0.5·z(|cosine_with_direction|)`. Selectivity uses Cohen's d only; alignment uses `|cosine|` at equal weight. Weights are surfaced in `run_config.json` (`combined_score_weights`, `combined_score_formula`, `combined_score_audit_note`). Schema of `feature_selectivity_alignment_joined.csv` unchanged.
+
+**Validation:** Pathological pair (Feature A high d+auc / low cos, Feature B low d+auc / high cos) — old formula favored A by +2.00 z-units; new formula puts them at parity (50/50). Realistic synthetic sweep with d↔auc correlated: Spearman ρ(old, new) = 0.92, so ~8% of the ranking shifts toward alignment-strong features.
+
+**Original audit (preserved):** `combined_score = z(|d|) + z(|cos|) + z(|auc − 0.5|)`. Cohen's d and AUC both measure the same A/B separation and are monotonically related, so the score effectively double-weighted selectivity vs. decoder alignment. Propagated into `per_contrast_topk` feature selection (Step 19), the triage's `max_combined_score` aggregator (Step 17), and the BBQ steering pool (Step 20).
 
 ### 5.4 [MINOR] Representation inconsistency: residualized direction vs. raw-encoded SAE features
 

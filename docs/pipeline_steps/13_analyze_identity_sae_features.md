@@ -34,7 +34,7 @@ The bridge from "geometric contrast directions" to "individual SAE features." Fo
 - Contrast direction (`compute_direction`, line 121) is the unit-normalized centered `mean(A) − mean(B)`, sign-flipped so identity_a scores higher.
 - `feature_selectivity_for_contrast` (line 199): computes Cohen's d and AUC analytically for **all** `n_features` via `compute_cohens_d_and_auc_for_all_features` (Cohen's d from sum/sum_sq/count using sample variance; AUC via the sparse 4-bucket decomposition), then ranks and keeps top `top_n` by `|d|`. The prior code prefiltered to `5 × top_n` by `|diff_mean|` before computing d/AUC, which biased the reported effect sizes upward. Audit 2.5 closed 2026-05-27.
 - `reconstruct_direction` solves the least-squares problem `argmin_c ||basis.T @ c − direction||²` via `np.linalg.lstsq` and sets `recon = c @ basis` — the true orthogonal projection of `direction` onto `span(rows of basis)`. `fraction_norm_captured = ||recon||² / ||direction||²` is now correctly in `[0, 1]` and equals `cosine_with_full_direction²` (projection identity). Audit 5.1 closed 2026-05-27 in commit `1a569c3`. The prior `coeff = basis @ direction; recon = coeff @ basis` (= `BᵀB d`) was only the orthogonal projection when `B Bᵀ = I`, which decoder rows don't satisfy.
-- `combined_score` (line 481) sums three z-scored magnitudes: `|d|`, `|cos|`, `|auc − 0.5|`. Since `d` and `auc` measure the same A/B separation, this double-weights selectivity vs alignment. See issue 5.3.
+- `combined_score = 0.5·z(|cohens_d|) + 0.5·z(|cosine_with_direction|)` (audit 5.3 closed 2026-05-27 in commit `3b48e5b`). The prior formula added `z(|auc − 0.5|)` as a third term, which double-weighted selectivity (d and auc are monotonically related) vs decoder alignment. The weights are surfaced in `run_config.json` under `combined_score_weights` / `combined_score_formula`.
 - Output CSVs are **appended** (`append_csv`) per layer/contrast, so the existing run requires `--overwrite` to rebuild cleanly.
 - The four numpy intervention helpers (lines 414-434) — `ablate_features_in_sae`, `steer_features_in_sae`, `decode_sae`, `patch_residual_with_sae_reconstruction` — are still defined here for analysis-side use, but the canonical torch primitives now live in [`scripts/encode_identity_saes.py`](05_encode_identity_saes.md) and are the ones consumed by [Step 20](20_run_bbq_sae_steering.md) under `--intervention_modes`. See issue 3.1 below.
 
@@ -95,13 +95,20 @@ The bridge from "geometric contrast directions" to "individual SAE features." Fo
 
 **Original audit (preserved):** `reconstruct_direction` computed `basis = decoder_normed[feature_ids]`, then `coeff = basis @ direction; recon = coeff @ basis` — i.e. `BᵀB d`. With `B` having unit-norm rows but **not** orthogonal rows (related identity features generally are not orthogonal), the orthogonal projection of `d` onto `span(B)` is actually `Bᵀ(BBᵀ)⁻¹B d`. So `fraction_norm_captured = ||recon||²` was not bounded in `[0, 1]` and was not a fraction of anything; `cosine_with_full_direction` was taken against a non-projection vector. The reconstruction table is meant to answer "how much of the identity direction do `k` SAE features capture" — a natural and reviewable claim — and the headline number in `direction_reconstruction.csv` did not have the interpretation the column name implied.
 
-### 5.3 [MINOR] — `combined_score` sums three near-duplicate, equally-weighted metrics
+### 5.3 [MINOR] — `combined_score` sums three near-duplicate, equally-weighted metrics (FIX LANDED 2026-05-27)
 
-**What's wrong:** `combined_score = zscore(|cohens_d|) + zscore(|cos|) + zscore(|auc − 0.5|)` (line 481). Cohen's d and AUC both measure the same A/B distribution separation and are monotonically related, so the score effectively double-weights selectivity relative to decoder alignment.
+**Status:** Closed in commit `3b48e5b`. Selectivity uses Cohen's d only; alignment uses `|cosine_with_direction|`; weights are 50/50 and documented in `run_config.json`.
 
-**Why it matters:** Propagates into `intervention_candidate_features.csv`, into `extract_token_level_sae_activations.py:select_features` (which picks features by `combined_score`), into `build_sae_feature_cards.py`, and into the triage. The "top by combined_score" features are systematically biased toward selectivity-only features over alignment-only features.
+**What landed:**
+- New formula: `combined_score = 0.5·zscore(|cohens_d|) + 0.5·zscore(|cosine_with_direction|)`.
+- `run_config.json` now contains `combined_score_weights` (`{"cohens_d": 0.5, "decoder_cosine": 0.5}`), `combined_score_formula` (the literal expression as a string), and `combined_score_audit_note` (rationale + reference to audit 5.3). Any downstream consumer that loads the config can see the choice.
+- Schema of `feature_selectivity_alignment_joined.csv` unchanged.
 
-**Targeted fix:** Pick **one** selectivity metric (d **or** AUC) and combine with decoder cosine. E.g. `combined_score = 0.5 zscore(|d|) + 0.5 zscore(|cos|)`. Document the weighting choice in `run_config.json`. Re-run downstream feature selection.
+**Validation (synthetic):** Pathological pair — Feature A has high d+auc but low cosine, Feature B has low d+auc but high cosine. Old formula favored A by +2.00 z-units (d and auc both swing it); new formula puts them at parity (50/50 weight). On a realistic 500-feature sweep with d↔auc correlated, Spearman ρ(old, new) = 0.92 — high but not 1, so the rebalance correctly shifts ~8% of the ranking toward alignment-strong features.
+
+**Downstream:** `plot_identity_sae_features.py`, `triage_sae_identity_features.py`, `build_sae_feature_cards.py`, and `run_bbq_sae_steering.py` all sort by `combined_score`; the corrected ranking propagates on next regeneration. The "top by combined_score" features under the old formula were systematically biased toward selectivity-strong features over alignment-strong features.
+
+**Original audit (preserved):** `combined_score = zscore(|cohens_d|) + zscore(|cos|) + zscore(|auc − 0.5|)`. Cohen's d and AUC both measure the same A/B distribution separation and are monotonically related, so the score effectively double-weighted selectivity relative to decoder alignment.
 
 ### 5.4 [MINOR] — Residualized direction vs raw-encoded SAE features inconsistency
 
@@ -136,7 +143,7 @@ Add the chosen mode to `run_config.json` and assert downstream.
 - [ ] Decide on a single representation: residualize end-to-end (re-encode through SAE on residualized activations) **or** keep everything raw. Document in `run_config.json`. (5.4)
 - [x] Replace `feature_selectivity_for_contrast`'s `|diff_mean|` prefilter with full computation. (2.5) *(Done 2026-05-27: commit `4481445` — analytical d/AUC for all features; identity_selectivity also fixed.)* **Still open:** holdout-set confirmation columns, bundled with 2.1 winner's-curse correction.
 - [x] Replace `reconstruct_direction` with a proper least-squares projection (`np.linalg.lstsq` or QR). Re-derive `fraction_norm_captured` as the normalized squared norm. (5.1) *(Done 2026-05-27: commit `1a569c3`.)*
-- [ ] Rebalance `combined_score`: use one of `|d|`/`|auc-0.5|` plus `|cos|` with a documented weighting. (5.3)
+- [x] Rebalance `combined_score`: use one of `|d|`/`|auc-0.5|` plus `|cos|` with a documented weighting. (5.3) *(Done 2026-05-27: commit `3b48e5b` — 0.5·z(|d|) + 0.5·z(|cos|), weights in run_config.json.)*
 - [x] Extract canonical SAE intervention primitives into a shared module so `run_bbq_sae_steering.py` can consume them. (3.1) *(Done 2026-05-27: torch primitives in `scripts/encode_identity_saes.py`, commits `11d4a4d` + `84c87b5`.)*
 - [ ] Convert `load_contrasts`'s silent `print` into a `warnings.warn` (or fail) so missing identity IDs cannot be masked. (4.1)
 - [ ] Re-run with `--overwrite` after the above; downstream scripts (token-level extraction, feature cards, triage) must be re-run to pick up the new CSVs.
