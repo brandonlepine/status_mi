@@ -178,13 +178,134 @@ def dense_feature_values(long_df: pd.DataFrame, feature_id: int, n_rows: int) ->
 def summarize_feature_groups(long_df: pd.DataFrame, mask: np.ndarray, n_features: int, prefix: str) -> pd.DataFrame:
     rows = np.flatnonzero(mask)
     subset = long_df[long_df["row"].isin(rows)]
-    grouped = subset.groupby("feature_id")["activation"].agg(["sum", "count", "mean"]).reset_index()
-    grouped = grouped.rename(columns={"sum": f"sum_{prefix}", "count": f"nonzero_{prefix}", "mean": f"mean_nonzero_{prefix}"})
+    activation = subset["activation"].to_numpy()
+    grouped = subset.assign(activation_sq=activation * activation).groupby("feature_id").agg(
+        **{
+            f"sum_{prefix}": ("activation", "sum"),
+            f"nonzero_{prefix}": ("activation", "count"),
+            f"mean_nonzero_{prefix}": ("activation", "mean"),
+            f"sum_sq_{prefix}": ("activation_sq", "sum"),
+        }
+    ).reset_index()
     out = pd.DataFrame({"feature_id": np.arange(n_features, dtype=np.int64)})
     out = out.merge(grouped, on="feature_id", how="left").fillna(0)
     out[f"mean_{prefix}"] = out[f"sum_{prefix}"] / max(1, int(mask.sum()))
     out[f"freq_{prefix}"] = out[f"nonzero_{prefix}"] / max(1, int(mask.sum()))
     return out
+
+
+def compute_cohens_d_and_auc_for_all_features(
+    long_df: pd.DataFrame,
+    mask_a: np.ndarray,
+    mask_b: np.ndarray,
+    df_groups: pd.DataFrame,
+    prefix_a: str,
+    prefix_b: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute Cohen's d and AUC for every row of df_groups (i.e. every feature).
+
+    Closes audit 2.5 (winner's-curse). The previous code applied a top-(5·k)
+    |diff_mean| prefilter before computing per-feature d/AUC, which conditions
+    the reported effect sizes on survival of that screen. Here we compute both
+    metrics analytically and on a sparse-aware basis for ALL features:
+
+    Cohen's d (sample variance, ddof=1; matches common.cohens_d):
+        var = (sum_sq - n·mean²) / (n - 1)
+        pooled = ((n_a - 1)·var_a + (n_b - 1)·var_b) / (n_a + n_b - 2)
+        d = (mean_a - mean_b) / sqrt(pooled), NaN when pooled <= 0 or n < 2.
+
+    AUC, exploiting the fact that long_df only stores positive activations:
+        Buckets over pairs (i ∈ a, j ∈ b):
+          B1: both zero  → tie  → 0.5 each
+          B2: a > 0, b = 0      → 1   each (positive > 0)
+          B3: a = 0, b > 0      → 0   each
+          B4: a > 0, b > 0      → direct comparison of nonzero arrays
+
+        For features with B4 empty (k_a = 0 XOR k_b = 0 XOR both 0), AUC has
+        a closed form in (k_a, k_b, n_a, n_b). For B4-active features we
+        materialize the small nonzero arrays once via groupby and compare.
+    """
+    n_a = int(mask_a.sum())
+    n_b = int(mask_b.sum())
+    n_features = len(df_groups)
+
+    sum_a = df_groups[f"sum_{prefix_a}"].to_numpy(dtype=np.float64)
+    sum_b = df_groups[f"sum_{prefix_b}"].to_numpy(dtype=np.float64)
+    sum_sq_a = df_groups[f"sum_sq_{prefix_a}"].to_numpy(dtype=np.float64)
+    sum_sq_b = df_groups[f"sum_sq_{prefix_b}"].to_numpy(dtype=np.float64)
+    nz_a = df_groups[f"nonzero_{prefix_a}"].to_numpy(dtype=np.int64)
+    nz_b = df_groups[f"nonzero_{prefix_b}"].to_numpy(dtype=np.int64)
+
+    mean_a = sum_a / max(n_a, 1)
+    mean_b = sum_b / max(n_b, 1)
+
+    if n_a >= 2:
+        var_a = np.clip((sum_sq_a - n_a * mean_a ** 2) / (n_a - 1), 0.0, None)
+    else:
+        var_a = np.zeros_like(sum_a)
+    if n_b >= 2:
+        var_b = np.clip((sum_sq_b - n_b * mean_b ** 2) / (n_b - 1), 0.0, None)
+    else:
+        var_b = np.zeros_like(sum_b)
+
+    denom_pooled = max(n_a + n_b - 2, 1)
+    pooled = ((n_a - 1) * var_a + (n_b - 1) * var_b) / denom_pooled
+    cohens_d_arr = np.full(n_features, np.nan, dtype=np.float64)
+    if n_a >= 2 and n_b >= 2:
+        valid = pooled > 0
+        cohens_d_arr[valid] = (mean_a[valid] - mean_b[valid]) / np.sqrt(pooled[valid])
+
+    auc_arr = np.full(n_features, 0.5, dtype=np.float64)
+    if n_a > 0 and n_b > 0:
+        bucket_a_only = (nz_a > 0) & (nz_b == 0)
+        auc_arr[bucket_a_only] = (nz_a[bucket_a_only] + 0.5 * (n_a - nz_a[bucket_a_only])) / n_a
+
+        bucket_b_only = (nz_a == 0) & (nz_b > 0)
+        auc_arr[bucket_b_only] = 0.5 * (n_b - nz_b[bucket_b_only]) / n_b
+
+        bucket_both = (nz_a > 0) & (nz_b > 0)
+        both_feature_ids = df_groups.loc[bucket_both, "feature_id"].astype(np.int64).to_numpy()
+        if both_feature_ids.size:
+            row_to_group = np.full(len(mask_a), -1, dtype=np.int8)
+            row_to_group[mask_a] = 0
+            row_to_group[mask_b] = 1
+            row_arr = long_df["row"].to_numpy()
+            grp_arr = row_to_group[row_arr]
+            in_ab = grp_arr >= 0
+            in_set = np.isin(long_df["feature_id"].to_numpy(), both_feature_ids)
+            keep = in_ab & in_set
+            sub = pd.DataFrame({
+                "feature_id": long_df["feature_id"].to_numpy()[keep],
+                "group": grp_arr[keep],
+                "activation": long_df["activation"].to_numpy()[keep].astype(np.float64),
+            })
+            nonzero_by_feat: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+            for fid, grp in sub.groupby("feature_id"):
+                vals_a = grp.loc[grp["group"] == 0, "activation"].to_numpy()
+                vals_b = grp.loc[grp["group"] == 1, "activation"].to_numpy()
+                nonzero_by_feat[int(fid)] = (vals_a, vals_b)
+            feature_id_col = df_groups["feature_id"].to_numpy(dtype=np.int64)
+            both_indices = np.flatnonzero(bucket_both)
+            inv_n_ab = 1.0 / (n_a * n_b)
+            for idx in both_indices:
+                fid = int(feature_id_col[idx])
+                vals_a, vals_b = nonzero_by_feat.get(fid, (np.zeros(0), np.zeros(0)))
+                k_a = vals_a.size
+                k_b = vals_b.size
+                if k_a == 0 or k_b == 0:
+                    continue  # safety: shouldn't happen given the mask
+                diff = vals_a[:, None] - vals_b[None, :]
+                wins = float((diff > 0).sum())
+                ties = float((diff == 0).sum())
+                numerator = (
+                    0.5 * (n_a - k_a) * (n_b - k_b)
+                    + k_a * (n_b - k_b)
+                    + wins
+                    + 0.5 * ties
+                )
+                auc_arr[idx] = numerator * inv_n_ab
+
+    return cohens_d_arr, auc_arr
 
 
 def feature_selectivity_for_contrast(
@@ -195,31 +316,29 @@ def feature_selectivity_for_contrast(
     top_n: int,
     layer: int,
 ) -> pd.DataFrame:
+    """Compute per-feature contrast selectivity (Cohen's d / AUC / diff_mean)
+    for ALL features, then rank and return the top_n. Audit 2.5: prior code
+    pre-filtered to top (5·top_n) by |diff_mean| before computing d / AUC,
+    which conditioned the reported effect sizes on having survived that
+    selection screen and biased them upward. The d / AUC are now computed
+    analytically over the full feature set using sufficient-statistic
+    aggregations (see compute_cohens_d_and_auc_for_all_features)."""
     mask_a = metadata["identity_id"].eq(contrast.identity_a).to_numpy()
     mask_b = metadata["identity_id"].eq(contrast.identity_b).to_numpy()
     stats_a = summarize_feature_groups(long_df, mask_a, n_features, "a")
     stats_b = summarize_feature_groups(long_df, mask_b, n_features, "b")
     df = stats_a.merge(stats_b, on="feature_id", how="outer").fillna(0)
     df["diff_mean"] = df["mean_a"] - df["mean_b"]
-    df["pooled"] = np.nan
-    candidates = df.reindex(df["diff_mean"].abs().sort_values(ascending=False).head(max(top_n * 5, top_n)).index).copy()
-    aucs = []
-    ds = []
-    for feature_id in candidates["feature_id"].astype(int):
-        vals = dense_feature_values(long_df, feature_id, len(metadata))
-        a = vals[mask_a]
-        b = vals[mask_b]
-        labels = np.concatenate([np.ones(len(a)), np.zeros(len(b))])
-        scores = np.concatenate([a, b])
-        aucs.append(float(roc_auc_score(labels, scores)) if len(np.unique(labels)) == 2 else float("nan"))
-        ds.append(cohens_d(a, b))
-    candidates["auc"] = aucs
-    candidates["cohens_d"] = ds
-    candidates["auc_distance"] = (candidates["auc"] - 0.5).abs()
-    candidates["rank_abs_d"] = candidates["cohens_d"].abs().rank(method="min", ascending=False)
-    candidates["rank_auc"] = candidates["auc_distance"].rank(method="min", ascending=False)
-    candidates["rank_abs_diff"] = candidates["diff_mean"].abs().rank(method="min", ascending=False)
-    candidates = candidates.sort_values(["rank_abs_d", "rank_auc", "rank_abs_diff"]).head(top_n).copy()
+    cohens_d_arr, auc_arr = compute_cohens_d_and_auc_for_all_features(
+        long_df, mask_a, mask_b, df, prefix_a="a", prefix_b="b"
+    )
+    df["cohens_d"] = cohens_d_arr
+    df["auc"] = auc_arr
+    df["auc_distance"] = (df["auc"] - 0.5).abs()
+    df["rank_abs_d"] = df["cohens_d"].abs().rank(method="min", ascending=False, na_option="bottom")
+    df["rank_auc"] = df["auc_distance"].rank(method="min", ascending=False, na_option="bottom")
+    df["rank_abs_diff"] = df["diff_mean"].abs().rank(method="min", ascending=False, na_option="bottom")
+    candidates = df.sort_values(["rank_abs_d", "rank_auc", "rank_abs_diff"]).head(top_n).copy()
     candidates["layer"] = layer
     candidates["contrast_name"] = contrast.contrast_name
     candidates["axis"] = contrast.axis
@@ -227,7 +346,6 @@ def feature_selectivity_for_contrast(
     candidates["identity_b"] = contrast.identity_b
     candidates["n_a"] = int(mask_a.sum())
     candidates["n_b"] = int(mask_b.sum())
-    candidates = candidates.rename(columns={"freq_a": "freq_a", "freq_b": "freq_b", "mean_nonzero_a": "mean_nonzero_a", "mean_nonzero_b": "mean_nonzero_b"})
     columns = [
         "layer", "contrast_name", "axis", "identity_a", "identity_b", "feature_id",
         "mean_a", "mean_b", "freq_a", "freq_b", "mean_nonzero_a", "mean_nonzero_b",
@@ -237,6 +355,10 @@ def feature_selectivity_for_contrast(
 
 
 def identity_selectivity(long_df: pd.DataFrame, metadata: pd.DataFrame, n_features: int, top_n: int, layer: int) -> pd.DataFrame:
+    """Per-(identity, feature) selectivity vs. other identities on the same axis.
+    Audit 2.5: prior code pre-filtered to top (3·top_n) by |diff_mean| before
+    computing d / AUC. We now compute both analytically for ALL features and
+    rank afterward, removing the selection-induced bias."""
     rows = []
     for (axis, identity_id, canonical_label), _ in tqdm(list(metadata.groupby(["axis", "identity_id", "canonical_label"], sort=True)), desc="identity selectivity", leave=False):
         mask_identity = metadata["identity_id"].eq(identity_id).to_numpy()
@@ -247,20 +369,12 @@ def identity_selectivity(long_df: pd.DataFrame, metadata: pd.DataFrame, n_featur
         stats_o = summarize_feature_groups(long_df, mask_other, n_features, "other")
         df = stats_i.merge(stats_o, on="feature_id", how="outer").fillna(0)
         df["diff_mean"] = df["mean_identity"] - df["mean_other"]
-        candidates = df.reindex(df["diff_mean"].abs().sort_values(ascending=False).head(max(top_n * 3, top_n)).index).copy()
-        aucs = []
-        ds = []
-        for feature_id in candidates["feature_id"].astype(int):
-            vals = dense_feature_values(long_df, feature_id, len(metadata))
-            a = vals[mask_identity]
-            b = vals[mask_other]
-            labels = np.concatenate([np.ones(len(a)), np.zeros(len(b))])
-            scores = np.concatenate([a, b])
-            aucs.append(float(roc_auc_score(labels, scores)) if len(np.unique(labels)) == 2 else float("nan"))
-            ds.append(cohens_d(a, b))
-        candidates["auc_identity_vs_other_same_axis"] = aucs
-        candidates["cohens_d"] = ds
-        candidates = candidates.sort_values("cohens_d", key=lambda s: s.abs(), ascending=False).head(top_n)
+        cohens_d_arr, auc_arr = compute_cohens_d_and_auc_for_all_features(
+            long_df, mask_identity, mask_other, df, prefix_a="identity", prefix_b="other"
+        )
+        df["cohens_d"] = cohens_d_arr
+        df["auc_identity_vs_other_same_axis"] = auc_arr
+        candidates = df.sort_values("cohens_d", key=lambda s: s.abs(), ascending=False, na_position="last").head(top_n)
         for row in candidates.itertuples(index=False):
             rows.append({
                 "layer": layer,
