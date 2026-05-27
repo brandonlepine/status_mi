@@ -97,25 +97,13 @@ FAMILY_SUMMARY_COLUMNS = [
     "n_pairs",
 ]
 PROJECTION_LAYERS = {0, 8, 16, 24, 32}
-CONTRASTS = [
-    ("race_black", "race_white"),
-    ("sexuality_gay", "sexuality_straight"),
-    ("sexuality_gay", "sexuality_heterosexual"),
-    ("sexuality_lesbian", "sexuality_straight"),
-    ("sexuality_bisexual", "sexuality_straight"),
-    ("disability_disabled", "disability_nondisabled"),
-    ("disability_disabled", "disability_able_bodied"),
-    ("appearance_short", "appearance_tall"),
-    ("appearance_obese", "appearance_thin"),
-    ("appearance_poorly_dressed", "appearance_well_dressed"),
-    ("ses_low_income", "ses_rich"),
-    ("ses_low_income", "ses_high_socioeconomic_status"),
-    ("ses_lower_class", "ses_upper_class"),
-    ("ses_blue_collar", "ses_white_collar"),
-    ("gender_transgender", "gender_cisgender"),
-    ("gender_transgender_man", "gender_cisgender_man"),
-    ("gender_transgender_woman", "gender_cisgender_woman"),
-]
+# Canonical contrast pairs are sourced from scripts/contrast_registry.py per
+# audit 4.1 (single validated registry; typos previously in this literal —
+# ses_low_income, ses_high_socioeconomic_status — are corrected in the
+# registry so the SES axis runs all 4 contrasts instead of silently 2).
+# CONTRASTS here is populated at main() startup after running the registry
+# validator against the loaded metadata; see resolve_contrasts() below.
+CONTRASTS: list[tuple[str, str]] = []
 
 
 def parse_args() -> argparse.Namespace:
@@ -886,6 +874,33 @@ def evaluate_contrast_scores(scores: np.ndarray, mask_a: np.ndarray, mask_b: np.
     return auc, cohens_d(scores_a, scores_b), float(np.mean(scores_a)), float(np.mean(scores_b))
 
 
+def resolve_contrasts_from_registry(
+    metadata: pd.DataFrame,
+    subdirs: dict[str, Path],
+    logger=None,
+) -> list[tuple[str, str]]:
+    """Load the canonical contrast registry, validate against the loaded
+    metadata's identity_ids, write contrasts_skipped.csv to the contrasts
+    subdir, and return 2-tuple (identity_a, identity_b) pairs ready for
+    run_contrasts. Audit 4.1."""
+    from contrast_registry import (
+        load_validated_contrasts, write_contrasts_skipped, get_contrast_pairs,
+    )
+    # Use the metadata's identity set as the validation oracle. We write a
+    # temp CSV with just the identity_id column for the loader.
+    import tempfile, os
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
+        pd.DataFrame({"identity_id": metadata["identity_id"].unique()}).to_csv(f.name, index=False)
+        tmp_path = f.name
+    try:
+        result = load_validated_contrasts(tmp_path)
+    finally:
+        os.unlink(tmp_path)
+    skipped_path = subdirs["contrasts"] / "contrasts_skipped.csv"
+    write_contrasts_skipped(result.skipped, skipped_path, logger=logger)
+    return get_contrast_pairs(result.valid)
+
+
 def run_contrasts(
     x: np.ndarray,
     metadata: pd.DataFrame,
@@ -1011,6 +1026,12 @@ def main() -> None:
     metadata = load_metadata(args.activation_dir)
     layers = parse_layer_list(args.layers, args.activation_dir)
     subdirs = prepare_output_dir(args.output_dir, args.overwrite)
+
+    # Audit 4.1: load contrast registry, validate against this run's
+    # identity_ids, write contrasts_skipped.csv next to the contrast outputs.
+    global CONTRASTS
+    CONTRASTS = resolve_contrasts_from_registry(metadata, subdirs)
+    print(f"Contrast registry: {len(CONTRASTS)} pairs valid for this run.")
 
     pca_evr_rows = []
     axis_probe_rows = []

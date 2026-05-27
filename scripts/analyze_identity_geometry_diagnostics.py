@@ -102,25 +102,11 @@ AXES_TO_PLOT = [
     "religion",
     "nationality",
 ]
-CONTRASTS = [
-    ("race_black", "race_white"),
-    ("sexuality_gay", "sexuality_straight"),
-    ("sexuality_gay", "sexuality_heterosexual"),
-    ("sexuality_lesbian", "sexuality_straight"),
-    ("sexuality_bisexual", "sexuality_straight"),
-    ("disability_disabled", "disability_nondisabled"),
-    ("disability_disabled", "disability_able_bodied"),
-    ("appearance_short", "appearance_tall"),
-    ("appearance_obese", "appearance_thin"),
-    ("appearance_poorly_dressed", "appearance_well_dressed"),
-    ("ses_low_income", "ses_rich"),
-    ("ses_low_income", "ses_high_socioeconomic_status"),
-    ("ses_lower_class", "ses_upper_class"),
-    ("ses_blue_collar", "ses_white_collar"),
-    ("gender_transgender", "gender_cisgender"),
-    ("gender_transgender_man", "gender_cisgender_man"),
-    ("gender_transgender_woman", "gender_cisgender_woman"),
-]
+# Canonical contrast pairs are sourced from scripts/contrast_registry.py per
+# audit 4.1 (single validated registry; ses_low_income / ses_high_socioeconomic_status
+# typos corrected in the registry so the SES axis runs 4 contrasts not silently 2).
+# Populated at main() startup; see resolve_contrasts_from_registry.
+CONTRASTS: list[tuple[str, str]] = []
 OKABE_ITO = [
     "#0072B2",
     "#E69F00",
@@ -1632,12 +1618,38 @@ def write_incremental_outputs(
     _write_holdout_summary(contrast_holdout_rows, contrasts_dir)
 
 
+def resolve_contrasts_from_registry(
+    metadata: pd.DataFrame, output_dir: Path, logger=None,
+) -> list[tuple[str, str]]:
+    """Audit 4.1: load registry, validate against this run's identity_ids,
+    write contrasts_skipped.csv next to the contrast outputs."""
+    from contrast_registry import (
+        load_validated_contrasts, write_contrasts_skipped, get_contrast_pairs,
+    )
+    import tempfile, os
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
+        pd.DataFrame({"identity_id": metadata["identity_id"].unique()}).to_csv(f.name, index=False)
+        tmp_path = f.name
+    try:
+        result = load_validated_contrasts(tmp_path)
+    finally:
+        os.unlink(tmp_path)
+    contrasts_dir = output_dir / "contrasts"
+    contrasts_dir.mkdir(parents=True, exist_ok=True)
+    write_contrasts_skipped(result.skipped, contrasts_dir / "contrasts_skipped.csv", logger=logger)
+    return get_contrast_pairs(result.valid)
+
+
 def main() -> None:
     args = parse_args()
     metadata = load_metadata(args.activation_dir)
     layers = parse_layers(args.layers, args.activation_dir)
     selected_layers = parse_selected_layers(args.selected_layers_for_plots)
     prepare_output_dir(args.output_dir, args.overwrite, args.resume)
+
+    global CONTRASTS
+    CONTRASTS = resolve_contrasts_from_registry(metadata, args.output_dir)
+    print(f"Contrast registry: {len(CONTRASTS)} pairs valid for this run.")
 
     if args.resume:
         (
