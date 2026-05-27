@@ -233,8 +233,8 @@ The bridge from "geometric directions" to "individual SAE features."
 For each layer:
 
 - Loads the SAE top-k indices/values produced by `encode_identity_saes.py`. Builds a sparse long table `(row_idx, feature_id, activation>0)`.
-- Loads the residualized activation matrix (default `family_residualized`) and the SAE decoder.
-- For each identity (`identity_selectivity`): compares activation distributions for that identity vs all other same-axis identities. Picks top features by `|diff_mean|`, then re-ranks by `|cohen's d|` and AUC. Writes per-feature `mean_identity`, `mean_other`, `freq_identity`, `freq_other`, `cohens_d`, `auc`.
+- Loads the raw activation matrix (audit 5.4 closed 2026-05-27 in commit `ebfdff7` — the script is now raw end-to-end so contrast direction, decoder alignment, selectivity, and reconstruction all operate on the same representation the SAE was trained on; prior default `family_residualized` mixed a residualized direction with raw SAE features). Also loads the SAE decoder.
+- For each identity (`identity_selectivity`): compares activation distributions for that identity vs all other same-axis identities. Computes per-feature Cohen's d and AUC analytically for all features (audit 2.5 closed 2026-05-27 in commit `4481445` — no `|diff_mean|` prefilter). Writes per-feature `mean_identity`, `mean_other`, `freq_identity`, `freq_other`, `cohens_d`, `auc`.
 - For each contrast in `DEFAULT_CONTRASTS` (a fixed list of identity pairs):
   - **Feature selectivity** (`feature_selectivity_for_contrast`): same idea but for the contrast pair. Records `mean_a`, `mean_b`, `freq_a`, `freq_b`, `diff_mean`, `cohens_d`, `auc`, plus ordinal ranks.
   - **Decoder alignment** (`decoder_alignment`): cosine between each decoder row and the centered difference-of-means direction `d_c`; also signed dot product. Ranks features by `|cosine|`.

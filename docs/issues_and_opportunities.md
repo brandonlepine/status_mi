@@ -409,9 +409,15 @@ What to do:
 
 **Original audit (preserved):** `combined_score = z(|d|) + z(|cos|) + z(|auc − 0.5|)`. Cohen's d and AUC both measure the same A/B separation and are monotonically related, so the score effectively double-weighted selectivity vs. decoder alignment. Propagated into `per_contrast_topk` feature selection (Step 19), the triage's `max_combined_score` aggregator (Step 17), and the BBQ steering pool (Step 20).
 
-### 5.4 [MINOR] Representation inconsistency: residualized direction vs. raw-encoded SAE features
+### 5.4 [MINOR] Representation inconsistency: residualized direction vs. raw-encoded SAE features (FIX LANDED 2026-05-27)
 
-`analyze_identity_sae_features.py` computes contrast directions from `family_residualized` activations, but the SAE features (`long_df`) were encoded by `encode_identity_saes.py` from **raw** activations. `decoder_alignment` then takes the cosine between a raw-space decoder row and a residualized-space direction, and `combined_score` mixes a residualized-direction cosine with a raw-SAE-activation Cohen's d. The two live in slightly different spaces. Decide on one representation (probably: residualize, then re-encode through the SAE, or do everything raw) and be consistent. Document the choice.
+**Status:** Closed in commit `ebfdff7` (`scripts/analyze_identity_sae_features.py`). The script is now raw end-to-end.
+
+**What landed:** `--residualization` flag and the `residualize(x, …)` call removed. `decoder_alignment` and `reconstruction_rows` no longer take a `residualization` parameter, and the `residualization` column is gone from `decoder_direction_alignment.csv` and `direction_reconstruction.csv`. `run_config.json` records `representation: "raw"` with an audit note. No downstream consumer (`plot_identity_sae_features.py`, `triage_sae_identity_features.py`, `build_sae_feature_cards.py`, `extract_token_level_sae_activations.py`, `run_bbq_sae_steering.py`) reads the dropped column.
+
+The alternative consistent choice (re-encode residualized activations through the SAE) would require importing `encode_full` from Step 5 and regenerating `long_df`. Left as a future option if template/family variance contamination turns out to matter on the corrected (audit 1.4) encodings.
+
+**Original audit (preserved):** `analyze_identity_sae_features.py` computed contrast directions from `family_residualized` activations, but the SAE features (`long_df`) were encoded by `encode_identity_saes.py` from **raw** activations. `decoder_alignment` then took the cosine between a raw-space decoder row and a residualized-space direction, and `combined_score` mixed a residualized-direction cosine with a raw-SAE-activation Cohen's d. The two lived in slightly different spaces.
 
 ### 5.5 [MAJOR] Missing baseline: does the SAE beat a difference-of-means direction?
 
@@ -512,7 +518,7 @@ Ordered by what most threatens a defensible result.
 17. Tie steering magnitude to a meaningful scale (3.2).
 18. Decide intersectional BBQ handling — first-class or excluded, not flattened (4.2).
 19. Reframe triage as pre-registered *selection*; validate the taxonomy if it is a contribution (5.2).
-20. Make representation use consistent (residualized vs raw) across the SAE analysis (5.4).
+20. Make representation use consistent (residualized vs raw) across the SAE analysis (5.4 — FIX LANDED 2026-05-27, commit `ebfdff7`: raw end-to-end).
 21. Extract shared code into a common module with a validated contrast registry (5.10, 4.1).
 22. Multi-layer SAE coverage (5.8); consider counterfactual/patching methods (5.6, 5.7).
 

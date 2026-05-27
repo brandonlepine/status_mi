@@ -30,7 +30,7 @@ The bridge from "geometric contrast directions" to "individual SAE features." Fo
 
 ## Key implementation details
 
-- Residualization (default `family_residualized`) is applied to the **activations** (`residualize()`, line 102): subtract per-family mean, add back the global mean. This affects the contrast `direction` and `evaluate_direction` scores — but the SAE encodings in `long_df` come from `encode_identity_saes.py`, which encoded **raw** activations. The two representations are mixed. See issue 5.4.
+- The script is **raw end-to-end** (audit 5.4 closed 2026-05-27 in commit `ebfdff7`). Contrast `direction`, `decoder_alignment`, `feature_selectivity_for_contrast`, and `reconstruction_rows` all operate on the same raw activations the SAE was trained on. The `--residualization` flag and the `residualize(x, …)` call were removed; `run_config.json` now records `representation: "raw"` with an audit note. Prior default (`family_residualized`) mixed a residualized-space direction with raw-SAE-space Cohen's d.
 - Contrast direction (`compute_direction`, line 121) is the unit-normalized centered `mean(A) − mean(B)`, sign-flipped so identity_a scores higher.
 - `feature_selectivity_for_contrast` (line 199): computes Cohen's d and AUC analytically for **all** `n_features` via `compute_cohens_d_and_auc_for_all_features` (Cohen's d from sum/sum_sq/count using sample variance; AUC via the sparse 4-bucket decomposition), then ranks and keeps top `top_n` by `|d|`. The prior code prefiltered to `5 × top_n` by `|diff_mean|` before computing d/AUC, which biased the reported effect sizes upward. Audit 2.5 closed 2026-05-27.
 - `reconstruct_direction` solves the least-squares problem `argmin_c ||basis.T @ c − direction||²` via `np.linalg.lstsq` and sets `recon = c @ basis` — the true orthogonal projection of `direction` onto `span(rows of basis)`. `fraction_norm_captured = ||recon||² / ||direction||²` is now correctly in `[0, 1]` and equals `cosine_with_full_direction²` (projection identity). Audit 5.1 closed 2026-05-27 in commit `1a569c3`. The prior `coeff = basis @ direction; recon = coeff @ basis` (= `BᵀB d`) was only the orthogonal projection when `B Bᵀ = I`, which decoder rows don't satisfy.
@@ -110,17 +110,18 @@ The bridge from "geometric contrast directions" to "individual SAE features." Fo
 
 **Original audit (preserved):** `combined_score = zscore(|cohens_d|) + zscore(|cos|) + zscore(|auc − 0.5|)`. Cohen's d and AUC both measure the same A/B distribution separation and are monotonically related, so the score effectively double-weighted selectivity relative to decoder alignment.
 
-### 5.4 [MINOR] — Residualized direction vs raw-encoded SAE features inconsistency
+### 5.4 [MINOR] — Residualized direction vs raw-encoded SAE features inconsistency (FIX LANDED 2026-05-27)
 
-**What's wrong:** The contrast `direction` is computed from `family_residualized` activations (line 466), but the SAE feature values in `long_df` come from `encode_identity_saes.py`, which encoded **raw** (non-residualized) activations. `decoder_alignment` then takes the cosine between a raw-space decoder row and a residualized-space direction, and `combined_score` mixes a residualized-direction cosine with a raw-SAE-activation `cohens_d`.
+**Status:** Closed in commit `ebfdff7` (`scripts/analyze_identity_sae_features.py`). The script is now raw end-to-end — the simpler of the two consistent choices the audit proposed.
 
-**Why it matters:** The two quantities live in slightly different spaces. The "decoder alignment" claim is implicitly "this decoder row points in the residualized direction" but the decoder was trained on raw residuals.
+**What landed:**
+- `--residualization` CLI flag removed. `RESIDUALIZATION_GROUPS` constant and the local `residualize()` adapter removed. The `residualize(x, …)` call in `main()` removed.
+- `decoder_alignment` and `reconstruction_rows` no longer take a `residualization` parameter, and the `residualization` column is gone from `decoder_direction_alignment.csv` and `direction_reconstruction.csv`. Verified by grep that no downstream consumer (`plot_identity_sae_features.py`, `triage_sae_identity_features.py`, `build_sae_feature_cards.py`, `extract_token_level_sae_activations.py`, `run_bbq_sae_steering.py`) reads the dropped column.
+- `run_config.json` now records `"representation": "raw"` and a `representation_audit_note` explaining the choice.
 
-**Targeted fix:** Pick one representation and stick with it. Two consistent choices:
-- **Raw end-to-end:** drop residualization in this script, accept that template/family variance is baked into the direction (and document it).
-- **Residualized end-to-end:** re-encode the residualized activations through the SAE (call `relu((x_resid - b_dec) @ w_enc + b_enc)`), and rebuild `long_df` from those activations. The encoder lives in `encode_identity_saes.py`; either import it or factor the encode step into a shared helper.
+**Caveat (template/family variance baked into direction):** Without residualization, template-specific or family-specific variance is part of the contrast direction. For the SAE-features path this is acceptable because the SAE was trained on raw activations and "sees" the same variance; the alternative (residualize → re-encode through SAE) would require importing `encode_full` from Step 5 and regenerating `long_df` from residualized activations. If that becomes the preferred path later, it's a deliberate addition rather than a flag toggle.
 
-Add the chosen mode to `run_config.json` and assert downstream.
+**Original audit (preserved):** The contrast `direction` was computed from `family_residualized` activations (line 466), but the SAE feature values in `long_df` came from `encode_identity_saes.py`, which encoded **raw** (non-residualized) activations. `decoder_alignment` then took the cosine between a raw-space decoder row and a residualized-space direction, and `combined_score` mixed a residualized-direction cosine with a raw-SAE-activation `cohens_d`. The two quantities lived in slightly different spaces. The "decoder alignment" claim implicitly said "this decoder row points in the residualized direction" but the decoder was trained on raw residuals.
 
 ### 3.1 (load-bearing context) [BLOCKER] — Feature-level intervention helpers exist here but are never used (FIX LANDED 2026-05-27)
 
@@ -140,7 +141,7 @@ Add the chosen mode to `run_config.json` and assert downstream.
 ## Rebuild checklist
 
 - [ ] Audit `DEFAULT_CONTRASTS` (lines 22-44) against `bbq_identity_normalized_forms.csv`. Drop or rename `ses_low_income`, `ses_high_socioeconomic_status`; replace with `ses_low_income → ses_low` or `ses_poor`, and add the contrasts that should have been there. Tie this to the shared registry (5.10).
-- [ ] Decide on a single representation: residualize end-to-end (re-encode through SAE on residualized activations) **or** keep everything raw. Document in `run_config.json`. (5.4)
+- [x] Decide on a single representation: residualize end-to-end (re-encode through SAE on residualized activations) **or** keep everything raw. Document in `run_config.json`. (5.4) *(Done 2026-05-27: commit `ebfdff7` — raw end-to-end; flag removed; recorded as `representation: "raw"` in run_config.json.)*
 - [x] Replace `feature_selectivity_for_contrast`'s `|diff_mean|` prefilter with full computation. (2.5) *(Done 2026-05-27: commit `4481445` — analytical d/AUC for all features; identity_selectivity also fixed.)* **Still open:** holdout-set confirmation columns, bundled with 2.1 winner's-curse correction.
 - [x] Replace `reconstruct_direction` with a proper least-squares projection (`np.linalg.lstsq` or QR). Re-derive `fraction_norm_captured` as the normalized squared norm. (5.1) *(Done 2026-05-27: commit `1a569c3`.)*
 - [x] Rebalance `combined_score`: use one of `|d|`/`|auc-0.5|` plus `|cos|` with a documented weighting. (5.3) *(Done 2026-05-27: commit `3b48e5b` — 0.5·z(|d|) + 0.5·z(|cos|), weights in run_config.json.)*
