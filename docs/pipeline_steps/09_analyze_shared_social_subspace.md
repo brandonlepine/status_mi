@@ -61,13 +61,9 @@ Decomposes the set of identity contrast directions into a **shared social subspa
 
 **Remaining tightening (optional):** Record the realized `C` (post-validation) in `run_config.json` and in each spectrum row so paper claims about the "rank" of the shared subspace cite a specific, reproducible number.
 
-### 5.10 [MINOR] — Heavy code duplication across analysis scripts
+### 5.10 [MINOR] — Heavy code duplication across analysis scripts (FIX LANDED 2026-05-27)
 
-**What's wrong:** Independent copies of `cohens_d`, contrast lists, sign-flip convention, `residualize`, `compute_direction`, palettes. The `DEFAULT_CONTRASTS` here uses a different schema (`(name, identity_a, identity_b, axis)` 4-tuples) than [Step 7](07_analyze_identity_geometry.md)'s 2-tuples.
-
-**Why it matters:** Two parallel contrast registries with different schemas guarantee drift.
-
-**Targeted fix:** One registry in `status_mi/common.py` that exposes both views (`as_pairs()` and `as_named()`). One implementation of `residualize` and one of `compute_direction` (with documented sign convention).
+**Status:** All shared helpers — `cohens_d`, `cosine`, `normalize`, `compute_direction`, `evaluate_projection`, `residualize`, `OKABE_ITO`, `save_fig`, `CenterOnlyScaler` + `make_scaler` — now live in `scripts/common.py` (commit `e50bbd1`). The canonical contrast list lives in `scripts/contrast_registry.py` (commit `1e242c9`; audit 4.1). This script's local copies are gone; any remaining definitions are thin adapter wrappers that preserve the prior return-tuple shapes while routing through `common.py`. Net change across the 8 consumer scripts: 358 lines added to `common.py`, 369 lines removed elsewhere.
 
 ## Rebuild checklist
 - [ ] Source `DEFAULT_CONTRASTS` from the shared registry; assert every identity exists at startup.

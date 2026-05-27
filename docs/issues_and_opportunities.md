@@ -410,9 +410,23 @@ SAEs are encoded/steered only at layer 24. The geometry diagnostics show identit
 
 **Optional follow-up:** run with both `--scaling center_only` and `--scaling standardize` once on RunPod, confirm the cross-residualization conclusions (η², probe AUC, contrast AUC) are stable under both, and document the stability in the methods writeup.
 
-### 5.10 [MINOR] Heavy code duplication across analysis scripts
+### 5.10 [MINOR] Heavy code duplication across analysis scripts (FIX LANDED 2026-05-27)
 
-`cohens_d`, `compute_direction`, `residualize`, `normalize`, contrast lists, Okabe-Ito palettes, `save_fig` are re-implemented in `analyze_identity_geometry.py`, `_diagnostics.py`, `analyze_shared_social_subspace.py`, `analyze_identity_sae_features.py`, `plot_identity_directional_visualizations.py`, and `plot_identity_directional_followups.py`. They look equivalent now, but independent copies drift silently (e.g. a sign-flip convention change in one place). Extract a shared `status_mi/common.py` (directions, effect sizes, residualization, the validated contrast registry, plotting). This also removes a class of "results differ between scripts" bugs and makes the pipeline auditable.
+**Status:** All shared helpers now live in `scripts/common.py`. Two commits closed this and the related 4.1 contrast-registry work:
+
+- `1e242c9` — `scripts/contrast_registry.py` consolidated the `CONTRASTS` / `DEFAULT_CONTRASTS` / `KEY_CONTRASTS` / `SELECTED_CROSS_AXIS_ORDERINGS` literals (also fixing the typo identities — audit 4.1).
+- `e50bbd1` — `scripts/common.py` consolidated everything else: `cohens_d`, `cosine`, `normalize`, `compute_direction` (low-level + `compute_direction_for_pair` convenience), `evaluate_projection`, `residualize`, `OKABE_ITO` (+ `okabe_ito_palette` helper), `save_fig`, `CenterOnlyScaler` + `make_scaler`. The `ContrastDirection` dataclass carries the canonical 3-tuple of (direction, global_mean, sign_flipped).
+
+**What landed in the 8 consumer scripts:**
+- `analyze_identity_geometry.py`: `contrast_direction` and `evaluate_contrast_scores` removed; `run_contrasts` routes through `common.compute_direction` + `common.evaluate_projection`. Sign convention is now consistently mean(A_proj) > mean(B_proj), so in-sample `auc_in_sample` is always ≥ 0.5 (a small but legitimate behavior improvement on a diagnostic-only CSV).
+- `analyze_identity_geometry_diagnostics.py`: `cohens_d`, `make_contrast_direction`, `evaluate_projection` (local), `residualize`, `OKABE_ITO`, `save_figure` all removed. Thin adapters preserve each call site's prior 2-tuple shape; the new `center_mean` kwarg on `common.compute_direction` supports the held-out train-mean centering pattern.
+- `analyze_shared_social_subspace.py`: 5 local helpers removed; adapters keep the script's `(direction, global_mean, sign_flipped)` return convention.
+- `analyze_identity_sae_features.py`: 5 local helpers removed; adapters keep the script's 2-tuple shapes.
+- `plot_identity_geometry.py`, `plot_identity_directional_visualizations.py`, `plot_identity_directional_followups.py`, `plot_identity_sae_features.py`: local `save_fig`/`save_figure`/`OKABE_ITO`/`cohens_d`/`normalize`/`residualize`/`compute_direction` removed. Each script keeps a 1-line `save_fig` wrapper that calls `common.save_fig(dpi=220, bbox_inches=None, tight_layout=True)` so prior figure styling is preserved.
+
+**Net change:** 358 lines added (`common.py`), 369 lines removed across the 8 consumers. Single source of truth for every helper that was duplicated. The class of "results differ between scripts because their `cohens_d` drifted" bugs is now impossible by construction.
+
+**Smoke-tested:** 10/10 common.py unit tests pass; all 8 consumer scripts import without runtime error; AST-clean.
 
 ---
 

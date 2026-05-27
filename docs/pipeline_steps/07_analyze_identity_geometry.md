@@ -97,13 +97,9 @@ First-pass characterization of identity geometry from the final-token residual s
 
 **Original audit (preserved):** `run_pca` and `make_probe_features` both applied `StandardScaler` (per-dim z-scoring) before PCA. Residual-stream dimensions carry meaningfully unequal scale (rogue / high-norm dimensions carry real signal); z-scoring upweighted low-variance dimensions, so the resulting `explained_variance_ratio` described standardized space, not activation space. Defensible for visualization but it should have been stated and ideally compared with centered-only PCA.
 
-### 5.10 [MINOR] — Heavy code duplication across analysis scripts
+### 5.10 [MINOR] — Heavy code duplication across analysis scripts (FIX LANDED 2026-05-27)
 
-**What's wrong:** `cohens_d`, `contrast_direction`, `evaluate_contrast_scores`, `CONTRASTS`, Okabe-Ito palettes, and `cosine` are reimplemented in this script and in `analyze_identity_geometry_diagnostics.py`, `analyze_shared_social_subspace.py`, `analyze_identity_sae_features.py`, `plot_identity_directional_visualizations.py`, and `plot_identity_directional_followups.py`. Each copy can drift independently.
-
-**Why it matters:** Sign conventions, normalization, and contrast lists silently diverge between scripts — a class of "results differ between scripts" bug that is invisible until someone checks.
-
-**Targeted fix:** Extract into `status_mi/common.py`: `cohens_d`, `contrast_direction`, `evaluate_contrast_scores`, `residualize`, `OKABE_ITO`, `save_fig`, and the validated contrast registry. Import from there in every analysis/plot script.
+**Status:** All shared helpers — `cohens_d`, `cosine`, `normalize`, `compute_direction`, `evaluate_projection`, `residualize`, `OKABE_ITO`, `save_fig`, `CenterOnlyScaler` + `make_scaler` — now live in `scripts/common.py` (commit `e50bbd1`). The canonical contrast list lives in `scripts/contrast_registry.py` (commit `1e242c9`; audit 4.1). This script's local copies are gone; any remaining definitions are thin adapter wrappers that preserve the prior return-tuple shapes while routing through `common.py`. Net change across the 8 consumer scripts: 358 lines added to `common.py`, 369 lines removed elsewhere.
 
 ## Rebuild checklist
 - [ ] Move `CONTRASTS` into a shared, validated registry (`status_mi/common.py`) and import it here; raise a hard error if any referenced identity is missing from `bbq_identity_normalized_forms.csv`.

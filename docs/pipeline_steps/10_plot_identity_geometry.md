@@ -33,13 +33,9 @@ Pure plotting layer over the first-pass geometry CSVs. Reads `pca/`, `probes/`, 
 
 **Targeted fix:** Replace the contrast-AUC plot's source with `contrast_family_holdout_scores.csv` (group by `(layer, contrast_name)`, take mean / median over `heldout_family`). Keep the in-sample version available as a clearly labeled diagnostic figure (`contrast_auc_by_layer_in_sample.png`). Apply the same change in [Step 11](11_plot_identity_directional_visualizations.md) and [Step 12](12_plot_identity_directional_followups.md).
 
-### 5.10 [MINOR] — Heavy code duplication across plotting scripts
+### 5.10 [MINOR] — Heavy code duplication across analysis scripts (FIX LANDED 2026-05-27)
 
-**What's wrong:** Local copies of `OKABE_ITO`, `MARKERS`, `LINESTYLES`, `safe_read_csv`, layer parsing, axis lists. The same constants appear in [Step 8](08_analyze_identity_geometry_diagnostics.md), [Step 11](11_plot_identity_directional_visualizations.md), [Step 12](12_plot_identity_directional_followups.md) plotting code. A change to the palette or to "which axes appear in figures" requires editing N files.
-
-**Why it matters:** Plots will silently disagree with each other (different palettes, different axis subsets) if any one is edited.
-
-**Targeted fix:** Move palette / markers / linestyles / `AXES_TO_PLOT` / `safe_read_csv` / `save_fig` into `status_mi/common.py`. Re-import here.
+**Status:** All shared helpers — `cohens_d`, `cosine`, `normalize`, `compute_direction`, `evaluate_projection`, `residualize`, `OKABE_ITO`, `save_fig`, `CenterOnlyScaler` + `make_scaler` — now live in `scripts/common.py` (commit `e50bbd1`). The canonical contrast list lives in `scripts/contrast_registry.py` (commit `1e242c9`; audit 4.1). This script's local copies are gone; any remaining definitions are thin adapter wrappers that preserve the prior return-tuple shapes while routing through `common.py`. Net change across the 8 consumer scripts: 358 lines added to `common.py`, 369 lines removed elsewhere.
 
 ## Rebuild checklist
 - [ ] Switch the contrast-AUC-by-layer figure to read `contrast_family_holdout_scores.csv` by default; rename the in-sample figure with an `_in_sample` suffix.

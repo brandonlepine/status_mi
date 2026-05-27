@@ -85,13 +85,9 @@ Same design and same fix as [Step 7](07_analyze_identity_geometry.md#28-minor--p
 
 **Remaining tightening (optional):** Run with both `--scaling center_only` and `--scaling standardize` once on RunPod and confirm the cross-residualization conclusions (η², probe AUC, contrast AUC) are stable under both. The audit recommends documenting this stability explicitly in the methods writeup.
 
-### 5.10 [MINOR] — Heavy code duplication across analysis scripts
+### 5.10 [MINOR] — Heavy code duplication across analysis scripts (FIX LANDED 2026-05-27)
 
-**What's wrong:** `cohens_d`, `contrast_direction`, `residualize`, `OKABE_ITO`, `CONTRASTS`, `evaluate_contrast_scores` are copy-pasted from [Step 7](07_analyze_identity_geometry.md). The residualization implementation here is the canonical one — `analyze_shared_social_subspace.py` and the directional plotting scripts copy it.
-
-**Why it matters:** A future fix to residualization (e.g. changing how the global-mean offset is handled) requires editing four files in sync.
-
-**Targeted fix:** Move `residualize` and the residualization map into `status_mi/common.py` as the source of truth; import from there in this script and in [Step 9](09_analyze_shared_social_subspace.md), [Step 11](11_plot_identity_directional_visualizations.md), [Step 12](12_plot_identity_directional_followups.md).
+**Status:** All shared helpers — `cohens_d`, `cosine`, `normalize`, `compute_direction`, `evaluate_projection`, `residualize`, `OKABE_ITO`, `save_fig`, `CenterOnlyScaler` + `make_scaler` — now live in `scripts/common.py` (commit `e50bbd1`). The canonical contrast list lives in `scripts/contrast_registry.py` (commit `1e242c9`; audit 4.1). This script's local copies are gone; any remaining definitions are thin adapter wrappers that preserve the prior return-tuple shapes while routing through `common.py`. Net change across the 8 consumer scripts: 358 lines added to `common.py`, 369 lines removed elsewhere.
 
 ## Rebuild checklist
 - [ ] Import `CONTRASTS` / `residualize` / `cohens_d` / `evaluate_contrast_scores` from the shared module; remove the local copies.

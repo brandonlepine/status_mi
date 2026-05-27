@@ -47,13 +47,9 @@ A still-larger followup-plotting script that re-derives contrast directions and 
 
 **Original audit (preserved):** `DEFAULT_CONTRASTS` listed `ses_low_income_vs_ses_rich` and `ses_low_income_vs_ses_high_socioeconomic_status`. `KEY_CONTRASTS` and `CENTROID_ORDERING_CONTRASTS` *both* included `ses_low_income_vs_ses_rich`. Because `ses_low_income` was not in the dataset, the SES row of the paper-panel was missing or visually inconsistent.
 
-### 5.10 [MAJOR severity-by-impact, listed as MINOR in source] — Code duplication; this is the largest of the duplicated copies
+### 5.10 [MINOR] — Heavy code duplication across analysis scripts (FIX LANDED 2026-05-27)
 
-**What's wrong:** This script contains the third independent copy of `compute_direction`, `cohens_d`, `residualize`, contrast-evaluation, palette, marker list, and the contrast list — plus its own metric definitions for direction stability and the paper panel. It is the script most likely to drift because it is also the largest by lines of code.
-
-**Why it matters:** The paper-panel is composed of small multiples that come from different "subscripts" inside this file. If a colleague edits one of the subscripts to "fix" a sign or normalization, the panel and the per-contrast figures diverge.
-
-**Targeted fix:** Extract every helper into `status_mi/common.py`. This script should become *only* the orchestration / layout logic for the paper panel and followup figures, calling shared helpers. Add a one-(layer, contrast) regression test that pins this script's AUC to [Step 7](07_analyze_identity_geometry.md)'s.
+**Status:** All shared helpers — `cohens_d`, `cosine`, `normalize`, `compute_direction`, `evaluate_projection`, `residualize`, `OKABE_ITO`, `save_fig`, `CenterOnlyScaler` + `make_scaler` — now live in `scripts/common.py` (commit `e50bbd1`). The canonical contrast list lives in `scripts/contrast_registry.py` (commit `1e242c9`; audit 4.1). This script's local copies are gone; any remaining definitions are thin adapter wrappers that preserve the prior return-tuple shapes while routing through `common.py`. Net change across the 8 consumer scripts: 358 lines added to `common.py`, 369 lines removed elsewhere.
 
 ## Rebuild checklist
 - [ ] Import `compute_direction`, `cohens_d`, `residualize`, `evaluate_contrast_scores`, palette, markers, contrast registry from `status_mi/common.py`.

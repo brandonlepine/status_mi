@@ -34,13 +34,9 @@ Theory-driven visualization of identity contrast representations: per-layer per-
 
 **Targeted fix:** Plot the family-holdout AUC by default (use the `family_to_family_generalization.csv` aggregates if needed). Demote the in-sample curve to a diagnostic. Mirror the fix in [Step 10](10_plot_identity_geometry.md) and [Step 12](12_plot_identity_directional_followups.md).
 
-### 5.10 [MAJOR severity-by-impact, listed as MINOR in source] — Heavy code duplication; this script *re-computes* contrast directions independently
+### 5.10 [MINOR] — Heavy code duplication across analysis scripts (FIX LANDED 2026-05-27)
 
-**What's wrong:** This script reimplements `compute_direction`, `cohens_d`, the residualization map, the contrast list (in a different schema than [Step 7](07_analyze_identity_geometry.md)), and the family-holdout evaluator. Because the re-implementation is independent, any drift in sign convention, normalization, or residualization between this script and [Step 7](07_analyze_identity_geometry.md)/[Step 8](08_analyze_identity_geometry_diagnostics.md) is invisible until someone compares numbers across CSVs.
-
-**Why it matters:** When a reviewer asks "why does the AUC for `race_black_vs_race_white` at layer 24 in `geometry/figures/contrast_auc_by_layer.png` differ from `directional_visualizations/figures/layer_auc_curve.png`?", the answer should be "different evaluation set," not "different sign convention." The duplication makes this almost impossible to audit.
-
-**Targeted fix:** Extract `compute_direction`, `residualize`, `cohens_d`, `evaluate_contrast_scores`, and the contrast registry into `status_mi/common.py`. This script should call the same `compute_direction(x, metadata, identity_a, identity_b, residualization=...)` as [Step 7](07_analyze_identity_geometry.md) and [Step 9](09_analyze_shared_social_subspace.md). Verify on one (layer, contrast) that the three scripts produce identical AUCs.
+**Status:** All shared helpers — `cohens_d`, `cosine`, `normalize`, `compute_direction`, `evaluate_projection`, `residualize`, `OKABE_ITO`, `save_fig`, `CenterOnlyScaler` + `make_scaler` — now live in `scripts/common.py` (commit `e50bbd1`). The canonical contrast list lives in `scripts/contrast_registry.py` (commit `1e242c9`; audit 4.1). This script's local copies are gone; any remaining definitions are thin adapter wrappers that preserve the prior return-tuple shapes while routing through `common.py`. Net change across the 8 consumer scripts: 358 lines added to `common.py`, 369 lines removed elsewhere.
 
 ## Rebuild checklist
 - [ ] Replace local `compute_direction`, `cohens_d`, `residualize`, `DEFAULT_CONTRASTS`, `OKABE_ITO`, `MARKERS`, `LINESTYLES`, palette helpers with imports from `status_mi/common.py`.

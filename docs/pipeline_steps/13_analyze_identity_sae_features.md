@@ -104,13 +104,9 @@ Add the chosen mode to `run_config.json` and assert downstream.
 
 This is the cleanest single change that converts "direction steering" into a feature-level causal test. Make ablation the primary mode (no alpha grid needed).
 
-### 5.10 [MINOR] — Heavy code duplication across analysis scripts
+### 5.10 [MINOR] — Heavy code duplication across analysis scripts (FIX LANDED 2026-05-27)
 
-**What's wrong:** `cohens_d`, `compute_direction`, `residualize`, `normalize`, `DEFAULT_CONTRASTS` are re-implemented in this script and again in `analyze_identity_geometry.py`, `analyze_identity_geometry_diagnostics.py`, `analyze_shared_social_subspace.py`, and the plotting scripts. The contrast list also contains identity IDs (`ses_low_income`, `ses_high_socioeconomic_status`) that do not exist in `bbq_identity_normalized_forms.csv` (see issue 4.1).
-
-**Why it matters:** Drift between copies is silent (e.g. a sign convention change in one file). The contrast registry duplication also means the silent skips in `load_contrasts` (line 92, `if skipped: print(...)` — only a `print`, not a warning) happen independently in every consumer.
-
-**Targeted fix:** Extract into `status_mi/common.py` (or `scripts/_common.py`): the effect-size and direction helpers, the residualization function, a **validated** `DEFAULT_CONTRASTS` registry that asserts every identity ID exists in `bbq_identity_normalized_forms.csv` at import time, the SAE intervention helpers (also see 3.1 above). Replace the silent `print(...)` with a hard error or at minimum a `warnings.warn`.
+**Status:** All shared helpers — `cohens_d`, `cosine`, `normalize`, `compute_direction`, `evaluate_projection`, `residualize`, `OKABE_ITO`, `save_fig`, `CenterOnlyScaler` + `make_scaler` — now live in `scripts/common.py` (commit `e50bbd1`). The canonical contrast list lives in `scripts/contrast_registry.py` (commit `1e242c9`; audit 4.1). This script's local copies are gone; any remaining definitions are thin adapter wrappers that preserve the prior return-tuple shapes while routing through `common.py`. Net change across the 8 consumer scripts: 358 lines added to `common.py`, 369 lines removed elsewhere.
 
 ## Rebuild checklist
 
