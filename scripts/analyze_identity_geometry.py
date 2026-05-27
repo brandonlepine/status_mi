@@ -67,8 +67,11 @@ CONTRAST_COLUMNS = [
     "identity_a",
     "identity_b",
     "axis",
-    "auc_all",
-    "cohens_d_all",
+    # In-sample: direction estimated AND evaluated on the same prompts. Kept as
+    # a diagnostic of how much the difference-of-means direction overfits its
+    # own evaluation; the headline number is the family-holdout below. Audit 2.1.
+    "auc_in_sample",
+    "cohens_d_in_sample",
     "mean_a",
     "mean_b",
     "n_a",
@@ -729,8 +732,8 @@ def run_contrasts(
                 "identity_a": identity_a,
                 "identity_b": identity_b,
                 "axis": axis_lookup.get(identity_a, ""),
-                "auc_all": auc,
-                "cohens_d_all": d_all,
+                "auc_in_sample": auc,
+                "cohens_d_in_sample": d_all,
                 "mean_a": mean_a,
                 "mean_b": mean_b,
                 "n_a": int(mask_a.sum()),
@@ -923,6 +926,28 @@ def main() -> None:
         CONTRAST_HOLDOUT_COLUMNS,
         subdirs["contrasts"] / "contrast_family_holdout_scores.csv",
     )
+
+    # Headline held-out summary: one row per (layer, contrast) with mean / sd
+    # / min / max / n_families across the held-out-family replicates. This is
+    # what downstream plotting and the methods writeup should cite (audit 2.1).
+    if contrast_holdout_rows:
+        holdout_df = pd.DataFrame(contrast_holdout_rows)
+        summary = (
+            holdout_df.groupby(["layer", "contrast_name", "identity_a", "identity_b"], sort=True)
+            .agg(
+                auc_mean=("auc", "mean"),
+                auc_sd=("auc", "std"),
+                auc_min=("auc", "min"),
+                auc_max=("auc", "max"),
+                cohens_d_mean=("cohens_d", "mean"),
+                cohens_d_sd=("cohens_d", "std"),
+                n_families=("auc", "size"),
+            )
+            .reset_index()
+        )
+        summary.to_csv(
+            subdirs["contrasts"] / "contrast_holdout_summary.csv", index=False
+        )
 
     assert hidden_dim is not None
     write_run_config(args, args.output_dir, metadata, layers, hidden_dim)

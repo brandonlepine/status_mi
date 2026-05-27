@@ -75,7 +75,7 @@ PROBE_COLUMNS = [
     "macro_f1_mean",
     "macro_f1_sd",
 ]
-CONTRAST_COLUMNS = [
+_CONTRAST_HEADER = [
     "layer",
     "residualization",
     "contrast_name",
@@ -83,13 +83,14 @@ CONTRAST_COLUMNS = [
     "identity_b",
     "axis",
     "heldout_family",
-    "auc",
-    "cohens_d",
-    "n_train_a",
-    "n_train_b",
-    "n_eval_a",
-    "n_eval_b",
 ]
+_CONTRAST_FOOTER = ["n_train_a", "n_train_b", "n_eval_a", "n_eval_b"]
+# In-sample rows: direction and evaluation both on the same A and B prompts.
+# Kept as a diagnostic; the headline is the family-holdout columns below (2.1).
+CONTRAST_IN_SAMPLE_COLUMNS = _CONTRAST_HEADER + ["auc_in_sample", "cohens_d_in_sample"] + _CONTRAST_FOOTER
+CONTRAST_HOLDOUT_COLUMNS = _CONTRAST_HEADER + ["auc", "cohens_d"] + _CONTRAST_FOOTER
+# Backwards-compatible alias for any caller that imports CONTRAST_COLUMNS.
+CONTRAST_COLUMNS = CONTRAST_HOLDOUT_COLUMNS
 PLOT_RESIDUALIZATIONS = ["raw", "family_residualized", "template_residualized"]
 AXES_TO_PLOT = [
     "sexual_orientation",
@@ -801,6 +802,41 @@ def evaluate_projection(
     return auc, cohens_d(scores[mask_a], scores[mask_b])
 
 
+def _write_holdout_summary(
+    contrast_holdout_rows: list[dict[str, object]], contrasts_dir: Path
+) -> None:
+    """Aggregate the family-holdout rows into a single headline row per
+    (layer, residualization, contrast): mean / sd / min / max / n_families.
+    This is the audit-recommended headline number (2.1) — downstream
+    plotting and any methods-doc table should cite this, not the in-sample
+    contrast_full_residualized_scores.csv.
+    """
+    if not contrast_holdout_rows:
+        return
+    holdout_df = pd.DataFrame(contrast_holdout_rows)
+    if holdout_df.empty or "auc" not in holdout_df.columns:
+        return
+    summary = (
+        holdout_df.groupby(
+            ["layer", "residualization", "contrast_name", "identity_a", "identity_b", "axis"],
+            sort=True,
+        )
+        .agg(
+            auc_mean=("auc", "mean"),
+            auc_sd=("auc", "std"),
+            auc_min=("auc", "min"),
+            auc_max=("auc", "max"),
+            cohens_d_mean=("cohens_d", "mean"),
+            cohens_d_sd=("cohens_d", "std"),
+            n_families=("auc", "size"),
+        )
+        .reset_index()
+    )
+    summary.to_csv(
+        contrasts_dir / "contrast_family_holdout_residualized_summary.csv", index=False
+    )
+
+
 def run_contrasts(
     x: np.ndarray,
     metadata: pd.DataFrame,
@@ -823,6 +859,9 @@ def run_contrasts(
         if direction is None:
             continue
         auc, d_value = evaluate_projection(x, direction, global_mean, mask_a, mask_b)
+        # In-sample evaluation: the direction is the difference of means on the
+        # same A and B prompts being projected. Reported as a diagnostic only;
+        # the headline is the family-holdout below (audit 2.1).
         full_rows.append(
             {
                 "layer": layer,
@@ -832,8 +871,8 @@ def run_contrasts(
                 "identity_b": identity_b,
                 "axis": axis_lookup.get(identity_a, ""),
                 "heldout_family": "",
-                "auc": auc,
-                "cohens_d": d_value,
+                "auc_in_sample": auc,
+                "cohens_d_in_sample": d_value,
                 "n_train_a": int(mask_a.sum()),
                 "n_train_b": int(mask_b.sum()),
                 "n_eval_a": int(mask_a.sum()),
@@ -1350,12 +1389,13 @@ def write_incremental_outputs(
     pd.DataFrame(surface_probe_rows, columns=PROBE_COLUMNS).drop_duplicates().to_csv(
         probes_dir / "surface_form_probe_scores.csv", index=False
     )
-    pd.DataFrame(contrast_holdout_rows, columns=CONTRAST_COLUMNS).drop_duplicates().to_csv(
+    pd.DataFrame(contrast_holdout_rows, columns=CONTRAST_HOLDOUT_COLUMNS).drop_duplicates().to_csv(
         contrasts_dir / "contrast_family_holdout_residualized_scores.csv", index=False
     )
-    pd.DataFrame(contrast_full_rows, columns=CONTRAST_COLUMNS).drop_duplicates().to_csv(
+    pd.DataFrame(contrast_full_rows, columns=CONTRAST_IN_SAMPLE_COLUMNS).drop_duplicates().to_csv(
         contrasts_dir / "contrast_full_residualized_scores.csv", index=False
     )
+    _write_holdout_summary(contrast_holdout_rows, contrasts_dir)
 
 
 def main() -> None:
@@ -1540,12 +1580,13 @@ def main() -> None:
 
     contrasts_dir = args.output_dir / "contrasts"
     contrasts_dir.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(contrast_holdout_rows, columns=CONTRAST_COLUMNS).to_csv(
+    pd.DataFrame(contrast_holdout_rows, columns=CONTRAST_HOLDOUT_COLUMNS).to_csv(
         contrasts_dir / "contrast_family_holdout_residualized_scores.csv", index=False
     )
-    pd.DataFrame(contrast_full_rows, columns=CONTRAST_COLUMNS).to_csv(
+    pd.DataFrame(contrast_full_rows, columns=CONTRAST_IN_SAMPLE_COLUMNS).to_csv(
         contrasts_dir / "contrast_full_residualized_scores.csv", index=False
     )
+    _write_holdout_summary(contrast_holdout_rows, contrasts_dir)
 
     if not args.skip_plots:
         start = time.perf_counter()

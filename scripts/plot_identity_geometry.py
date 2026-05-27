@@ -543,50 +543,73 @@ def plot_family_stability(geometry_dir: Path, output_dir: Path) -> None:
 
 
 def plot_contrasts(geometry_dir: Path, output_dir: Path) -> None:
+    """Plot contrast separation by layer.
+
+    Headline (audit 2.1): cross-family held-out AUC / Cohen's d. The direction
+    is estimated on non-held-out template families and evaluated on the
+    held-out family, then averaged across families. In-sample numbers
+    (direction estimated AND evaluated on the same prompts) are kept as a
+    diagnostic so the gap quantifies how much the direction overfits, but
+    they are no longer the headline plot.
+    """
     scores_path = geometry_dir / "contrasts" / "contrast_scores.csv"
     holdout_path = geometry_dir / "contrasts" / "contrast_family_holdout_scores.csv"
 
+    # Headline: family-holdout AUC / Cohen's d, averaged across folds.
+    holdout = safe_read_csv(holdout_path)
+    if holdout is not None and not holdout.empty:
+        summary = (
+            holdout.groupby(["layer", "contrast_name"], sort=True)
+            .agg(auc_mean=("auc", "mean"), auc_sd=("auc", "std"),
+                 cohens_d_mean=("cohens_d", "mean"), cohens_d_sd=("cohens_d", "std"))
+            .reset_index()
+        )
+        line_plot(
+            summary,
+            "layer",
+            "auc_mean",
+            "contrast_name",
+            "Contrast direction by layer: held-out-family AUC (headline; direction trained on non-held-out families)",
+            "Mean held-out-family AUC",
+            output_dir / "contrast_auc_by_layer",
+            figsize=(17, 7),
+        )
+        line_plot(
+            summary,
+            "layer",
+            "cohens_d_mean",
+            "contrast_name",
+            "Contrast direction by layer: held-out-family Cohen's d (headline; direction trained on non-held-out families)",
+            "Mean held-out-family Cohen's d",
+            output_dir / "contrast_cohens_d_by_layer",
+            figsize=(17, 7),
+        )
+
+    # Diagnostic: in-sample AUC / Cohen's d. These overstate separation
+    # because the difference-of-means direction is, by construction, optimal
+    # for separating its own training data.
     scores = safe_read_csv(scores_path)
     if scores is not None:
         line_plot(
             scores,
             "layer",
-            "auc_all",
+            "auc_in_sample",
             "contrast_name",
-            "Contrast direction separation by layer: AUC from final-token projections",
-            "AUC for identity_a vs identity_b",
-            output_dir / "contrast_auc_by_layer",
+            "Contrast direction by layer (DIAGNOSTIC — in-sample AUC; direction trained AND evaluated on the same prompts)",
+            "AUC for identity_a vs identity_b (in-sample)",
+            output_dir / "contrast_auc_by_layer_in_sample",
             figsize=(17, 7),
         )
         line_plot(
             scores,
             "layer",
-            "cohens_d_all",
+            "cohens_d_in_sample",
             "contrast_name",
-            "Contrast direction separation by layer: Cohen's d of final-token projections",
-            "Cohen's d for identity_a minus identity_b",
-            output_dir / "contrast_cohens_d_by_layer",
+            "Contrast direction by layer (DIAGNOSTIC — in-sample Cohen's d; direction trained AND evaluated on the same prompts)",
+            "Cohen's d for identity_a minus identity_b (in-sample)",
+            output_dir / "contrast_cohens_d_by_layer_in_sample",
             figsize=(17, 7),
         )
-
-    holdout = safe_read_csv(holdout_path)
-    if holdout is not None:
-        if not holdout.empty:
-            summary = (
-                holdout.groupby(["layer", "contrast_name"], sort=True)["auc"]
-                .agg(auc_mean="mean", auc_sd="std")
-                .reset_index()
-            )
-            line_plot(
-                summary,
-                "layer",
-                "auc_mean",
-                "contrast_name",
-                "Contrast direction family holdout by layer: mean AUC on held-out template family",
-                "Mean held-out-family AUC",
-                output_dir / "contrast_family_holdout_auc_by_layer",
-                figsize=(17, 7),
-            )
 
 
 def plot_umap_if_available(
