@@ -33,13 +33,19 @@ A still-larger followup-plotting script that re-derives contrast directions and 
 
 ## Issues & Opportunities
 
-### 2.1 (visualization consequence) [MAJOR] — Key contrast AUC and direction stability are computed in-sample
+### 2.1 (visualization consequence) [MAJOR] — Key contrast AUC by layer (PARTIAL FIX LANDED 2026-05-27)
 
-**What's wrong:** The paper-summary panel's "key contrast AUC by layer" subplot, and the per-contrast centroid-ordering CIs, are derived from the full-data direction (`compute_direction` on all prompts) projected onto all prompts. The cross-family / cross-template held-out variant exists upstream but is not the default source for the paper panel.
+**Status:** The headline AUC plot is now sourced from held-out CSV. The centroid-ordering CIs are NOT yet bootstrapped against held-out direction estimation — that's the remaining piece.
 
-**Why it matters:** This is the single figure most likely to land in a paper. If its AUC numbers are in-sample, the headline number is biased.
+**What landed:**
+- `plot_layerwise_figures` now reads `family_to_family_generalization.csv` (filtered to `train_family LIKE "all_except_*"` — the leave-one-family-out rows) and aggregates per `(layer, contrast_name, residualization)` as both `mean` and `median` across held-out families.
+- New headline plots: `key_contrasts_auc_by_layer_residualization_comparison.png` (mean) and `..._median.png`. Titles include "HEADLINE — across held-out template families".
+- In-sample variants moved to `..._in_sample.png` with "DIAGNOSTIC" in the title and a note that the metric overstates separation.
+- Cohen's d variant: same swap, gated on `cohens_d` column being present in `family_to_family_generalization.csv`.
 
-**Targeted fix:** Recompute the key-contrast AUC for the paper panel using cross-family direction estimation (re-fit direction on `~heldout` family, evaluate on `heldout` family, average across heldout families). Mirror the centroid-ordering CIs by bootstrapping over (a) family-held-out direction estimation, and (b) the prompts being projected. Demote in-sample to diagnostic small multiples.
+**Remaining work (smaller follow-up):** centroid-ordering CIs are still bootstrapped over the full-data direction. The honest version bootstraps over (a) family-held-out direction estimation, and (b) the prompts being projected. Substantial change to `centroid_ordering_rows` and the corresponding plotter; deferred until you say.
+
+**Original audit (preserved):** The paper-summary panel's "key contrast AUC by layer" subplot was derived from the full-data direction (`compute_direction` on all prompts) projected onto all prompts. The cross-family / cross-template held-out variant existed upstream but was not the default source for the paper panel.
 
 ### 4.1 [MAJOR] — `DEFAULT_CONTRASTS` references identities that do not exist (FIX LANDED 2026-05-27)
 

@@ -26,13 +26,16 @@ Theory-driven visualization of identity contrast representations: per-layer per-
 
 ## Issues & Opportunities
 
-### 2.1 (visualization consequence) [MAJOR] — In-sample AUC plotted as the headline contrast curve
+### 2.1 (visualization consequence) [MAJOR] — In-sample AUC plotted as the headline contrast curve (FIX LANDED 2026-05-27)
 
-**What's wrong:** `metrics/layerwise_contrast_metrics.csv` contains both the full-data and family-holdout AUC; the layer-curve figure here uses the full-data column by default. The full-data number is computed on the same prompts that defined the direction — identical to the bias described in [Step 7](07_analyze_identity_geometry.md) issue 2.1.
+**Status:** Closed. `plot_layer_curves` now sources from `directional_family_holdout_metrics.csv` for the headline `directional_auc_by_layer.png` (plus a `_median` variant) — aggregating per (layer, contrast_name) as mean and median across held-out template families. The in-sample plot is preserved with a `_in_sample` suffix and "DIAGNOSTIC" in the title. Matches the Step 10 (commit `e15e62f`) and Step 12 patterns.
 
-**Why it matters:** This script's layer-AUC plot is one of the geometry-pipeline's headline visuals. Plotting in-sample AUC overstates separability.
+**What landed:**
+- Headline plot `directional_auc_by_layer.png` reads the held-out CSV and plots mean-across-families per (layer, contrast). A companion `_median.png` variant uses the median.
+- The "mean family-holdout AUC across contrasts" plot retains its existing `mean_family_holdout_auc_by_layer.png` name, now explicitly titled HEADLINE.
+- In-sample plots become `directional_auc_by_layer_in_sample.png`, `directional_cohens_d_by_layer_in_sample.png`, `directional_accuracy_by_layer_in_sample.png`, each with "DIAGNOSTIC" in the title and a note that the metric overstates separation.
 
-**Targeted fix:** Plot the family-holdout AUC by default (use the `family_to_family_generalization.csv` aggregates if needed). Demote the in-sample curve to a diagnostic. Mirror the fix in [Step 10](10_plot_identity_geometry.md) and [Step 12](12_plot_identity_directional_followups.md).
+**Original audit (preserved):** `metrics/layerwise_contrast_metrics.csv` contained both the full-data and family-holdout AUC; the layer-curve figure used the full-data column by default. The full-data number was computed on the same prompts that defined the direction.
 
 ### 5.10 [MINOR] — Heavy code duplication across analysis scripts (FIX LANDED 2026-05-27)
 

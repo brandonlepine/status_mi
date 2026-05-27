@@ -458,29 +458,45 @@ def run_family_holdout(x: np.ndarray, metadata: pd.DataFrame, contrasts: pd.Data
 
 
 def plot_layer_curves(metrics_path: Path, holdout_path: Path, output_dir: Path) -> None:
-    metrics = pd.read_csv(metrics_path) if metrics_path.exists() else pd.DataFrame()
-    if not metrics.empty:
-        for y_col, filename, ylabel in [
-            ("auc", "directional_auc_by_layer", "AUC"),
-            ("cohens_d", "directional_cohens_d_by_layer", "Cohen's d"),
-            ("accuracy_midpoint", "directional_accuracy_by_layer", "Accuracy at midpoint threshold"),
-        ]:
-            fig, ax = plt.subplots(figsize=(16, 7))
-            if sns is not None:
-                sns.lineplot(data=metrics, x="layer", y=y_col, hue="contrast_name", style="residualization", ax=ax)
-            else:
-                for name, group in metrics.groupby("contrast_name"):
-                    ax.plot(group["layer"], group[y_col], label=name)
-                ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left", frameon=False)
-            ax.set_title(filename.replace("_", " ").title())
-            ax.set_ylabel(ylabel)
-            if y_col in {"auc", "accuracy_midpoint"}:
-                ax.axhline(0.5, color="black", linestyle=":", linewidth=1, alpha=0.6)
-                ax.set_ylim(0.45, 1.02)
-            save_fig(fig, output_dir / "figures" / "layer_curves" / filename)
+    """Plot directional layer curves.
 
+    Headline (audit 2.1): cross-family held-out AUC / Cohen's d, sourced from
+    `directional_family_holdout_metrics.csv` and aggregated per
+    (layer, contrast_name) as mean and median across held-out families. The
+    in-sample variants (direction trained AND evaluated on the same prompts)
+    are preserved as diagnostic figures with a `_in_sample` suffix and a
+    DIAGNOSTIC label in the title.
+    """
     holdout = pd.read_csv(holdout_path) if holdout_path.exists() else pd.DataFrame()
     if not holdout.empty:
+        # Per-contrast headline: mean and median across held-out families.
+        per_contrast = (
+            holdout.groupby(["layer", "residualization", "contrast_name"], sort=True)["auc"]
+            .agg(mean="mean", median="median", sd="std")
+            .reset_index()
+        )
+        for stat, stat_label in [("mean", "mean"), ("median", "median")]:
+            for y_col, filename_base, ylabel in [
+                ("auc", "directional_auc_by_layer", "AUC"),
+                # cohens_d held-out is also useful when available
+            ]:
+                if y_col != "auc":
+                    continue  # holdout CSV currently only has auc; cohens_d added if present below
+                fig, ax = plt.subplots(figsize=(16, 7))
+                if sns is not None:
+                    sns.lineplot(data=per_contrast, x="layer", y=stat, hue="contrast_name", style="residualization", ax=ax)
+                else:
+                    for name, group in per_contrast.groupby("contrast_name"):
+                        ax.plot(group["layer"], group[stat], label=name)
+                    ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left", frameon=False)
+                ax.set_title(f"Directional {ylabel} by layer (HEADLINE — {stat} across held-out template families)")
+                ax.set_ylabel(f"Held-out {ylabel} ({stat} across families)")
+                ax.axhline(0.5, color="black", linestyle=":", linewidth=1, alpha=0.6)
+                ax.set_ylim(0.45, 1.02)
+                suffix = "" if stat == "mean" else f"_{stat}"
+                save_fig(fig, output_dir / "figures" / "layer_curves" / f"{filename_base}{suffix}")
+
+        # Per-residualization summary across all contrasts.
         summary = holdout.groupby(["layer", "residualization"], sort=True)["auc"].agg(mean="mean", sd="std").reset_index()
         fig, ax = plt.subplots(figsize=(14, 6))
         if sns is not None:
@@ -491,7 +507,7 @@ def plot_layer_curves(metrics_path: Path, holdout_path: Path, output_dir: Path) 
             ax.legend(frameon=False)
         ax.axhline(0.5, color="black", linestyle=":", linewidth=1, alpha=0.6)
         ax.set_ylim(0.45, 1.02)
-        ax.set_title("Mean family-holdout AUC by layer, averaged across contrasts")
+        ax.set_title("Mean family-holdout AUC by layer, averaged across contrasts (HEADLINE)")
         ax.set_ylabel("Mean held-out-family AUC")
         save_fig(fig, output_dir / "figures" / "family_holdout" / "mean_family_holdout_auc_by_layer")
         for residualization, resid_df in holdout.groupby("residualization", sort=True):
@@ -518,6 +534,30 @@ def plot_layer_curves(metrics_path: Path, holdout_path: Path, output_dir: Path) 
                 ax.set_xlabel("Layer")
                 ax.set_ylabel("AUC")
                 save_fig(fig, output_dir / "figures" / "family_holdout" / residualization / f"{contrast_name}_family_holdout_auc_by_layer")
+
+    # Diagnostic: in-sample plots get a _in_sample suffix and DIAGNOSTIC in the title.
+    metrics = pd.read_csv(metrics_path) if metrics_path.exists() else pd.DataFrame()
+    if not metrics.empty:
+        for y_col, filename, ylabel in [
+            ("auc", "directional_auc_by_layer_in_sample", "AUC (in-sample)"),
+            ("cohens_d", "directional_cohens_d_by_layer_in_sample", "Cohen's d (in-sample)"),
+            ("accuracy_midpoint", "directional_accuracy_by_layer_in_sample", "Accuracy at midpoint (in-sample)"),
+        ]:
+            fig, ax = plt.subplots(figsize=(16, 7))
+            if sns is not None:
+                sns.lineplot(data=metrics, x="layer", y=y_col, hue="contrast_name", style="residualization", ax=ax)
+            else:
+                for name, group in metrics.groupby("contrast_name"):
+                    ax.plot(group["layer"], group[y_col], label=name)
+                ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left", frameon=False)
+            ax.set_title(
+                f"Directional {ylabel} by layer (DIAGNOSTIC — direction trained AND evaluated on the same prompts; overstates separation)"
+            )
+            ax.set_ylabel(ylabel)
+            if y_col in {"auc", "accuracy_midpoint"}:
+                ax.axhline(0.5, color="black", linestyle=":", linewidth=1, alpha=0.6)
+                ax.set_ylim(0.45, 1.02)
+            save_fig(fig, output_dir / "figures" / "layer_curves" / filename)
 
 
 def direction_cosine_outputs(directions: dict[str, np.ndarray], contrasts: pd.DataFrame, layer: int, residualization: str, output_dir: Path) -> list[dict[str, object]]:

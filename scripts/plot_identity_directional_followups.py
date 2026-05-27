@@ -503,9 +503,57 @@ def plot_layerwise_figures(metrics_path: Path, output_dir: Path, residualization
     key = metrics[metrics["contrast_name"].isin(KEY_CONTRASTS) & metrics["residualization"].isin(["raw", "family_residualized", "template_residualized"])].copy()
     if key.empty:
         return
+
+    # Headline (audit 2.1): source the key-contrast paper figure from the
+    # held-out cross-family AUC, NOT from the in-sample metrics CSV. The
+    # held-out source is family_to_family_generalization.csv, filtered to
+    # the leave-one-family-out rows (train_family LIKE 'all_except_*'), then
+    # aggregated per (layer, contrast_name) as mean / median across held-out
+    # families.
+    holdout_path = metrics_path.parent / "family_to_family_generalization.csv"
+    if holdout_path.exists():
+        holdout = pd.read_csv(holdout_path)
+        loo = holdout[holdout["train_family"].astype(str).str.startswith("all_except_")].copy()
+        loo = loo[
+            loo["contrast_name"].isin(KEY_CONTRASTS)
+            & loo["residualization"].isin(["raw", "family_residualized", "template_residualized"])
+        ]
+        if not loo.empty:
+            for y_col, ylabel, filename in [
+                ("auc", "AUC", "key_contrasts_auc_by_layer_residualization_comparison"),
+                ("cohens_d", "Cohen's d", "key_contrasts_d_by_layer_residualization_comparison"),
+            ]:
+                if y_col not in loo.columns:
+                    continue
+                for stat in ("mean", "median"):
+                    summary = (
+                        loo.groupby(["layer", "contrast_name", "residualization"], sort=True)[y_col]
+                        .agg(value=stat)
+                        .reset_index()
+                    )
+                    fig, ax = plt.subplots(figsize=(18, 8))
+                    if sns is not None:
+                        sns.lineplot(data=summary, x="layer", y="value", hue="contrast_name", style="residualization", ax=ax, linewidth=2.2, marker=None)
+                    else:
+                        colors = color_map(sorted(summary["contrast_name"].unique()))
+                        styles = {name: LINESTYLES[i % len(LINESTYLES)] for i, name in enumerate(sorted(summary["residualization"].unique()))}
+                        for (contrast, resid), group in summary.groupby(["contrast_name", "residualization"], sort=True):
+                            ax.plot(group["layer"], group["value"], color=colors[contrast], linestyle=styles[resid], linewidth=2.2, label=f"{contrast} | {resid}")
+                    if y_col == "auc":
+                        ax.axhline(0.5, color="black", linestyle=":", linewidth=1, alpha=0.6)
+                        ax.set_ylim(0.45, 1.02)
+                    ax.set_title(f"Key identity contrast {ylabel} by layer (HEADLINE — {stat} across held-out template families)")
+                    ax.set_xlabel("Layer")
+                    ax.set_ylabel(f"Held-out {ylabel} ({stat})")
+                    ax.grid(alpha=0.2)
+                    add_outside_legend(ax, max_items=80)
+                    suffix = "" if stat == "mean" else f"_{stat}"
+                    save_fig(fig, output_dir / "figures" / "layerwise" / f"{filename}{suffix}")
+
+    # Diagnostic: in-sample variants under _in_sample suffix, DIAGNOSTIC in title.
     for y_col, ylabel, filename in [
-        ("auc", "AUC", "key_contrasts_auc_by_layer_residualization_comparison"),
-        ("cohens_d", "Cohen's d", "key_contrasts_d_by_layer_residualization_comparison"),
+        ("auc", "AUC", "key_contrasts_auc_by_layer_residualization_comparison_in_sample"),
+        ("cohens_d", "Cohen's d", "key_contrasts_d_by_layer_residualization_comparison_in_sample"),
     ]:
         fig, ax = plt.subplots(figsize=(18, 8))
         if sns is not None:
@@ -518,9 +566,9 @@ def plot_layerwise_figures(metrics_path: Path, output_dir: Path, residualization
         if y_col == "auc":
             ax.axhline(0.5, color="black", linestyle=":", linewidth=1, alpha=0.6)
             ax.set_ylim(0.45, 1.02)
-        ax.set_title(f"Key identity contrast {ylabel} by layer and residualization")
+        ax.set_title(f"Key identity contrast {ylabel} (DIAGNOSTIC — in-sample; direction trained AND evaluated on the same prompts; overstates separation)")
         ax.set_xlabel("Layer")
-        ax.set_ylabel(ylabel)
+        ax.set_ylabel(f"{ylabel} (in-sample)")
         ax.grid(alpha=0.2)
         add_outside_legend(ax, max_items=80)
         save_fig(fig, output_dir / "figures" / "layerwise" / filename)
