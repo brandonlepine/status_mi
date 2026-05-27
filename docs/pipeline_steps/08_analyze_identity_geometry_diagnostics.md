@@ -41,13 +41,17 @@ Do not collapse the residualization grid into a single "best" residualization �
 
 ## Issues & Opportunities
 
-### 2.1 [MAJOR] — Headline contrast AUC / Cohen's d are in-sample (circular)
+### 2.1 [MAJOR] — Headline contrast AUC / Cohen's d are in-sample (FIX LANDED 2026-05-27)
 
-**What's wrong:** `run_contrasts` here writes `contrast_full_residualized_scores.csv` using the same `mean(A) − mean(B)` direction definition and same-prompt evaluation as [Step 7](07_analyze_identity_geometry.md). The honest `contrast_family_holdout_residualized_scores.csv` is also written, but the "full" CSV is what gets plotted in `contrast_full_auc_residualized_by_layer`.
+**Status:** Commit `e15e62f`. Same fix shape as [Step 7](07_analyze_identity_geometry.md#21-major--headline-contrast-auc--cohens-d-are-in-sample-fix-landed-2026-05-27).
 
-**Why it matters:** The residualization story ("identity geometry survives family residualization") is only convincing if the AUC compared across residualizations is held-out. With in-sample AUC, a residualization that hurts only generalization (not in-sample separability) will look harmless.
+**What landed:**
+- `CONTRAST_COLUMNS` split into `CONTRAST_IN_SAMPLE_COLUMNS` and `CONTRAST_HOLDOUT_COLUMNS`; the two CSVs now have distinct schemas (in-sample writes `auc_in_sample`/`cohens_d_in_sample`, held-out writes `auc`/`cohens_d`). Backwards-compatible alias `CONTRAST_COLUMNS = CONTRAST_HOLDOUT_COLUMNS`.
+- `run_contrasts` populates the renamed in-sample columns.
+- New `_write_holdout_summary` helper emits `contrast_family_holdout_residualized_summary.csv` — the headline number per (layer, residualization, contrast).
+- The residualization comparison story is now honest: differences between residualizations are visible on the held-out summary, not on a metric that the difference-of-means direction is guaranteed to maximize.
 
-**Targeted fix:** Make `plot_contrast_full_auc_residualized_by_layer` read from `contrast_family_holdout_residualized_scores.csv` instead (or add a held-out variant of that plot, demote the in-sample one to `*_in_sample`). Same change in [Step 10](10_plot_identity_geometry.md), [Step 11](11_plot_identity_directional_visualizations.md), [Step 12](12_plot_identity_directional_followups.md).
+**Remaining work (followup plotting):** `plot_identity_directional_followups.py` still computes in-sample AUC per residualization for the projection histogram titles. Those numbers correctly describe the projection distributions being plotted (they're inherently in-sample), but the title text should explicitly call them in-sample to avoid confusion. That's a small docs-side label tweak, not a logic change.
 
 ### 2.2 [BLOCKER] — No null model for the central claims (PROBE NULL LANDED 2026-05-27; η² / contrast / SVD nulls still pending)
 

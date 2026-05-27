@@ -30,13 +30,18 @@ Decomposes the set of identity contrast directions into a **shared social subspa
 
 ## Issues & Opportunities
 
-### 2.1 [MAJOR] — Shared / residual components evaluated in-sample
+### 2.1 [MAJOR] — Shared / residual components evaluated in-sample (FIX LANDED 2026-05-27)
 
-**What's wrong:** `evaluate_component` projects the endpoint A/B prompts (the *same* prompts whose means defined `d`) onto each component (shared or residual) and reports AUC/d. Because `d` was built from these prompts and the shared/residual components are linear functions of `d` and a fixed basis, the separation metrics are conditioned on the data they evaluate.
+**Status:** Commit `51aa571`. Genuinely held-out at every step: direction estimation, SVD basis, and evaluation.
 
-**Why it matters:** The shared-subspace paper-worthy claim ("a low-rank subspace recovers most of the identity contrast across axes") needs to be a generalization claim. As written, "shared component AUC = 0.85" is "the shared component, fit on these prompts, separates these prompts with AUC 0.85" — not a generalization statement.
+**What landed:**
+- `DECOMPOSITION_COLUMNS` split into in-sample (suffixed `_in_sample`) and held-out schemas; `_suffix_metric_keys` helper drives the rename so the same `evaluate_component` function backs both paths.
+- New `decomposition_rows_holdout`: for each held-out template family `f`, re-derives every contrast direction on the non-`f` rows, re-SVDs the basis from those held-out-trained directions, decomposes each direction onto the held-out basis, and evaluates shared / residual components on the `f` rows. Writes `decomposition_metrics_holdout.csv` (one row per fold).
+- New `write_decomposition_holdout_summary`: aggregates per-fold rows into one row per (contrast, k, component_type): `auc_mean`, `auc_sd`, `cohens_d_mean`, `cohens_d_sd`, `n_folds`. Written to `decomposition_metrics_holdout_summary.csv`. This is the audit-recommended headline; cite it in the methods doc, not the in-sample `decomposition_metrics.csv`.
+- `aggregate_axis_sharedness` output columns are renamed `mean_*_auc → mean_*_auc_in_sample` (same for `d`) so the per-axis summary's in-sample status is unambiguous. `plot_axis_summary` title and filename now carry "DIAGNOSTIC (in-sample)".
+- Paper-panel plot in `plot_decomposition_paper_panel` reads `auc_in_sample` (the renamed column) for the in-sample quad.
 
-**Targeted fix:** Re-estimate each contrast direction `d` on a held-out split of prompts (cross-family or cross-template), refit the SVD on those train-side directions, and evaluate `shared` / `residual` AUC on the held-out prompts only. Write a `decomposition_metrics_heldout.csv` alongside the in-sample version.
+**Original audit (preserved):** `evaluate_component` projected the endpoint A/B prompts (the *same* prompts whose means defined `d`) onto each component (shared or residual) and reported AUC/d. Because `d` was built from these prompts and the shared/residual components are linear functions of `d` and a fixed basis, the separation metrics were conditioned on the data they evaluated. The shared-subspace paper-worthy claim ("a low-rank subspace recovers most of the identity contrast across axes") is now a defensible generalization claim from the held-out summary.
 
 ### 2.2 [BLOCKER] — No null model for the SVD spectrum / "shared subspace" claim (STILL OPEN)
 

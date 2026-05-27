@@ -149,15 +149,21 @@ Per-layer constants must be loaded from each layer's `hyperparameters.json` — 
 
 ## 2. Statistical rigor (numbers that will not survive review as-is)
 
-### 2.1 [MAJOR] Headline contrast AUC / Cohen's d are in-sample (circular)
+### 2.1 [MAJOR] Headline contrast AUC / Cohen's d are in-sample (FIX LANDED 2026-05-27 across geometry + subspace; SAE features partial)
+
+**Status:** Two commits closed the headline metric switch. The SAE-features held-out reconstruction is intentionally bundled with 2.5 winner's curse.
+
+- `e15e62f` — `analyze_identity_geometry.py` + `analyze_identity_geometry_diagnostics.py`: `auc_all`/`cohens_d_all` renamed `_in_sample`; new `contrast_holdout_summary.csv` and `contrast_family_holdout_residualized_summary.csv` aggregate the family-holdout rows into headline mean/sd/min/max per (layer, contrast). `plot_identity_geometry.py:plot_contrasts` makes held-out the headline plot (`contrast_auc_by_layer.png`) and demotes in-sample to `_in_sample`-suffixed diagnostic plots.
+- `51aa571` — `analyze_shared_social_subspace.py`: in-sample decomposition columns renamed `_in_sample`. New `decomposition_rows_holdout` does leave-one-family-out: re-derives every contrast direction on non-`f` rows, re-SVDs a held-out basis, decomposes each direction onto that basis, evaluates shared / residual / full components on the `f` rows. Writes `decomposition_metrics_holdout.csv` (per fold) and `decomposition_metrics_holdout_summary.csv` (mean / sd / n_folds per contrast × k × component). `aggregate_axis_sharedness` and `plot_axis_summary` updated to read the renamed in-sample columns and mark their plots `DIAGNOSTIC`.
+- `51aa571` — `analyze_identity_sae_features.py`: in-sample `auc`/`cohens_d`/`full_direction_*` columns in `direction_reconstruction.csv` renamed `_in_sample`. Held-out reconstruction (which requires held-out feature *selection*, not just held-out direction) is bundled with the 2.5 winner's-curse fix.
+
+**Original audit (preserved):**
 
 `analyze_identity_geometry.py:run_contrasts` and `analyze_identity_geometry_diagnostics.py:run_contrasts` compute the contrast direction from `mean(A) − mean(B)`, then evaluate AUC/Cohen's d of the projection **on the same A and B prompts**. `analyze_shared_social_subspace.py:evaluate_component` and `analyze_identity_sae_features.py` do the same. In-sample separation is optimistically biased — a difference-of-means direction is *defined* to separate the two means.
 
-The family-holdout variants (`contrast_family_holdout_scores.csv`, `contrast_family_holdout_residualized_scores.csv`, the family-to-family heatmaps) are the honest tests and they exist — good. But the in-sample `auc_all` / `cohens_d_all` columns are what gets plotted as the headline "contrast AUC by layer."
-
-What to do:
-- Demote in-sample AUC to a clearly-labeled diagnostic, or remove it. Make the **held-out** AUC (cross-template, cross-family) the headline number everywhere.
-- For the shared-subspace decomposition, evaluate shared/residual components with the *direction estimated on held-out prompts* too.
+**Remaining work:**
+- Hold-out reconstruction for `analyze_identity_sae_features.py:reconstruction_rows`, folded into the 2.5 fix.
+- The followups plotting script (`plot_identity_directional_followups.py`) shows in-sample AUC per residualization in projection-histogram titles; those are genuinely in-sample by design (they describe the projection distribution being plotted), but the title text should explicitly say `in-sample` to avoid confusion. Small label-only tweak.
 
 ### 2.2 [BLOCKER] No null model for the central claims (PROBE NULL LANDED 2026-05-27; SVD null still pending)
 

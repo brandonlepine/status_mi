@@ -42,6 +42,17 @@ The bridge from "geometric contrast directions" to "individual SAE features." Fo
 
 > **Upstream callout — issue 1.4 (FIX LANDED; regenerate inputs).** The encoder fix in [Step 5](05_encode_identity_saes.md#14-blocker--sae-preprocessing-convention-fix-landed-2026-05-26) landed in commit `4b8851a` (JumpReLU at θ=0.7539, dataset-wise input normalization, `b_dec` decode-only). Every existing `feature_*_selectivity.csv`, `decoder_direction_alignment.csv`, `direction_reconstruction.csv`, and `intervention_candidate_features.csv` was produced by the broken encoder and must be regenerated: re-run [Step 5](05_encode_identity_saes.md) with `--overwrite`, [Step 6](06_validate_sae_hook_alignment.md) to confirm `reconstruction_fvu <= 0.15`, then this script. The script logic below is unchanged; only its inputs were wrong.
 
+### 2.1 [MAJOR] — Headline reconstruction AUC / Cohen's d are in-sample (PARTIAL FIX LANDED 2026-05-27; held-out math bundled with 2.5)
+
+**Status:** Commit `51aa571` renamed the affected columns in `direction_reconstruction.csv` so the in-sample status is explicit. The held-out reconstruction math is scope-deferred to the 2.5 winner's-curse fix because both require held-out feature SELECTION (re-ranking by Cohen's d on non-held-out rows), not just held-out direction estimation. Bundling them avoids re-touching the selection code twice.
+
+**What landed:**
+- `direction_reconstruction.csv` columns renamed: `auc → auc_in_sample`, `cohens_d → cohens_d_in_sample`, `full_direction_auc → full_direction_auc_in_sample`, `full_direction_cohens_d → full_direction_cohens_d_in_sample`. Inline comment in `reconstruction_rows` documents the scope split.
+
+**Remaining work (folded into 2.5):**
+- For each held-out template family `f`: re-derive the contrast direction on non-`f` rows, re-rank features by Cohen's d / decoder alignment / combined score using the non-`f` direction, reconstruct using the new top-`k`, evaluate on `f`. Write `direction_reconstruction_holdout.csv` and a per-(contrast, method, k) summary.
+- The `random_baseline` selection method is direction-independent and gets the held-out treatment for free (just re-run the reconstruction on held-out rows).
+
 ### 2.5 [MAJOR] — Selection-induced bias ("winner's curse") in feature effect sizes
 
 **What's wrong:** `feature_selectivity_for_contrast` filters to the top `5 · top_n` features by `|diff_mean|`, then computes Cohen's d and AUC only on that surviving subset, then re-ranks and keeps the top `top_n` by `|d|`. Because `diff_mean` and `d` are highly correlated, the reported `d`/`auc` are conditioned on having survived a selection screen and are inflated.

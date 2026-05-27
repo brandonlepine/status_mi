@@ -65,13 +65,13 @@ Severity tags are aggregated per script from `issues_and_opportunities.md`. **B*
 | 04 | `extract_identity_activations.py` | 1 | **B** (1.1 — PARTIAL FIX LANDED) · m (1.5) | [04_extract_identity_activations.md](04_extract_identity_activations.md) |
 | 05 | `encode_identity_saes.py` | 1 | **B** (1.4 — FIX LANDED) · m (4.6) · **B** (1.1 — FIX LANDED) | [05_encode_identity_saes.md](05_encode_identity_saes.md) |
 | 06 | `validate_sae_hook_alignment.py` | 1 | **B** (1.4 — FIX LANDED with recon check) | [06_validate_sae_hook_alignment.md](06_validate_sae_hook_alignment.md) |
-| 07 | `analyze_identity_geometry.py` | 2 | **B** (2.2 — PROBE NULL LANDED) · M (2.1, 4.1) · m (2.8, 5.9, 5.10) | [07_analyze_identity_geometry.md](07_analyze_identity_geometry.md) |
-| 08 | `analyze_identity_geometry_diagnostics.py` | 2 | **B** (2.2 — PROBE NULL LANDED) · M (2.1, 4.1) · m (5.9, 5.10) — strengths to keep | [08_analyze_identity_geometry_diagnostics.md](08_analyze_identity_geometry_diagnostics.md) |
-| 09 | `analyze_shared_social_subspace.py` | 2 | **B** (2.2 — SVD null still pending) · M (2.1, 4.1) · m (5.10) | [09_analyze_shared_social_subspace.md](09_analyze_shared_social_subspace.md) |
+| 07 | `analyze_identity_geometry.py` | 2 | **B** (2.2 — PROBE NULL LANDED) · M (2.1 — FIX LANDED, 4.1) · m (2.8, 5.9, 5.10) | [07_analyze_identity_geometry.md](07_analyze_identity_geometry.md) |
+| 08 | `analyze_identity_geometry_diagnostics.py` | 2 | **B** (2.2 — PROBE NULL LANDED) · M (2.1 — FIX LANDED, 4.1) · m (5.9, 5.10) — strengths to keep | [08_analyze_identity_geometry_diagnostics.md](08_analyze_identity_geometry_diagnostics.md) |
+| 09 | `analyze_shared_social_subspace.py` | 2 | **B** (2.2 — SVD null still pending) · M (2.1 — FIX LANDED, 4.1) · m (5.10) | [09_analyze_shared_social_subspace.md](09_analyze_shared_social_subspace.md) |
 | 10 | `plot_identity_geometry.py` | 2 | m (2.1 visualization, 5.10) | [10_plot_identity_geometry.md](10_plot_identity_geometry.md) |
 | 11 | `plot_identity_directional_visualizations.py` | 2 | m (2.1 visualization, 5.10) | [11_plot_identity_directional_visualizations.md](11_plot_identity_directional_visualizations.md) |
 | 12 | `plot_identity_directional_followups.py` | 2 | m (2.1, 4.1, 5.10) | [12_plot_identity_directional_followups.md](12_plot_identity_directional_followups.md) |
-| 13 | `analyze_identity_sae_features.py` | 3 | M (2.5, 5.1) · m (5.3, 5.4, 5.10) · enabler (3.1) | [13_analyze_identity_sae_features.md](13_analyze_identity_sae_features.md) |
+| 13 | `analyze_identity_sae_features.py` | 3 | M (2.1 — PARTIAL FIX LANDED, 2.5, 5.1) · m (5.3, 5.4, 5.10) · enabler (3.1) | [13_analyze_identity_sae_features.md](13_analyze_identity_sae_features.md) |
 | 14 | `extract_token_level_sae_activations.py` | 3 | m (4.6) · enabler (1.1) | [14_extract_token_level_sae_activations.md](14_extract_token_level_sae_activations.md) |
 | 15 | `build_sae_feature_cards.py` | 3 | m (logit-lens caveat) | [15_build_sae_feature_cards.md](15_build_sae_feature_cards.md) |
 | 16 | `plot_identity_sae_features.py` | 3 | m (5.10) | [16_plot_identity_sae_features.md](16_plot_identity_sae_features.md) |

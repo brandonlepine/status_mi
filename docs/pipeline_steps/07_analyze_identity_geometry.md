@@ -31,13 +31,17 @@ First-pass characterization of identity geometry from the final-token residual s
 
 ## Issues & Opportunities
 
-### 2.1 [MAJOR] — Headline contrast AUC / Cohen's d are in-sample (circular)
+### 2.1 [MAJOR] — Headline contrast AUC / Cohen's d are in-sample (FIX LANDED 2026-05-27)
 
-**What's wrong:** `run_contrasts` defines the contrast direction as `mean(A) − mean(B)` on **all** prompts of identities A and B, then evaluates `auc_all` / `cohens_d_all` by projecting **those same prompts** onto that direction. Difference-of-means is by construction the linear maximizer of mean separation between the two groups, so this number is optimistically biased. The family-holdout columns (`contrast_family_holdout_scores.csv`) are the honest version — but the *headline* plots downstream still use `auc_all`.
+**Status:** Commit `e15e62f`. The headline metric is now held-out; in-sample is preserved as a diagnostic so the over-fitting gap can still be quoted.
 
-**Why it matters:** "Identity contrasts are linearly decodable with AUC ≈ X" is one of the project's two main geometric claims. As currently reported, it is a tautology, not evidence. A reviewer will require the held-out number.
+**What landed:**
+- `CONTRAST_COLUMNS` renamed `auc_all` → `auc_in_sample`, `cohens_d_all` → `cohens_d_in_sample` (in-sample status now loud in the schema).
+- `run_contrasts` writes the renamed columns to `contrast_scores.csv`.
+- New `contrast_holdout_summary.csv` aggregates `contrast_family_holdout_scores.csv` into a headline row per (layer, contrast): `auc_mean`, `auc_sd`, `auc_min`, `auc_max`, `cohens_d_mean`, `cohens_d_sd`, `n_families`. Cite this in the methods doc, not `contrast_scores.csv`.
+- [Step 10](10_plot_identity_geometry.md) — `plot_contrasts` now plots held-out AUC / Cohen's d as the headline `contrast_auc_by_layer.png` / `contrast_cohens_d_by_layer.png` (with "HEADLINE" in the title). The in-sample plots get an `_in_sample` suffix and "DIAGNOSTIC" in the title so anyone glancing knows they overstate separation.
 
-**Targeted fix:** Demote `auc_all` / `cohens_d_all` to a labeled diagnostic (or remove). Make the cross-family held-out AUC/d the headline everywhere they appear (here and in [Step 10](10_plot_identity_geometry.md), [Step 11](11_plot_identity_directional_visualizations.md), [Step 12](12_plot_identity_directional_followups.md)).
+**Original audit (preserved for context):** `run_contrasts` defined the contrast direction as `mean(A) − mean(B)` on **all** prompts of identities A and B, then evaluated `auc_all` / `cohens_d_all` by projecting **those same prompts** onto that direction. Difference-of-means is by construction the linear maximizer of mean separation between the two groups, so this number was optimistically biased. "Identity contrasts are linearly decodable with AUC ≈ X" was a tautology, not evidence.
 
 ### 2.2 [BLOCKER] — No null model for probes (PROBE NULL LANDED 2026-05-27; SVD null still pending)
 
