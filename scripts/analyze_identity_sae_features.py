@@ -426,17 +426,33 @@ def zscore(series: pd.Series) -> pd.Series:
 
 
 def reconstruct_direction(decoder_normed: np.ndarray, direction: np.ndarray, feature_ids: np.ndarray) -> tuple[np.ndarray | None, float, float]:
+    """Orthogonal projection of `direction` onto span(decoder_normed[feature_ids]).
+
+    Audit 5.1: prior code computed `recon = (basis @ direction) @ basis`, i.e.
+    `B^T B d`. This is only the orthogonal projection when `B B^T = I`
+    (basis rows orthonormal). Decoder rows are unit-normed but generally not
+    mutually orthogonal — related identity features have nonzero cosines —
+    so `||recon||²` was not bounded in [0, 1] and `cosine_with_full_direction`
+    was taken against a non-projection vector.
+
+    Fix: solve the least-squares problem `argmin_c ||basis.T @ c − direction||²`.
+    The minimizer `recon = c @ basis` is the true orthogonal projection onto
+    span(rows of basis). Then `fraction_norm_captured = ||recon||² / ||direction||²`
+    is a genuine variance-captured fraction in [0, 1], and
+    `cosine_with_full_direction = sqrt(fraction_norm_captured)` (projection
+    identity: `direction · recon = ||recon||²`)."""
     if len(feature_ids) == 0:
         return None, float("nan"), float("nan")
     basis = decoder_normed[feature_ids]
-    coeff = basis @ direction
+    coeff, *_ = np.linalg.lstsq(basis.T, direction, rcond=None)
     recon = coeff @ basis
-    norm = np.linalg.norm(recon)
-    if norm == 0 or not np.isfinite(norm):
+    norm = float(np.linalg.norm(recon))
+    direction_norm_sq = float(np.dot(direction, direction))
+    if norm == 0 or not np.isfinite(norm) or direction_norm_sq == 0:
         return None, float("nan"), float("nan")
     recon_unit = recon / norm
     cosine = float(np.dot(direction, recon_unit))
-    fraction = float(np.linalg.norm(recon) ** 2)
+    fraction = (norm * norm) / direction_norm_sq
     return recon_unit.astype(np.float32), cosine, fraction
 
 
