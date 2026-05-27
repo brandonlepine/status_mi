@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
@@ -400,6 +400,108 @@ def decode_full(acts: torch.Tensor, sae: LoadedSAE) -> torch.Tensor:
     if sae.b_dec is not None:
         recon_norm = recon_norm + sae.b_dec
     return recon_norm * sae.scale_out
+
+
+# ---------------------------------------------------------------------------
+# Feature-level interventions (audit 3.1)
+# ---------------------------------------------------------------------------
+#
+# Primitives for the encode -> modify latent -> decode -> patch loop. These
+# operate on the latent activation tensor (NORMALIZED-space, the output of
+# encode_full) and produce a modified latent of the same shape. Pair them
+# with patched_residual_with_intervention for the full residual-stream
+# intervention.
+
+
+def ablate_features(latent: torch.Tensor, feature_ids: torch.Tensor | list[int]) -> torch.Tensor:
+    """Clamp the specified latent features to 0. The audit-recommended primary
+    causal test of "feature f drives behavior" — needs no alpha grid.
+
+    Args:
+        latent: (..., d_sae) latent activations (output of encode_full).
+        feature_ids: indices to clamp to 0. Either a 1-D LongTensor or a list.
+    """
+    if not isinstance(feature_ids, torch.Tensor):
+        feature_ids = torch.as_tensor(feature_ids, dtype=torch.long, device=latent.device)
+    modified = latent.clone()
+    modified[..., feature_ids] = 0
+    return modified
+
+
+def clamp_features(
+    latent: torch.Tensor, feature_ids: torch.Tensor | list[int], value: float
+) -> torch.Tensor:
+    """Clamp the specified latent features to a fixed value (normalized space).
+    Use with feature_stats.csv p95/p99/max to amplify a feature beyond its
+    typical activation — the audit's recommended amplification primitive
+    (audit 3.2 makes the amplitude interpretable per-feature)."""
+    if not isinstance(feature_ids, torch.Tensor):
+        feature_ids = torch.as_tensor(feature_ids, dtype=torch.long, device=latent.device)
+    modified = latent.clone()
+    modified[..., feature_ids] = value
+    return modified
+
+
+def steer_features(
+    latent: torch.Tensor, feature_ids: torch.Tensor | list[int], alpha: float,
+    signs: torch.Tensor | list[float] | None = None,
+) -> torch.Tensor:
+    """Add `alpha * sign_i` to each feature_id's latent activation
+    (NORMALIZED-space units). With `signs=None` the same `alpha` is added to
+    every feature; otherwise `signs[i]` scales the per-feature addition (e.g.
+    +1 / -1 from the contrast's direction_side).
+
+    Note on units: alpha is in the same units as the latent activations
+    themselves, which means it is NOT directly comparable across features —
+    a feature whose typical activation is ~1 is amplified more by alpha=2
+    than a feature whose typical activation is ~100. Use clamp_features
+    with a p95-derived value for cross-feature comparable amplification.
+    """
+    if not isinstance(feature_ids, torch.Tensor):
+        feature_ids = torch.as_tensor(feature_ids, dtype=torch.long, device=latent.device)
+    modified = latent.clone()
+    if signs is None:
+        modified[..., feature_ids] = modified[..., feature_ids] + alpha
+    else:
+        if not isinstance(signs, torch.Tensor):
+            signs = torch.as_tensor(signs, dtype=modified.dtype, device=modified.device)
+        modified[..., feature_ids] = modified[..., feature_ids] + alpha * signs
+    return modified
+
+
+def patched_residual_with_intervention(
+    h: torch.Tensor,
+    sae: LoadedSAE,
+    intervention: Callable[[torch.Tensor], torch.Tensor],
+) -> torch.Tensor:
+    """Audit 3.1: the encode -> modify-latent-f -> decode -> patch loop.
+
+    Args:
+        h: (..., d_model) residual-stream activations (UN-NORMALIZED space —
+            the natural scale of the model's hidden states).
+        sae: LoadedSAE with the corrected encode/decode formula (1.4).
+        intervention: callable that maps (latent: (..., d_sae)) -> modified
+            latent of the same shape. Typically a partial of `ablate_features`,
+            `clamp_features`, or `steer_features` bound to a feature_id set.
+
+    Returns:
+        h_patched: (..., d_model). The model sees the original residual plus
+        the DIFFERENCE (recon_modified - recon_original); the SAE
+        reconstruction error cancels in the delta because we add only the
+        change induced by the intervention.
+
+    Math (encode/decode formulas from audit 1.4):
+        latent          = encode_full(h, sae)             # normalized space
+        latent_modified = intervention(latent)            # normalized space
+        recon_original  = decode_full(latent, sae)        # un-normalized
+        recon_modified  = decode_full(latent_modified, sae)
+        h_patched       = h + (recon_modified - recon_original)
+    """
+    latent = encode_full(h, sae)
+    latent_modified = intervention(latent)
+    recon_original = decode_full(latent, sae)
+    recon_modified = decode_full(latent_modified, sae)
+    return h + (recon_modified - recon_original)
 
 
 def encode_batch(batch: np.ndarray, sae: LoadedSAE, device: torch.device, dtype: torch.dtype, top_k: int) -> tuple[np.ndarray, np.ndarray]:

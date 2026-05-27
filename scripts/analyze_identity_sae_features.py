@@ -408,19 +408,44 @@ def intervention_candidates(joined: pd.DataFrame, contrast: pd.Series, layer: in
     return pd.DataFrame(rows)
 
 
+# SAE intervention primitives — numpy versions used by this script's analysis
+# helpers. The canonical TORCH versions (`ablate_features`, `clamp_features`,
+# `steer_features`, `patched_residual_with_intervention`) live in
+# scripts/encode_identity_saes.py and are used by run_bbq_sae_steering.py
+# (audit 3.1). These numpy versions share semantics; both implementations
+# operate on latent activations in NORMALIZED space (the output of the
+# JumpReLU encoder) and the decode produces a residual-space reconstruction
+# that must be added to (not replaced into) the original residual.
+
+
 def ablate_features_in_sae(latent_acts: np.ndarray, feature_ids: list[int]) -> np.ndarray:
+    """Clamp the specified latent features to 0 (numpy)."""
     modified = latent_acts.copy()
     modified[:, feature_ids] = 0
     return modified
 
 
 def steer_features_in_sae(latent_acts: np.ndarray, feature_ids: list[int], alpha: float) -> np.ndarray:
+    """Add `alpha` to the specified latent features (numpy; alpha is in
+    normalized latent units, same caveat as the torch version)."""
     modified = latent_acts.copy()
     modified[:, feature_ids] += alpha
     return modified
 
 
+def clamp_features_in_sae(latent_acts: np.ndarray, feature_ids: list[int], value: float) -> np.ndarray:
+    """Clamp the specified latent features to `value` (numpy). Use with
+    feature_stats.csv p95/p99/max for amplification."""
+    modified = latent_acts.copy()
+    modified[:, feature_ids] = value
+    return modified
+
+
 def decode_sae(latent_acts: np.ndarray, decoder: np.ndarray, decoder_bias: np.ndarray | None = None) -> np.ndarray:
+    """Pure decode in NORMALIZED space — does NOT apply the audit-1.4
+    scale_out factor. For the corrected residual-space decode use the torch
+    `decode_full` in encode_identity_saes.py (which multiplies by scale_out
+    after the affine step)."""
     recon = latent_acts @ decoder
     if decoder_bias is not None:
         recon = recon + decoder_bias
@@ -428,6 +453,9 @@ def decode_sae(latent_acts: np.ndarray, decoder: np.ndarray, decoder_bias: np.nd
 
 
 def patch_residual_with_sae_reconstruction(original_x: np.ndarray, modified_reconstruction: np.ndarray, original_reconstruction: np.ndarray) -> np.ndarray:
+    """h + (recon_modified - recon_original). SAE reconstruction error cancels
+    in the delta — see encode_identity_saes.patched_residual_with_intervention
+    for the canonical torch implementation used by BBQ steering."""
     return original_x + (modified_reconstruction - original_reconstruction)
 
 
