@@ -263,29 +263,36 @@ What to do: for final results, drop `--smoke`; use ≥10,000 bootstrap and ≥10
 
 ## 3. Causal-intervention design (the heart of the second contribution)
 
-### 3.1 [BLOCKER] "Feature steering" is decoder-direction addition, not a feature intervention
+### 3.1 [BLOCKER] "Feature steering" is decoder-direction addition, not a feature intervention (FIX LANDED 2026-05-27)
 
-`run_bbq_sae_steering.py:make_vector` builds `vec = unit-norm mean of signed decoder rows` and the hook does `h[:, pos, :] += alpha · vec`. This adds a fixed vector **regardless of whether the SAE feature was active** on that example. That is a *direction* intervention, not a *feature* intervention.
+**Status:** Code path closed across commits `11d4a4d` (canonical torch primitives) and `84c87b5` (BBQ steering hook + dispatch). Headline RunPod run with `--intervention_modes ablate` still pending; until then the existing `steering_per_feature_matched_full/` numbers are direction-based and must not be cited as feature-level evidence.
+
+**What landed:**
+- Canonical torch primitives now live alongside the corrected SAE encoder in `scripts/encode_identity_saes.py`: `ablate_features`, `clamp_features`, `steer_features`, and the wrapper `patched_residual_with_intervention(h, sae, intervention_fn)`. The wrapper runs encode → modify-latent → decode → patch in normalized space and un-scales by `scale_out` so the residual delta is on the model's natural scale. SAE reconstruction error cancels in the delta because only the intervention-induced change is added back.
+- `scripts/run_bbq_sae_steering.py` exposes `install_feature_intervention_hook` and `install_batched_feature_intervention_hook`. The forward hook captures `h` on `model.model.layers[layer-1]`, runs the chosen intervention through the patched-residual wrapper, and writes the modified residual back in place.
+- `--intervention_modes` (comma-separated) defaults to `ablate` (no alpha grid: the audit's recommended primary causal test). Valid modes: `{add_vector, ablate_projection, ablate, clamp, steer}`. `--clamp_value` accepts the per-feature clamp target (in normalized latent space; user supplies the lookup from `feature_stats.csv`). Five synthetic hook integration tests pass.
+- Legacy `add_vector` / `ablate_projection` decoder-direction modes remain available so the audit-5.5 "is the SAE adding causal value over a linear direction?" comparison can be run side-by-side.
+
+**Remaining:** RunPod headline run with `--intervention_modes ablate` against the (re-encoded under 1.4) feature pool. Pair with an `add_vector` run on the same examples for the linear-direction baseline (5.5).
+
+**Original audit (preserved):**
+
+`run_bbq_sae_steering.py:make_vector` built `vec = unit-norm mean of signed decoder rows` and the hook did `h[:, pos, :] += alpha · vec`. This added a fixed vector **regardless of whether the SAE feature was active** on that example. That was a *direction* intervention, not a *feature* intervention.
 
 A genuine single-feature causal test of "feature f drives bias" is:
 1. encode the actual hidden state `a = SAE.encode(h)`,
 2. modify only latent `f` (clamp it to 0 to ablate, or to a target value to amplify),
 3. decode and patch: `h' = h + (SAE.decode(a') − SAE.decode(a))`.
 
-`analyze_identity_sae_features.py` already contains exactly these helpers — `ablate_features_in_sae`, `steer_features_in_sae`, `decode_sae`, `patch_residual_with_sae_reconstruction` — but **they are never called** in that script's `main()`, and the steering runner does not use them either.
-
 Why it matters: with decoder-vector addition, the SAE contributes nothing but a *direction*. The claim "we found SAE features causally implicated in bias" collapses to "we found *directions* causally implicated in bias", and a reviewer will ask why an SAE was needed at all rather than a difference-of-means or probe direction. The project's stated goal — *interpretable features causally implicated in biased behavior* — specifically requires a feature-level intervention.
 
-What to do:
-- Implement encode → modify-latent-f → decode → patch as the primary intervention. Ablation (clamp f to 0) is the cleanest causal test and needs no alpha grid.
-- For amplification, clamp f to a percentile of its own observed activation distribution (`feature_stats.csv` has `p95`/`p99`/`max`).
-- Keep decoder-vector addition as a secondary "direction steering" comparison if desired, but the headline causal claim must come from the feature-level patch.
+### 3.2 [MAJOR] Steering magnitude is uniform and untethered to feature scale (STILL OPEN; 3.1 unblocks the cleanest fix)
 
-### 3.2 [MAJOR] Steering magnitude is uniform and untethered to feature scale
+Even within the current direction-addition design, `alpha ∈ {±2, ±4, ±8}` is applied to a **unit** vector, identically for every feature. Features differ enormously in natural activation magnitude and decoder norm. A fixed alpha is neither "amplify feature f by X%" nor a constant fraction of the residual-stream norm at layer 24 (which is itself large and varies by token). So a feature showing a big effect at α=8 may simply have received a *relatively larger* perturbation than another.
 
-Even within the current design, `alpha ∈ {±2, ±4, ±8}` is applied to a **unit** vector, identically for every feature. Features differ enormously in natural activation magnitude and decoder norm. A fixed alpha is neither "amplify feature f by X%" nor a constant fraction of the residual-stream norm at layer 24 (which is itself large and varies by token). So a feature showing a big effect at α=8 may simply have received a *relatively larger* perturbation than another.
+The same problem now applies to the post-3.1 `--intervention_modes clamp` / `steer` paths: a single `--clamp_value` (or alpha) is applied across all features regardless of each feature's `p95`/`p99`. The `ablate` mode is unaffected (it sets the latent to exactly 0).
 
-What to do: express the perturbation relative to a meaningful scale — e.g. as a multiple of the residual-stream RMS norm at that layer/position, or (better, with the 3.1 fix) clamp the feature latent to a multiple of its own `p95`/`max`. Then "α" is comparable across features.
+What to do: express the perturbation relative to a meaningful scale — e.g. as a multiple of the residual-stream RMS norm at that layer/position, or (better, now that 3.1 has landed) extend `--clamp_value` to accept a per-feature lookup against `feature_stats.csv` (`p95`/`p99`/`max`) and a multiplier grid. Then "α" is comparable across features.
 
 ### 3.3 [MAJOR] Intervention positions are located by greedy regex and may hit the wrong span
 
@@ -305,7 +312,7 @@ What to do: for headline results, restrict to `mapped_contrast_confidence == exa
 
 ### 3.5 [MINOR] Bundle steering averages decoder rows into one direction
 
-`per_contrast_topk` and `role_bundle` modes average signed decoder rows into a single vector. The downstream analyzer correctly tags these `feature_bundle_membership` and warns against single-feature claims — good. But averaging *unit-normed* rows then *re-normalizing* produces a direction whose relation to any individual feature is weak; bundle effects are hard to interpret even as "membership." With the 3.1 feature-level fix, bundle interventions become "clamp this *set* of latents", which is cleaner. Prefer that.
+`per_contrast_topk` and `role_bundle` modes average signed decoder rows into a single vector. The downstream analyzer correctly tags these `feature_bundle_membership` and warns against single-feature claims — good. But averaging *unit-normed* rows then *re-normalizing* produces a direction whose relation to any individual feature is weak; bundle effects are hard to interpret even as "membership." With the 3.1 feature-level fix landed, bundle interventions can now be implemented as "clamp this *set* of latents simultaneously" via a multi-feature `ablate` / `clamp` call — cleaner and interpretable. Prefer that.
 
 ---
 
@@ -462,7 +469,7 @@ Ordered by what most threatens a defensible result.
 **Tier 1 — do before trusting any current number**
 
 1. **Verify SAE preprocessing** (1.4): confirm LlamaScope normalization + activation function; add an encode→decode reconstruction-quality check to `validate_sae_hook_alignment.py`. If wrong, every SAE number is wrong.
-2. **Fix the feature intervention** (3.1): implement encode → modify latent → decode → patch (helpers already exist, unused); make ablation the primary causal test.
+2. **Fix the feature intervention** (3.1) — **FIX LANDED 2026-05-27.** Canonical torch primitives (`ablate_features`, `clamp_features`, `steer_features`, `patched_residual_with_intervention`) live in `scripts/encode_identity_saes.py` alongside `encode_full` / `decode_full`. `scripts/run_bbq_sae_steering.py` dispatches them via `--intervention_modes` (default: `ablate`). Commits `11d4a4d` (primitives) + `84c87b5` (hook + dispatch). RunPod headline run with `--intervention_modes ablate` pending.
 3. **Re-enable steering controls** (2.3) and add the difference-of-means direction as a control/baseline (5.5).
 4. **Polarity-sign the bias metric** (4.3): the current `effect_label`/rankings/candidates table are polarity-confounded.
 5. **Validate the measurement locus** (1.1): compare final-token vs identity-span-pooled geometry; pick and justify one.

@@ -4,7 +4,7 @@
 **Runs after:** `encode_identity_saes.py` (produces top-k feature indices/values + decoder), `extract_identity_activations.py` (residual activations + metadata)
 **Feeds into:** `extract_token_level_sae_activations.py`, `build_sae_feature_cards.py`, `plot_identity_sae_features.py`, `triage_sae_identity_features.py`, ultimately `prepare_bbq_for_steering.py` and `run_bbq_sae_steering.py` (via the triaged CSV)
 
-> **CRITICAL NOTE — load-bearing for fixing 3.1.** This script defines four feature-level intervention helpers (`ablate_features_in_sae`, `steer_features_in_sae`, `decode_sae`, `patch_residual_with_sae_reconstruction`) at lines 414–434, but **none of them are called from `main()`**. The downstream steering pipeline (`run_bbq_sae_steering.py`) implements decoder-direction addition instead of an actual feature-level intervention. Wiring these helpers into the steering hook is the cleanest path to resolving issue 3.1. See `20_run_bbq_sae_steering.md` (forthcoming) for the consumer side.
+> **NOTE — 3.1 FIX LANDED 2026-05-27.** Original audit observation: the numpy helpers `ablate_features_in_sae`, `steer_features_in_sae`, `decode_sae`, `patch_residual_with_sae_reconstruction` were defined here but never called from `main()`, and `run_bbq_sae_steering.py` used decoder-vector addition. Resolution: canonical torch primitives now live in [`scripts/encode_identity_saes.py`](05_encode_identity_saes.md) alongside `encode_full` / `decode_full` (commit `11d4a4d`), and [`run_bbq_sae_steering.py`](20_run_bbq_sae_steering.md) consumes them via `install_feature_intervention_hook` (commit `84c87b5`). The numpy helpers in this file are retained as analysis-side diagnostics and have docstrings pointing at the canonical torch versions.
 
 ## Purpose
 
@@ -36,7 +36,7 @@ The bridge from "geometric contrast directions" to "individual SAE features." Fo
 - `reconstruct_direction` (line 323) does `coeff = basis @ direction; recon = coeff @ basis` — i.e. `BᵀB d` with `B` having unit-norm but **not orthogonal** rows. This is not an orthogonal projection. See issue 5.1.
 - `combined_score` (line 481) sums three z-scored magnitudes: `|d|`, `|cos|`, `|auc − 0.5|`. Since `d` and `auc` measure the same A/B separation, this double-weights selectivity vs alignment. See issue 5.3.
 - Output CSVs are **appended** (`append_csv`) per layer/contrast, so the existing run requires `--overwrite` to rebuild cleanly.
-- The four SAE intervention helpers (lines 414-434) — `ablate_features_in_sae`, `steer_features_in_sae`, `decode_sae`, `patch_residual_with_sae_reconstruction` — are defined and exported but never invoked in `main()`. They are the missing primitives for a real feature-level intervention.
+- The four numpy intervention helpers (lines 414-434) — `ablate_features_in_sae`, `steer_features_in_sae`, `decode_sae`, `patch_residual_with_sae_reconstruction` — are still defined here for analysis-side use, but the canonical torch primitives now live in [`scripts/encode_identity_saes.py`](05_encode_identity_saes.md) and are the ones consumed by [Step 20](20_run_bbq_sae_steering.md) under `--intervention_modes`. See issue 3.1 below.
 
 ## Issues & Opportunities
 
@@ -89,20 +89,16 @@ The bridge from "geometric contrast directions" to "individual SAE features." Fo
 
 Add the chosen mode to `run_config.json` and assert downstream.
 
-### 3.1 (load-bearing context) [BLOCKER] — Feature-level intervention helpers exist here but are never used
+### 3.1 (load-bearing context) [BLOCKER] — Feature-level intervention helpers exist here but are never used (FIX LANDED 2026-05-27)
 
-**What's wrong (in this file):** Lines 414-434 define `ablate_features_in_sae(latent_acts, feature_ids)`, `steer_features_in_sae(latent_acts, feature_ids, alpha)`, `decode_sae(latent_acts, decoder, decoder_bias)`, and `patch_residual_with_sae_reconstruction(original_x, modified_reconstruction, original_reconstruction)`. These are exactly the primitives needed for the encode → modify-latent-`f` → decode → patch loop that issue 3.1 says the BBQ steering pipeline is missing. `main()` does not call any of them. `run_bbq_sae_steering.py` does not call them either — it uses decoder-vector addition.
+**Status:** Closed across commits `11d4a4d` (canonical torch primitives in `encode_identity_saes.py`) and `84c87b5` (BBQ steering hook wired through them). The legacy numpy helpers in this file are kept for analysis-side use and explicitly point at the canonical implementations in their docstrings.
 
-**Why it matters:** As long as steering is "add a unit-norm direction at one token," the SAE contributes only a direction; the headline causal claim ("we found SAE features causally implicated in bias") cannot be supported. With these helpers wired in, the headline becomes a proper feature ablation/clamp.
+**What landed:**
+- Canonical torch primitives in [Step 5 — `encode_identity_saes.py`](05_encode_identity_saes.md): `ablate_features`, `clamp_features`, `steer_features`, `patched_residual_with_intervention(h, sae, intervention_fn)`. The wrapper handles the full encode → modify-latent-f → decode → patch loop and accounts for the audit 1.4 dataset-wise normalization (the patch math operates in un-normalized residual space; `scale_out` is folded in by `decode_full`).
+- [Step 20 — `run_bbq_sae_steering.py`](20_run_bbq_sae_steering.md) now exposes `--intervention_modes` values `ablate`, `clamp`, `steer` (in addition to legacy `add_vector` / `ablate_projection`), with `ablate` as the default. The hook dispatch (`make_batched_hook_fn` / `make_hook_fn`) routes feature modes through the encode → modify → decode → patch loop on the actual SAE; legacy modes still build the decoder-direction vector for the audit 5.5 baseline.
+- The numpy helpers in this file (`ablate_features_in_sae`, `steer_features_in_sae`, `decode_sae`, `patch_residual_with_sae_reconstruction`) now carry docstrings pointing at the canonical torch versions and explaining that `decode_sae` here is pure normalized-space decode — the corrected residual-space decode is `decode_full` in Step 5.
 
-**Targeted fix:** Move these four functions into a small shared module (e.g. `scripts/sae_interventions.py` or a new `status_mi/common.py`, see 5.10) and import them from `run_bbq_sae_steering.py`. The hook in `run_bbq_sae_steering.py:install_hook` should be rewritten to:
-1. Compute `latent = encode_selected_features(h)` (already implemented in `extract_token_level_sae_activations.py`).
-2. Compute `recon_original = decode_sae(latent, w_dec, b_dec)`.
-3. Compute `latent_modified = ablate_features_in_sae(latent, feature_ids)` (or `steer_features_in_sae(..., alpha)` against `p95`).
-4. Compute `recon_modified = decode_sae(latent_modified, w_dec, b_dec)`.
-5. Patch: `h = patch_residual_with_sae_reconstruction(h, recon_modified, recon_original)` at the chosen token positions.
-
-This is the cleanest single change that converts "direction steering" into a feature-level causal test. Make ablation the primary mode (no alpha grid needed).
+**Original audit (preserved):** Lines 414-434 of this file defined feature-level intervention helpers that were exactly the primitives needed for the encode → modify-latent-f → decode → patch loop, but `main()` did not call any of them and `run_bbq_sae_steering.py` used decoder-vector addition. As long as steering was "add a unit-norm direction at one token," the SAE contributed only a direction; the headline causal claim could not be supported.
 
 ### 5.10 [MINOR] — Heavy code duplication across analysis scripts (FIX LANDED 2026-05-27)
 
@@ -115,12 +111,12 @@ This is the cleanest single change that converts "direction steering" into a fea
 - [ ] Replace `feature_selectivity_for_contrast`'s `|diff_mean|` prefilter with full computation, or split prompts into selection/confirmation halves and add holdout columns. (2.5)
 - [ ] Replace `reconstruct_direction` with a proper least-squares projection (`np.linalg.lstsq` or QR). Re-derive `fraction_norm_captured` as the normalized squared norm. (5.1)
 - [ ] Rebalance `combined_score`: use one of `|d|`/`|auc-0.5|` plus `|cos|` with a documented weighting. (5.3)
-- [ ] Extract `ablate_features_in_sae`, `steer_features_in_sae`, `decode_sae`, `patch_residual_with_sae_reconstruction` into a shared module so `run_bbq_sae_steering.py` can import them. (3.1)
+- [x] Extract canonical SAE intervention primitives into a shared module so `run_bbq_sae_steering.py` can consume them. (3.1) *(Done 2026-05-27: torch primitives in `scripts/encode_identity_saes.py`, commits `11d4a4d` + `84c87b5`.)*
 - [ ] Convert `load_contrasts`'s silent `print` into a `warnings.warn` (or fail) so missing identity IDs cannot be masked. (4.1)
 - [ ] Re-run with `--overwrite` after the above; downstream scripts (token-level extraction, feature cards, triage) must be re-run to pick up the new CSVs.
 
 ## Notes from the doc audit
 
-- `intervention_candidate_features.csv` hardcodes `"recommended_intervention": "ablate"` for every row (line 408), even though the steering runner ignores the field and instead applies decoder-vector addition with both positive and negative `alpha`. The field reads as a specification but is currently aspirational. After the 3.1 fix, this field should become load-bearing.
+- `intervention_candidate_features.csv` hardcodes `"recommended_intervention": "ablate"` for every row (line 408). With 3.1 landed (2026-05-27) and `--intervention_modes ablate` as the new default in [Step 20](20_run_bbq_sae_steering.md), this field is now consistent with the production intervention. The field is still informational — the steering runner reads `feature_ids` from the triage CSV, not this column — but it now describes what actually runs.
 - `load_contrasts` skips silently with only a `print` (line 98). Combined with the missing-ID problem in `DEFAULT_CONTRASTS`, the SES axis effectively runs with two contrasts instead of four, with no error.
 - `decoder_direction_alignment.csv` only writes the top-N by each of three ranks per contrast (lines 483-487), so a feature that is mid-rank in every contrast may not appear in this CSV at all — `triage_sae_identity_features.py` joins on this file and the missing rows fall back to `max_abs_decoder_cosine = 0`. Either widen the write here or use the full `alignment` frame.
