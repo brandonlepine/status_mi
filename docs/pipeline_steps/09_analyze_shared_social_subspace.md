@@ -43,15 +43,35 @@ Decomposes the set of identity contrast directions into a **shared social subspa
 
 **Original audit (preserved):** `evaluate_component` projected the endpoint A/B prompts (the *same* prompts whose means defined `d`) onto each component (shared or residual) and reported AUC/d. Because `d` was built from these prompts and the shared/residual components are linear functions of `d` and a fixed basis, the separation metrics were conditioned on the data they evaluated. The shared-subspace paper-worthy claim ("a low-rank subspace recovers most of the identity contrast across axes") is now a defensible generalization claim from the held-out summary.
 
-### 2.2 [BLOCKER] — No null model for the SVD spectrum / "shared subspace" claim (STILL OPEN)
+### 2.2 [BLOCKER] — No null model for the SVD spectrum / "shared subspace" claim (FIX LANDED 2026-05-27)
 
-**Status:** The probe-side half of audit 2.2 landed in commits touching [Step 7](07_analyze_identity_geometry.md) and [Step 8](08_analyze_identity_geometry_diagnostics.md). This SVD-side half is still pending.
+**Status:** Closed in commit `c4071cd`. Audit 2.2 is now FULLY landed (probe null + SVD null).
 
-**What's wrong:** The reported singular spectrum and PC structure are not compared with any null. Any set of ~19 unit vectors in 4096-d has *some* concentration in its leading SVD components; the question is whether the observed concentration exceeds chance. The script writes `shared_subspace_spectrum.csv` without a matched-null spectrum.
+**What landed:**
 
-**Why it matters:** The "shared social subspace" claim is unsupported until a null exists. This is the central conceptual risk for this analysis.
+Two null methods both run per (layer, residualization), gated behind `--n_nulls_svd` (default 200):
 
-**Targeted fix:** Build a null distribution of SVD spectra by (a) shuffling identity assignments within each axis and re-deriving the contrast directions, or (b) splitting each axis's prompts randomly into two halves and computing differences of half-means. Run ≥100 nulls. Report concentration metrics (participation ratio, variance in top-k) against the null. Only PCs whose singular value exceeds, e.g., the 95th percentile of the null are reported as "shared."
+1. **`null_directions_shuffle_identities`** — for each (identity_a, identity_b) contrast, randomly permute prompts BETWEEN the two endpoint identities (preserving marginal n_a / n_b). Compute the diff-of-means direction on the shuffled labels. Tests H0 = "the difference between identity_a's and identity_b's prompts reflects no identity-specific structure beyond random relabeling."
+2. **`null_directions_random_half_split`** — for each contrast, take ALL prompts on that axis (not just the two endpoint identities) and randomly split into two halves whose sizes match the original n_a / n_b. Stronger null. Tests H0 = "the contrast direction reflects no axis-specific structure beyond a random 50/50 split of the axis."
+
+For each null replicate: build directions, stack, SVD; record per-PC singular values + **participation ratio** + **top-k explained variance** (both audit-recommended concentration metrics).
+
+**New CSVs:**
+- `metrics/shared_subspace_spectrum_null_summary.csv` — per (layer, residualization, null_method, component): observed_singular_value, null_mean, null_sd, null_p5, null_p50, null_p95, n_null_replicates, `observed_exceeds_p95`. **PCs whose observed value exceeds null p95 are the audit-defensible "shared" components.**
+- `metrics/shared_subspace_concentration_null.csv` — per (layer, residualization, null_method): observed_participation_ratio, observed_top_k_variance, the matching null distribution stats, and `observed_pr_more_concentrated_than_p5` and `observed_top_k_exceeds_p95` flags.
+- `metrics/shared_subspace_spectrum_null_replicates.csv` (optional, gated by `--save_null_svd_replicates`): per-replicate, per-component singular values for downstream plotting.
+
+**New CLI:** `--n_nulls_svd` (default 200), `--null_svd_random_seed` (defaults to `--random_seed`), `--null_svd_top_k` (default 5), `--save_null_svd_replicates`.
+
+**Decision rule for the paper:** report "the top-k singular components are shared" where k is the largest index for which `observed_exceeds_p95` is true under both null methods. Cite the concentration metrics (participation ratio, top-k variance) alongside.
+
+**Synthetic validation (in commit message):**
+- Strong rank-1 shared subspace: observed PC1 sigma 2.21 vs null p95 1.63 → EXCEEDS_P95 (correctly flagged); PR 1.05 vs null p5 ~2.88 → MORE_CONCENTRATED.
+- No shared structure (each axis along its own random direction): observed PC1 sigma 1.15 vs null p95 1.22-1.24 → below_p95 (correctly NOT flagged); PR 4.76 vs null p5 ~4.55 → NOT_MORE_CONCENTRATED.
+
+The null discriminates signal from noise.
+
+**Original audit (preserved):** The reported singular spectrum and PC structure were not compared with any null. Any set of ~19 unit vectors in 4096-d has *some* concentration in its leading SVD components; the question is whether the observed concentration exceeds chance.
 
 ### 4.1 [MAJOR] — `DEFAULT_CONTRASTS` references identities that do not exist (FIX LANDED 2026-05-27)
 

@@ -165,17 +165,29 @@ Per-layer constants must be loaded from each layer's `hyperparameters.json` — 
 - Hold-out reconstruction for `analyze_identity_sae_features.py:reconstruction_rows`, folded into the 2.5 fix.
 - The followups plotting script (`plot_identity_directional_followups.py`) shows in-sample AUC per residualization in projection-histogram titles; those are genuinely in-sample by design (they describe the projection distribution being plotted), but the title text should explicitly say `in-sample` to avoid confusion. Small label-only tweak.
 
-### 2.2 [BLOCKER] No null model for the central claims (PROBE NULL LANDED 2026-05-27; SVD null still pending)
+### 2.2 [BLOCKER] No null model for the central claims (FIX LANDED 2026-05-27; both probe + SVD halves complete)
 
-**Status:** The probe-side null landed for both `analyze_identity_geometry.py` and `analyze_identity_geometry_diagnostics.py`. The shared-subspace SVD null in `analyze_shared_social_subspace.py` is still pending.
+**Status:** Probe null landed `cafc150` (both geometry scripts). SVD null landed `c4071cd` (`analyze_shared_social_subspace.py`). η² null and contrast-direction AUC null are the only remaining sub-pieces, both noted under "Remaining work" below.
 
-**What landed:**
+**What landed (probe half — commit `cafc150`):**
 - `_run_cv_folds` (geometry) / `_run_cv_folds_diag` (diagnostics) extract the inner CV loop so observed and null share one implementation.
 - `crossval_probe` in both scripts accepts `n_permutations` and `null_rng_seed`. When `n_permutations > 0`, `y` is globally shuffled per replicate while the GroupKFold split structure is preserved across all replicates.
 - New CLI flags on both scripts: `--n_permutations` (default `20`; bump to `>=100` for the headline number) and `--null_random_seed` (defaults to `--random_seed`).
 - All probe output rows gain `null_n_permutations`, `null_accuracy_mean`, `null_accuracy_sd`, `null_macro_f1_mean`, `null_macro_f1_sd`, `accuracy_z`, `macro_f1_z`, `accuracy_p_value`, `macro_f1_p_value`. The p-value uses Phipson-Smyth `(1 + n_above) / (1 + N)` smoothing.
 - When `n_permutations == 0` the null fields are `NaN` so downstream readers can tell that no null was computed.
-- Unit-tested on synthetic data: perfect-feature inputs hit p at the n-perm floor (1/(N+1)); noise inputs sit within the null distribution with z ≈ 0 and high p; same seed reproduces the same null bit-for-bit; both scripts produce equivalent numbers.
+- Synthetic-tested: perfect-feature inputs hit p at the n-perm floor (1/(N+1)); noise inputs sit within the null distribution with z ≈ 0 and high p; same seed reproduces the same null bit-for-bit.
+
+**What landed (SVD half — commit `c4071cd`):**
+- Two null methods in `analyze_shared_social_subspace.py`:
+  1. `null_directions_shuffle_identities` — shuffle prompts between identity_a and identity_b within each contrast (preserves n_a, n_b).
+  2. `null_directions_random_half_split` — random axis-wide partition into halves matching n_a, n_b. Stronger null.
+- For each null replicate: stack directions, SVD, record per-PC singular values plus **participation ratio** and **top-k explained variance** (both audit-recommended).
+- New CSVs:
+  - `shared_subspace_spectrum_null_summary.csv` — per (layer, residualization, null_method, component): observed_singular_value, null mean/sd/p5/p50/p95, `observed_exceeds_p95`. PCs above p95 are the audit-defensible "shared" components.
+  - `shared_subspace_concentration_null.csv` — observed participation_ratio and top-k variance vs the null distribution, with `observed_pr_more_concentrated_than_p5` and `observed_top_k_exceeds_p95` flags.
+  - `shared_subspace_spectrum_null_replicates.csv` (optional via `--save_null_svd_replicates`) — per-replicate per-component sigmas for downstream plotting.
+- New CLI: `--n_nulls_svd` (default 200), `--null_svd_random_seed`, `--null_svd_top_k` (default 5), `--save_null_svd_replicates`.
+- Synthetic-tested: a rank-1 shared subspace correctly produces observed PC1 ≫ null p95 (and PR ≪ null p5); random per-axis structure correctly produces PC1 below null p95 (no false positive). Both null methods discriminate signal from noise.
 
 **Original audit (preserved):**
 
@@ -184,12 +196,11 @@ The geometry probes (`crossval_probe`) report accuracy/macro-F1 but never a **la
 - "Identity is linearly decodable" — high CV accuracy could partly reflect group structure / template leakage rather than identity content.
 - "There is a shared social subspace" — *any* set of ~19 unit vectors in 4096-d has *some* SVD spectrum; concentration only means something relative to a null. As written, the "shared subspace" claim is not yet supported.
 
-**Remaining work:**
-- Shared subspace ([Step 9](pipeline_steps/09_analyze_shared_social_subspace.md)): build directions from shuffled identity assignments (or from random splits of each axis), re-SVD, and compare the real spectrum's concentration (e.g. participation ratio, or variance in top-k) to the null distribution. Only then is "shared subspace" a finding.
-- η² in [Step 8](pipeline_steps/08_analyze_identity_geometry_diagnostics.md): report under shuffled identity labels alongside observed.
-- Per-contrast AUC / family-holdout AUC nulls (also in Step 7 / Step 8): apply the same shuffle to the contrast direction projections.
+**Remaining sub-pieces (small follow-ups):**
+- η² in [Step 8](pipeline_steps/08_analyze_identity_geometry_diagnostics.md) under shuffled identity labels alongside observed.
+- Per-contrast AUC / family-holdout AUC nulls (Step 7 / Step 8): apply the same shuffle to the contrast direction projections.
 
-The BBQ analyzer already has a sign-flip permutation test — good. The geometry side now matches that discipline for probes; finishing the SVD and contrast-direction nulls completes 2.2.
+These are mechanical extensions of the SVD / probe machinery rather than new infrastructure. The two main halves of 2.2 (probes + SVD) are now landed; the BBQ analyzer's sign-flip permutation test is the third leg of the discipline.
 
 ### 2.3 [BLOCKER] Steering controls are disabled in the production run
 
