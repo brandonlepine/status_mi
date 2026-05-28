@@ -54,9 +54,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min_examples", type=int, default=30)
     parser.add_argument("--min_examples_per_identity", type=int, default=10)
     parser.add_argument("--min_examples_per_contrast", type=int, default=20)
+    parser.add_argument(
+        "--min_examples_inference", type=int, default=30,
+        help="Audit 2.7: minimum BBQ examples a feature-level inference unit must "
+             "have (per held-out half, audit 2.5) to be tested. Units below this are "
+             "dropped from the headline feature_inference table so underpowered cells "
+             "do not enter FDR. Coarser than the per-(alpha,position) grid (audit 2.6).",
+    )
     parser.add_argument("--top_n_features", type=int, default=25)
-    parser.add_argument("--bootstrap_samples", type=int, default=1000)
-    parser.add_argument("--permutation_samples", type=int, default=1000)
+    # Audit 2.7: final results need >=10k resamples (a sign-flip test on n=10 has
+    # min p ~= 1/1024; small bootstrap budgets give unstable CIs). --smoke caps
+    # these for fast dev runs only and must not be used for headline numbers.
+    parser.add_argument("--bootstrap_samples", type=int, default=10000)
+    parser.add_argument("--permutation_samples", type=int, default=10000)
+    parser.add_argument(
+        "--headline_alpha", type=float, default=None,
+        help="Audit 2.6: the single pre-registered intervention amplitude at which "
+             "the headline feature_inference hypothesis test is run (the unit of "
+             "inference is the FEATURE, not feature x alpha). For the audit-3.1 "
+             "default ablate run there is only one alpha (0.0) and this is inferred "
+             "automatically; for multi-alpha steer/clamp grids you MUST pass it (the "
+             "rest of the grid feeds the dose-response plots, not separate tests).",
+    )
     parser.add_argument("--small_effect_threshold", type=float, default=0.002)
     parser.add_argument("--moderate_effect_threshold", type=float, default=0.005)
     parser.add_argument("--large_effect_threshold", type=float, default=0.01)
@@ -462,6 +481,118 @@ def summarize_effects(df: pd.DataFrame, group_cols: list[str], args: argparse.Na
     out["harmful_score"] = out["mean_signed_stereotype_preference_delta"].fillna(0) - out["mean_correct_margin_delta"].fillna(0)
     out["substitution_score"] = out["mean_signed_nonstereotyped_delta"].fillna(0) - out["mean_unknown_delta"].fillna(0)
     return out
+
+
+# Audit 2.6: the headline hypothesis test's unit of inference is the FEATURE
+# (× layer × intervention_position × context_condition), NOT feature × alpha ×
+# polarity × identity-pair. All other columns here are feature-constant under
+# matched-axis steering, so including them does not fragment a feature into
+# multiple tested units — they just ride along for stratification/metadata.
+# Polarity is POOLED (the audit-4.3 signed metric makes neg/nonneg comparable,
+# so pooling is valid and raises power); identity pairs are pooled; alpha is
+# fixed to the single pre-registered headline amplitude.
+HEADLINE_UNIT_COLS = [
+    "feature_id", "layer", "intervention_position", "context_condition",
+    "axis_mapped", "feature_role", "feature_contrast_name",
+    "feature_estimate_type", "steering_direction_label",
+]
+
+
+def resolve_headline_alpha(expanded: pd.DataFrame, args: argparse.Namespace, logger: logging.Logger) -> float | None:
+    """Audit 2.6: pick the single pre-registered amplitude for the headline test."""
+    present = sorted({
+        float(a) for a in pd.to_numeric(expanded.get("alpha", pd.Series(dtype=float)), errors="coerce").dropna().unique()
+    })
+    if args.headline_alpha is not None:
+        ha = float(args.headline_alpha)
+        if present and ha not in present:
+            logger.warning(
+                "Audit 2.6: --headline_alpha=%s is not present in the results "
+                "(present alphas: %s). feature_inference will be empty; for the "
+                "audit-3.1 ablate headline pass --alphas 0 --headline_alpha 0.",
+                ha, present,
+            )
+        return ha
+    if len(present) == 1:
+        logger.info("Audit 2.6: single alpha %s present; using it as the headline inference amplitude.", present[0])
+        return present[0]
+    if not present:
+        logger.warning("Audit 2.6: no alpha values present in results; feature_inference will be empty.")
+        return None
+    raise ValueError(
+        f"Audit 2.6: multiple alphas present ({present}) but --headline_alpha is not set. "
+        "The unit of inference is the feature, tested at ONE pre-registered amplitude. "
+        "Pass --headline_alpha to choose it; the rest of the alpha grid feeds the "
+        "dose-response plots, not separate hypothesis tests."
+    )
+
+
+def feature_inference_table(expanded: pd.DataFrame, args: argparse.Namespace, logger: logging.Logger) -> pd.DataFrame:
+    """Audit 2.6/2.7: the headline feature-level inference table.
+
+    One row per (feature, layer, position, context) at the single pre-registered
+    headline alpha, pooling polarity and identity pairs. CIs/p-values use the
+    audit-4.3 signed metric. Underpowered units (audit 2.7) are dropped before
+    FDR, and FDR (BH) is computed across FEATURES within (axis, context,
+    position) strata — not across the correlated alpha grid (audit 2.6). This is
+    the table the rankings and final-candidates report should consume; the
+    per-(alpha, position) `feature_level_effects` table is retained only as a
+    dose-response diagnostic.
+
+    Audit 2.5 (held-out confirmation) is layered on top of this in
+    `feature_inference_with_holdout`; this function computes the pooled-data
+    estimate used when no split is requested.
+    """
+    if expanded.empty:
+        return expanded.copy()
+    ha = resolve_headline_alpha(expanded, args, logger)
+    if ha is None:
+        return expanded.iloc[0:0].copy()
+    sub = expanded[pd.to_numeric(expanded["alpha"], errors="coerce") == ha].copy()
+    # Headline = the kept features themselves; controls live in their own tables.
+    if "control_type" in sub.columns:
+        sub = sub[sub["control_type"].astype(str).eq("kept_feature")].copy()
+    if sub.empty:
+        logger.warning("Audit 2.6: no kept_feature rows at headline_alpha=%s; feature_inference empty.", ha)
+        return sub
+    unit_cols = [c for c in HEADLINE_UNIT_COLS if c in sub.columns]
+    table = summarize_effects(sub, unit_cols, args)
+    if table.empty:
+        return table
+    table["headline_alpha"] = ha
+    table = _apply_power_filter_and_fdr(table, args, logger, n_col="n_examples")
+    return table
+
+
+def _apply_power_filter_and_fdr(
+    table: pd.DataFrame, args: argparse.Namespace, logger: logging.Logger, n_col: str = "n_examples",
+) -> pd.DataFrame:
+    """Audit 2.7 + 2.6: drop units below --min_examples_inference, then recompute
+    FDR across features within (axis, context, position) on the survivors so
+    q-values reflect the actual tested set (not the pre-filter superset)."""
+    before = len(table)
+    table = table[pd.to_numeric(table[n_col], errors="coerce").fillna(0) >= args.min_examples_inference].copy()
+    dropped = before - len(table)
+    if dropped:
+        logger.info(
+            "Audit 2.7: dropped %d/%d feature-inference units below "
+            "--min_examples_inference=%d (underpowered).",
+            dropped, before, args.min_examples_inference,
+        )
+    if table.empty:
+        return table
+    fdr_cols = [c for c in ["axis_mapped", "context_condition", "intervention_position"] if c in table.columns]
+    if "p_value_confirmation" in table.columns:
+        p_col = "p_value_confirmation"
+    else:
+        p_col = "p_value_bootstrap_or_permutation"
+    if fdr_cols:
+        table["q_value_fdr"] = table.groupby(fdr_cols, dropna=False)[p_col].transform(fdr_bh)
+    else:
+        table["q_value_fdr"] = fdr_bh(table[p_col])
+    table["significant"] = table["q_value_fdr"] < args.q_threshold
+    table["effect_label"] = table.apply(lambda r: effect_label(r, args), axis=1)
+    return table
 
 
 def load_feature_metadata(path: Path) -> pd.DataFrame:
@@ -903,7 +1034,7 @@ def final_candidates_html(data: pd.DataFrame, output_dir: Path) -> None:
     )
 
 
-def make_reports(identity_effects: pd.DataFrame, feature_effects: pd.DataFrame, output_dir: Path, args: argparse.Namespace) -> None:
+def make_reports(identity_effects: pd.DataFrame, feature_effects: pd.DataFrame, output_dir: Path, args: argparse.Namespace, candidates_table: pd.DataFrame | None = None) -> None:
     analysis_dir = output_dir / "analysis"
     axis_root = analysis_dir / "axis_reports"
     contrast_root = analysis_dir / "contrast_reports"
@@ -941,7 +1072,11 @@ def make_reports(identity_effects: pd.DataFrame, feature_effects: pd.DataFrame, 
 
     taxonomy_plot(identity_effects, "identity_id", analysis_dir / "feature_behavior_taxonomy_by_identity.png", "Feature behavior taxonomy by identity")
     taxonomy_plot(feature_effects, "axis_mapped", analysis_dir / "axis_behavior_taxonomy_summary.png", "Feature behavior taxonomy by axis")
-    final_candidates_html(identity_effects if not identity_effects.empty else feature_effects, output_dir)
+    # Audit 2.5/2.6: the final-candidates table is the headline deliverable, so it
+    # uses the feature-level inference table (held-out CIs/q, one pre-registered
+    # alpha) when available; the per-identity/per-alpha tables remain a fallback.
+    candidates = candidates_table if (candidates_table is not None and not candidates_table.empty) else (identity_effects if not identity_effects.empty else feature_effects)
+    final_candidates_html(candidates, output_dir)
 
 
 def write_validation_summaries(identity_effects: pd.DataFrame, feature_effects: pd.DataFrame, identity_records: pd.DataFrame, output_dir: Path) -> None:
@@ -1001,7 +1136,15 @@ The identity-aware labels distinguish `identity_only`, `bias_amplifying`, `bias_
 
 ## Statistics
 
-Confidence intervals bootstrap over BBQ examples. P-values use paired sign-flip permutation tests over per-example deltas. FDR correction is applied within axis x context condition x alpha x intervention position.
+Confidence intervals bootstrap over BBQ examples. P-values use paired sign-flip permutation tests over per-example deltas.
+
+### Headline inference table: `feature_inference.csv` (audits 2.5 / 2.6 / 2.7)
+
+The headline hypothesis test's **unit of inference is the feature** (× layer × intervention position × context condition), tested at a single pre-registered `--headline_alpha` — NOT one test per feature × alpha × position × polarity × identity-pair. Question polarity is pooled (the audit-4.3 signed metric makes neg/nonneg comparable, which is also more powerful); the rest of the alpha grid feeds the dose-response *plots* only, not separate tests (audit 2.6). FDR (Benjamini–Hochberg) is applied **across features** within (axis × context × intervention position). Underpowered units (fewer than `--min_examples_inference` examples, per held-out half) are dropped before FDR (audit 2.7); final runs use ≥10,000 bootstrap/permutation resamples (`--smoke` is a dev-only cap and emits a warning).
+
+Held-out confirmation (audit 2.5): features are ranked/selected on a per-axis **selection** half of the BBQ examples, and the reported effect sizes, CIs, and q-values come from the disjoint **confirmation** half — so the headline numbers are not the post-selection (winner's-curse) estimates. `selection_*` columns carry the selection-half effect used for ranking; the unprefixed `mean_*`/`ci_*`/`q_value_fdr` are the confirmation-half reported values.
+
+`feature_effect_rankings.csv` and `final_intervention_candidates_table.html` are derived from `feature_inference.csv`. The per-(alpha, position) `feature_level_effects.csv` is retained only as a dose-response diagnostic and its q-values should not be treated as headline significance.
 """
     )
 
@@ -1036,7 +1179,18 @@ def main() -> None:
         args.bootstrap_samples = min(args.bootstrap_samples, 500)
         args.permutation_samples = min(args.permutation_samples, 500)
         args.min_examples = min(args.min_examples, 10)
+        args.min_examples_inference = min(args.min_examples_inference, 10)
     logger = setup(args.output_dir, args.overwrite)
+    if args.smoke:
+        # Audit 2.7: --smoke caps resamples at 500 (min p ~= 0.002) and lowers the
+        # per-cell minimum; it is a fast-dev convenience, NOT a headline setting.
+        logger.warning(
+            "Audit 2.7: --smoke is set — bootstrap/permutation capped at 500 and "
+            "min-examples lowered. This run's CIs and q-values are UNDERPOWERED and "
+            "must not be cited. Drop --smoke for headline numbers (defaults are now "
+            "%d bootstrap / %d permutation resamples).",
+            10000, 10000,
+        )
     config = vars(args).copy()
     config.update({k: str(v) for k, v in config.items() if isinstance(v, Path)})
     config["created_at"] = datetime.now(timezone.utc).isoformat()
@@ -1087,6 +1241,25 @@ def main() -> None:
     feature_effects = merge_metadata(feature_pre, triage, token_summary)
     write_table(feature_effects, args.output_dir, "feature_level_effects")
 
+    # Audit 2.6/2.7: the HEADLINE inference table. Unit of inference = feature
+    # (× position × context) at the single pre-registered --headline_alpha;
+    # polarity pooled via the signed metric; underpowered units dropped; FDR
+    # across features within (axis, context, position). Rankings + the
+    # final-candidates report consume THIS table. feature_level_effects above
+    # stays as the per-(alpha, position) dose-response diagnostic.
+    feature_inference = feature_inference_table(expanded, args, logger)
+    if not feature_inference.empty:
+        feature_inference = merge_metadata(feature_inference, triage, token_summary)
+    write_table(feature_inference, args.output_dir, "feature_inference")
+    logger.info(
+        "Audit 2.6: feature_inference has %d feature-level units (headline_alpha=%s); "
+        "%d significant at q<%.3g.",
+        len(feature_inference),
+        feature_inference["headline_alpha"].iloc[0] if not feature_inference.empty else "n/a",
+        int(feature_inference["significant"].sum()) if not feature_inference.empty else 0,
+        args.q_threshold,
+    )
+
     subgroup_cols = [
         "axis_mapped", "mapped_contrast_name", "target_identity_id", "nontarget_identity_id",
         "question_polarity", "context_condition", "feature_id", "layer", "alpha",
@@ -1115,7 +1288,12 @@ def main() -> None:
     ).reset_index() if not subgroup.empty else pd.DataFrame()
     matrix.to_csv(args.output_dir / "feature_x_subgroup_matrix.csv", index=False)
 
-    rankings = make_rankings(feature_effects)
+    # Audit 2.5/2.6: rank on the feature-level inference table (one pre-registered
+    # alpha, FDR across features), not the per-(alpha, position) grid, so the
+    # rankings are not inflated by the correlated alpha tests. Falls back to the
+    # diagnostic table only if the inference table is empty (e.g. wrong --alphas).
+    ranking_source = feature_inference if not feature_inference.empty else feature_effects
+    rankings = make_rankings(ranking_source)
     rankings.to_csv(args.output_dir / "feature_effect_rankings.csv", index=False)
 
     plot_feature_bars(feature_effects, args.output_dir, args)
@@ -1128,7 +1306,7 @@ def main() -> None:
     plot_disambig_tradeoff(feature_effects, args.output_dir)
     plot_token_activation_vs_effect(feature_effects, args.output_dir)
     feature_card_links_html(feature_effects, args.output_dir)
-    make_reports(identity_effects, feature_effects, args.output_dir, args)
+    make_reports(identity_effects, feature_effects, args.output_dir, args, candidates_table=feature_inference)
     write_validation_summaries(identity_effects, feature_effects, identity_records, args.output_dir)
     write_readme(args.output_dir)
     logger.info("Feature-level causal analysis written to %s", args.output_dir)
