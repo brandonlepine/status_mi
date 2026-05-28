@@ -350,13 +350,23 @@ What to do: use `find_section_spans` (already implemented) to restrict identity-
 
 Why it matters: the project's stated subject is *marginalized identities*, and intersectionality is central to that literature. Flattening Race×Gender to "race" both loses the most interesting cases and risks mislabeling the stereotyped answer. Either (a) handle intersectional contrasts as first-class objects (compound identity directions, intersectional steering), which would be a genuine contribution, or (b) explicitly exclude `race_x_*` and say so. Do not silently flatten.
 
-### 4.3 [BLOCKER] `question_polarity` sign is not folded into the bias metric
+### 4.3 [BLOCKER] `question_polarity` sign is not folded into the bias metric (FIX LANDED 2026-05-27)
 
-BBQ has negative-polarity questions ("Who was bad at X?") and non-negative ones ("Who was good at X?"). `stereotyped_groups` is fixed (it is the group the *negative* stereotype targets). For a **negative** question, choosing the stereotyped group is the *bias-consistent* answer; for a **non-negative** question, choosing the stereotyped group is the *anti*-bias answer.
+**Status:** Closed in commit `a03760f` (`scripts/analyze_bbq_feature_level_causal_effects.py`).
 
-`analyze_bbq_feature_level_causal_effects.py` defines `stereotype_preference_delta = Δ[log p(stereotyped) − log p(unknown)]` with **no polarity sign**. The grouping keys include `question_polarity`, so individual rows are separable — but `effect_label` (`bias_amplifying` if `bias_delta > threshold`), `beneficial_score`, `harmful_score`, and `make_rankings` do **not** condition on polarity. A feature that raises `log p(stereotyped group)` is labeled "bias-amplifying" even on non-negative items where that is the *unbiased* direction. `final_intervention_candidates_table.html` is sorted by a polarity-confounded `beneficial_score`.
+**What landed:**
+- `enrich_results` now computes `polarity_sign = +1 if question_polarity == "neg" else -1 if "nonneg" else NaN`, plus three signed delta columns: `signed_stereotype_preference_delta`, `signed_stereotyped_delta`, `signed_nonstereotyped_delta`. Positive signed delta = intervention made the model more biased, regardless of polarity.
+- `summarize_effects` aggregates `mean_signed_*` columns alongside the unsigned originals (preserved as diagnostics). CI and the permutation p-value are computed on signed values. `n_polarity_skipped` records rows with unknown/missing polarity.
+- `effect_label` branches on `mean_signed_stereotype_preference_delta`. The `bias_amplifying` / `bias_reducing_*` labels now mean the same thing across both polarities. The `general_answer_suppression` branch also uses signed stereotyped/nonstereotyped deltas so it doesn't misfire on nonneg-polarity rows.
+- `beneficial_score = -mean_signed_stereotype_preference_delta + mean_unknown_delta + max(0, mean_correct_margin_delta)` — high when intervention reduces bias on both polarities. `harmful_score`, `substitution_score`, and all rankings + plots that ranked by the bias metric (`make_rankings`, `plot_feature_bars`, `plot_top_by_contrast`, `plot_amp_suppression_scatter`, `plot_dose_response`, `plot_answer_role_shift`) now use the signed metric.
 
-What to do: define a **polarity-signed** bias quantity, e.g. `signed_bias_delta = stereotype_preference_delta · s`, with `s = +1` for `question_polarity == neg` and `s = −1` for `nonneg`. Use the signed quantity everywhere a "bias direction" is asserted (`effect_label`, scores, rankings, the candidates table). Until this is fixed the bias taxonomy is partly wrong.
+**Validation (synthetic, 50 neg + 50 nonneg, both anti-bias by symmetric Δ=1.5):**
+- Per-row: signed delta is negative on both polarities; unsigned is -1.5 on neg and +1.5 on nonneg.
+- Aggregate: mean unsigned = 0.000 (cancels — the polarity confound). Mean signed = -1.500 (correctly anti-bias).
+- effect_label = `bias_reducing_substitution`. beneficial_score = +1.500.
+- Missing polarity → NaN signed delta → excluded from aggregates and counted in `n_polarity_skipped`.
+
+**Original audit (preserved):** BBQ has negative-polarity questions ("Who was bad at X?") and non-negative ones ("Who was good at X?"). `stereotyped_groups` is fixed (it is the group the *negative* stereotype targets). For a **negative** question, choosing the stereotyped group is the *bias-consistent* answer; for a **non-negative** question, choosing the stereotyped group is the *anti*-bias answer. `analyze_bbq_feature_level_causal_effects.py` defined `stereotype_preference_delta = Δ[log p(stereotyped) − log p(unknown)]` with no polarity sign. The grouping keys included `question_polarity`, so individual rows were separable — but `effect_label` (`bias_amplifying` if `bias_delta > threshold`), `beneficial_score`, `harmful_score`, and `make_rankings` did not condition on polarity. A feature that raised `log p(stereotyped group)` was labeled "bias-amplifying" even on non-negative items where that is the unbiased direction. `final_intervention_candidates_table.html` was sorted by a polarity-confounded `beneficial_score`.
 
 ### 4.4 [MINOR] `MANUAL_ALIASES` has dozens of duplicate `"nondisabled"` keys
 
@@ -516,7 +526,7 @@ Ordered by what most threatens a defensible result.
 1. **Verify SAE preprocessing** (1.4): confirm LlamaScope normalization + activation function; add an encode→decode reconstruction-quality check to `validate_sae_hook_alignment.py`. If wrong, every SAE number is wrong.
 2. **Fix the feature intervention** (3.1) — **FIX LANDED 2026-05-27.** Canonical torch primitives (`ablate_features`, `clamp_features`, `steer_features`, `patched_residual_with_intervention`) live in `scripts/encode_identity_saes.py` alongside `encode_full` / `decode_full`. `scripts/run_bbq_sae_steering.py` dispatches them via `--intervention_modes` (default: `ablate`). Commits `11d4a4d` (primitives) + `84c87b5` (hook + dispatch). RunPod headline run with `--intervention_modes ablate` pending.
 3. **Re-enable steering controls** (2.3) and add the difference-of-means direction as a control/baseline (5.5).
-4. **Polarity-sign the bias metric** (4.3): the current `effect_label`/rankings/candidates table are polarity-confounded.
+4. **Polarity-sign the bias metric** (4.3 — FIX LANDED 2026-05-27, commit `a03760f`): signed_stereotype_preference_delta + signed_stereotyped/nonstereotyped_delta computed in `enrich_results`; `effect_label`, `beneficial_score`, `harmful_score`, all rankings, and all plots now use the signed metric. Polarity-confounded `mean_stereotype_preference_delta` preserved alongside as a diagnostic.
 5. **Validate the measurement locus** (1.1): compare final-token vs identity-span-pooled geometry; pick and justify one.
 6. **Characterize baseline behavior** (1.2): answer-option mass and standard BBQ score for Llama-3.1-8B-Base in this format.
 

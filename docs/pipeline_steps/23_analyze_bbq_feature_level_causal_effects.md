@@ -94,19 +94,23 @@ These are explicit positives that should survive any refactor (Section 6 of the 
 
 ## Issues & Opportunities
 
-### 4.3 [BLOCKER] — `stereotype_preference_delta` has no polarity sign — `effect_label` and rankings are polarity-confounded
+### 4.3 [BLOCKER] — `stereotype_preference_delta` has no polarity sign — `effect_label` and rankings are polarity-confounded (FIX LANDED 2026-05-27)
 
-**What's wrong:** BBQ has negative-polarity questions ("Who was bad at X?") and non-negative ones ("Who was good at X?"). `stereotyped_groups` is the group the *negative* stereotype targets. For a **negative** question, choosing the stereotyped group is the *bias-consistent* answer. For a **non-negative** question, choosing the stereotyped group is the *anti-bias* answer.
+**Status:** Closed in commit `a03760f`.
 
-`enrich_results` defines `stereotype_preference_delta = Δ[log p(stereotyped) − log p(unknown)]` **with no polarity sign**. The grouping keys include `question_polarity`, so individual rows are separable, but `effect_label`, `beneficial_score`, `harmful_score`, `make_rankings`, and `final_candidates_html` do **not** condition on or sign-correct for polarity. A feature that raises `log p(stereotyped group)` is labeled `bias_amplifying` even on non-negative items where that movement is the *unbiased* direction. `final_intervention_candidates_table.html` is sorted by a polarity-confounded `beneficial_score`.
+**What landed:**
+- `enrich_results` computes `polarity_sign` (+1 for `neg`, -1 for `nonneg`, NaN for missing) and three signed deltas (`signed_stereotype_preference_delta`, `signed_stereotyped_delta`, `signed_nonstereotyped_delta`).
+- `summarize_effects` aggregates `mean_signed_*` columns alongside the unsigned originals (preserved as diagnostics). CI and the permutation p-value are computed on signed values; rows with unknown polarity drop out via NaN and are counted as `n_polarity_skipped`.
+- `effect_label`, `beneficial_score`, `harmful_score`, `substitution_score`, `make_rankings`, and every plot that ranked or bar-charted the bias metric (`plot_feature_bars`, `plot_top_by_contrast`, `plot_amp_suppression_scatter`, `plot_dose_response`, `plot_answer_role_shift`) now operate on `mean_signed_stereotype_preference_delta`. The labels `bias_amplifying` / `bias_reducing_*` mean the same thing across both polarities.
+- Output schema is a superset of the prior schema: every new column is `mean_signed_*`; the unsigned `mean_stereotype_preference_delta` and per-answer-role deltas survive for polarity-stratified diagnostics.
 
-**Why it matters:** Any "this feature reduces bias" / "this feature amplifies bias" claim is partially wrong wherever polarity matters. The candidates table — which is the headline artifact of this script — currently mixes (i) features that genuinely reduce stereotype preference on negative-polarity questions with (ii) features that *amplify* counter-stereotype preference on non-negative questions. The rankings cannot be trusted until polarity is signed.
+**Validation (synthetic, 50 neg + 50 nonneg, both anti-bias by symmetric Δ=1.5):**
+- Per-row: signed delta is negative on both polarities; unsigned is -1.5 on neg and +1.5 on nonneg.
+- Aggregate: unsigned mean = 0.000 (cancels — the polarity confound). Signed mean = -1.500.
+- `effect_label = bias_reducing_substitution`; `beneficial_score = +1.500`.
+- Missing polarity → `polarity_sign = NaN` → signed delta NaN → excluded from aggregates and counted in `n_polarity_skipped`.
 
-**Targeted fix:**
-- Define `signed_bias_delta = stereotype_preference_delta * bias_polarity_sign`, where `bias_polarity_sign = +1` if `question_polarity == "neg"` else `-1`. (Have Step 18 emit this column — see Step 18 issue 4.3 — or compute it inline here from `question_polarity`.)
-- Use `signed_bias_delta` everywhere a "bias direction" is asserted: `effect_label` thresholds, `beneficial_score`, `harmful_score`, `make_rankings`, the per-row `final_candidates_html` sort key.
-- Keep `stereotype_preference_delta` available as a diagnostic so polarity-stratified plots are still possible, but make the *signed* version the headline.
-- Update `README.md`'s sign-convention section accordingly. Re-state: "Negative `signed_bias_delta` means the feature reduces bias relative to the polarity-correct anti-bias direction."
+**Original audit (preserved):** BBQ has negative-polarity questions ("Who was bad at X?") and non-negative ones ("Who was good at X?"). `stereotyped_groups` is the group the *negative* stereotype targets. For a **negative** question, choosing the stereotyped group is the bias-consistent answer; for a **non-negative** question, choosing the stereotyped group is the anti-bias answer. `enrich_results` defined `stereotype_preference_delta = Δ[log p(stereotyped) − log p(unknown)]` with no polarity sign. The grouping keys included `question_polarity`, so individual rows were separable — but `effect_label`, `beneficial_score`, `harmful_score`, `make_rankings`, and `final_candidates_html` did not condition on polarity. A feature that raised `log p(stereotyped group)` was labeled `bias_amplifying` even on non-negative items where that movement is the unbiased direction. `final_intervention_candidates_table.html` was sorted by a polarity-confounded `beneficial_score`. The candidates table — the headline artifact of this script — mixed (i) features that genuinely reduce stereotype preference on negative-polarity questions with (ii) features that amplify counter-stereotype preference on non-negative questions.
 
 ### 2.4 [MAJOR] — Length bias contaminates argmax/accuracy metrics inherited from Step 20
 
@@ -164,7 +168,7 @@ The headline numbers `mean_stereotype_preference_delta` etc. are computed on Ste
 **Targeted fix here, after upstream:** stratify every effect table by `mapped_contrast_confidence` and by `intervention_section` (the section-resolved position name once Step 20 emits it). Make `exact + context-section` the headline subset.
 
 ## Rebuild checklist
-- [ ] Add `bias_polarity_sign` (`+1` for `neg`, `-1` for `nonneg`) and define `signed_bias_delta = stereotype_preference_delta * bias_polarity_sign`. Refactor `effect_label`, `beneficial_score`, `harmful_score`, `make_rankings`, and `final_candidates_html` to use the signed version. Update `README.md`.
+- [x] Add `bias_polarity_sign` (`+1` for `neg`, `-1` for `nonneg`) and define `signed_stereotype_preference_delta = stereotype_preference_delta * polarity_sign`. Refactor `effect_label`, `beneficial_score`, `harmful_score`, `make_rankings`, and all plots to use the signed version. *(Done 2026-05-27: commit `a03760f`. Also signed the per-answer-role deltas. `mean_stereotype_preference_delta` preserved as diagnostic alongside.)*
 - [ ] Implement a selection / confirmation split keyed by `bbq_uid`. Rank features on the selection set; report effect sizes and q-values on the confirmation set in the final tables.
 - [ ] Coarsen the inference grid: collapse alphas into one summary statistic per (feature, position). Apply FDR across features, not within-stratum.
 - [ ] Drop `--smoke` and raise bootstrap/permutation budgets to ≥10000; raise `min_examples` accordingly.
