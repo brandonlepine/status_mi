@@ -50,7 +50,14 @@ FEATURE_INTERVENTION_MODES = {"ablate", "clamp", "steer"}
 # analyze_identity_geometry.py's contrast_directions_layer_*.npz instead
 # of being built from SAE decoder rows. Lets the BBQ analyzer compare
 # SAE feature interventions against the linear baseline head-to-head.
-BASELINE_INTERVENTION_MODES = {"direction_baseline"}
+BASELINE_INTERVENTION_MODES = {"direction_baseline", "probe_baseline"}
+# direction_baseline -> diff-of-means contrast direction (from Step 7's
+#   contrast_directions_layer_*.npz).
+# probe_baseline     -> per-contrast logistic-probe direction in raw d_model
+#   space (audit 5.5 option (c); from Step 7's contrast_probe_directions_layer_*.npz).
+# Both share the same h += alpha * vec hook plumbing; the source of the
+# vector is what changes. Output rows stamp intervention_mode so the
+# downstream analyzer can stratify SAE vs DoM vs probe head-to-head.
 ALL_INTERVENTION_MODES = LEGACY_INTERVENTION_MODES | FEATURE_INTERVENTION_MODES | BASELINE_INTERVENTION_MODES
 VECTOR_HOOK_MODES = LEGACY_INTERVENTION_MODES | BASELINE_INTERVENTION_MODES  # all modes that route through install_hook
 
@@ -128,6 +135,22 @@ def parse_args() -> argparse.Namespace:
             "file or a directory containing one or more contrast_directions_layer_*.npz "
             "files. Required when --intervention_modes includes 'direction_baseline'. "
             "Keys inside each .npz are 'layer{LL}_{identity_a}_vs_{identity_b}'."
+        ),
+    )
+    parser.add_argument(
+        "--probe_baselines_path",
+        type=Path,
+        default=None,
+        help=(
+            "Audit 5.5 option (c): path to the per-contrast logistic probe direction "
+            "store from Step 7 (analyze_identity_geometry.py:run_contrast_probes). "
+            "Either a single .npz file or a directory containing one or more "
+            "contrast_probe_directions_layer_*.npz files. Required when "
+            "--intervention_modes includes 'probe_baseline'. Same key schema as "
+            "--direction_baselines_path; the source of the vector is what differs. "
+            "Run --intervention_modes ablate,direction_baseline,probe_baseline for "
+            "the three-way head-to-head: SAE feature ablation vs DoM linear direction "
+            "vs logistic-probe direction, on the same prompts and positions."
         ),
     )
     parser.add_argument(
@@ -543,6 +566,22 @@ def install_batched_feature_intervention_hook(
     return module.register_forward_hook(hook)
 
 
+def _baseline_vector_for_mode(
+    mode: str,
+    baseline_vector: torch.Tensor | None,
+    probe_vector: torch.Tensor | None,
+) -> torch.Tensor | None:
+    """Pick the vector source for a baseline mode. Audit 5.5: direction_baseline
+    uses the DoM vector; probe_baseline uses the logistic-probe vector. Returns
+    None if the matching vector wasn't built for this feature set (caller raises
+    a mode-specific error message)."""
+    if mode == "direction_baseline":
+        return baseline_vector
+    if mode == "probe_baseline":
+        return probe_vector
+    return None
+
+
 def make_batched_hook_fn(
     model,
     fs: "FeatureSet",
@@ -553,27 +592,29 @@ def make_batched_hook_fn(
     mode: str,
     clamp_value: float | None,
     baseline_vector: torch.Tensor | None = None,
+    probe_vector: torch.Tensor | None = None,
 ) -> Callable[[], object]:
     """Dispatch factory: returns a no-arg callable that installs the right
     hook for the chosen intervention mode. Legacy modes (add_vector,
     ablate_projection) use the precomputed decoder direction `vector`;
     feature modes (ablate, clamp, steer) use the full SAE for the
-    encode -> modify -> decode -> patch loop (audit 3.1); the baseline
-    mode (direction_baseline, audit 5.5) uses the difference-of-means
-    `baseline_vector` instead of a decoder-derived vector."""
+    encode -> modify -> decode -> patch loop (audit 3.1); baseline modes
+    (direction_baseline, probe_baseline; audit 5.5) use the matching
+    baseline vector loaded from Step 7."""
     if mode in LEGACY_INTERVENTION_MODES:
         if vector is None:
             raise RuntimeError(f"vector was not built for legacy mode {mode!r}.")
         return lambda: install_batched_hook(model, fs.layer, vector, positions_by_example, alpha, mode)
     if mode in BASELINE_INTERVENTION_MODES:
-        if baseline_vector is None:
+        bvec = _baseline_vector_for_mode(mode, baseline_vector, probe_vector)
+        if bvec is None:
+            flag = "--direction_baselines_path" if mode == "direction_baseline" else "--probe_baselines_path"
             raise RuntimeError(
-                f"direction_baseline mode requires a baseline_vector for "
-                f"feature set {fs.set_id!r} (layer {fs.layer}, contrast "
-                f"{fs.contrast_name!r}). Confirm --direction_baselines_path is "
-                f"set and the .npz contains the matching contrast."
+                f"{mode} requires a matching vector for feature set "
+                f"{fs.set_id!r} (layer {fs.layer}, contrast {fs.contrast_name!r}). "
+                f"Confirm {flag} is set and the .npz contains the matching contrast."
             )
-        return lambda: install_batched_hook(model, fs.layer, baseline_vector, positions_by_example, alpha, mode)
+        return lambda: install_batched_hook(model, fs.layer, bvec, positions_by_example, alpha, mode)
     if mode in FEATURE_INTERVENTION_MODES:
         return lambda: install_batched_feature_intervention_hook(
             model, fs.layer, sae, fs.feature_ids, fs.signs, positions_by_example, mode,
@@ -592,6 +633,7 @@ def make_hook_fn(
     mode: str,
     clamp_value: float | None,
     baseline_vector: torch.Tensor | None = None,
+    probe_vector: torch.Tensor | None = None,
 ) -> Callable[[], object]:
     """Non-batched variant of make_batched_hook_fn for the per-example
     scoring paths (answer_logprob scoring iterates one prompt at a time)."""
@@ -600,13 +642,15 @@ def make_hook_fn(
             raise RuntimeError(f"vector was not built for legacy mode {mode!r}.")
         return lambda: install_hook(model, fs.layer, vector, positions, alpha, mode)
     if mode in BASELINE_INTERVENTION_MODES:
-        if baseline_vector is None:
+        bvec = _baseline_vector_for_mode(mode, baseline_vector, probe_vector)
+        if bvec is None:
+            flag = "--direction_baselines_path" if mode == "direction_baseline" else "--probe_baselines_path"
             raise RuntimeError(
-                f"direction_baseline mode requires a baseline_vector for "
-                f"feature set {fs.set_id!r} (layer {fs.layer}, contrast "
-                f"{fs.contrast_name!r})."
+                f"{mode} requires a matching vector for feature set "
+                f"{fs.set_id!r} (layer {fs.layer}, contrast {fs.contrast_name!r}). "
+                f"Confirm {flag} is set and the .npz contains the matching contrast."
             )
-        return lambda: install_hook(model, fs.layer, baseline_vector, positions, alpha, mode)
+        return lambda: install_hook(model, fs.layer, bvec, positions, alpha, mode)
     if mode in FEATURE_INTERVENTION_MODES:
         return lambda: install_feature_intervention_hook(
             model, fs.layer, sae, fs.feature_ids, fs.signs, positions, mode,
@@ -1015,6 +1059,7 @@ def run_first_token_batched_feature_set(
     fs_index: int,
     n_feature_sets: int,
     baseline_vector: torch.Tensor | None = None,
+    probe_vector: torch.Tensor | None = None,
 ) -> tuple[int, int]:
     n_done = 0
     batch_size = max(1, int(args.batch_size))
@@ -1054,6 +1099,7 @@ def run_first_token_batched_feature_set(
                         positions_by_example=positions_by_example,
                         alpha=alpha, mode=mode, clamp_value=args.clamp_value,
                         baseline_vector=baseline_vector,
+                        probe_vector=probe_vector,
                     )
                     start = time.perf_counter()
                     inter_scores = score_first_token_batch(
@@ -1194,8 +1240,8 @@ def main() -> None:
     part_idx = len(list((args.output_dir / "results_parts").glob("part_*")))
     sae_cache = {}
     vector_cache = {}
-    # Audit 5.5: load the difference-of-means baseline directions if direction_baseline
-    # is in the requested modes. Empty dict otherwise (lookups will safely return None).
+    # Audit 5.5: load the diff-of-means baseline directions if direction_baseline
+    # is in the requested modes. Empty dict otherwise (lookups safely return None).
     direction_baselines: dict[tuple[int, str], np.ndarray] = {}
     if "direction_baseline" in intervention_modes:
         if args.direction_baselines_path is None:
@@ -1205,10 +1251,33 @@ def main() -> None:
                 "(or directory of .npz files) produced by Step 7's "
                 "analyze_identity_geometry.py:run_contrasts."
             )
-        direction_baselines = load_contrast_directions(args.direction_baselines_path)
+        # Restrict the glob to DoM-style files so a directory containing
+        # both DoM and probe .npz doesn't accidentally pick up probe vectors.
+        direction_baselines = load_contrast_directions(
+            args.direction_baselines_path,
+            glob_patterns=("contrast_directions_layer_*.npz",),
+        )
         logger.info(
-            "Audit 5.5: loaded %d contrast directions from %s for direction_baseline mode.",
+            "Audit 5.5: loaded %d DoM contrast directions from %s for direction_baseline mode.",
             len(direction_baselines), args.direction_baselines_path,
+        )
+    # Audit 5.5 option (c): load the per-contrast logistic probe directions.
+    probe_baselines: dict[tuple[int, str], np.ndarray] = {}
+    if "probe_baseline" in intervention_modes:
+        if args.probe_baselines_path is None:
+            raise ValueError(
+                "--intervention_modes includes 'probe_baseline' but "
+                "--probe_baselines_path is not set. Point at the .npz "
+                "(or directory of .npz files) produced by Step 7's "
+                "analyze_identity_geometry.py:run_contrast_probes."
+            )
+        probe_baselines = load_contrast_directions(
+            args.probe_baselines_path,
+            glob_patterns=("contrast_probe_directions_layer_*.npz",),
+        )
+        logger.info(
+            "Audit 5.5 (c): loaded %d probe directions from %s for probe_baseline mode.",
+            len(probe_baselines), args.probe_baselines_path,
         )
     n_done = 0
     completed_buffer: list[dict[str, object]] = []
@@ -1245,14 +1314,12 @@ def main() -> None:
                 vector = vector_cache[vector_key]
             else:
                 vector = None
-            # Audit 5.5: look up the difference-of-means baseline direction
-            # when direction_baseline is in the requested modes. Bundle-mode
-            # feature sets (empty contrast_name) are skipped — the baseline
-            # is defined per-contrast and is not meaningful for averaged-
-            # decoder bundles.
+            # Audit 5.5: look up the diff-of-means baseline direction when
+            # direction_baseline is in the requested modes. Bundle-mode feature
+            # sets (empty contrast_name) are skipped — the baseline is defined
+            # per-contrast and is not meaningful for averaged-decoder bundles.
             baseline_vector: torch.Tensor | None = None
-            needs_baseline = "direction_baseline" in intervention_modes
-            if needs_baseline:
+            if "direction_baseline" in intervention_modes:
                 baseline_vector = make_direction_baseline_vector(direction_baselines, fs, device)
                 if baseline_vector is None:
                     logger.warning(
@@ -1260,6 +1327,18 @@ def main() -> None:
                         "contrast %r): no matching DoM direction in --direction_baselines_path. "
                         "Either the contrast is missing from the .npz or this is a bundle-mode "
                         "feature set with no contrast_name.",
+                        fs.set_id, fs.layer, fs.contrast_name,
+                    )
+            # Audit 5.5 option (c): look up the logistic-probe baseline direction
+            # when probe_baseline is in the requested modes. Same skip semantics
+            # as direction_baseline.
+            probe_vector: torch.Tensor | None = None
+            if "probe_baseline" in intervention_modes:
+                probe_vector = make_direction_baseline_vector(probe_baselines, fs, device)
+                if probe_vector is None:
+                    logger.warning(
+                        "Skipping probe_baseline for feature set %s (layer %d, "
+                        "contrast %r): no matching probe direction in --probe_baselines_path.",
                         fs.set_id, fs.layer, fs.contrast_name,
                     )
             if args.scoring_mode == "first_token" and args.disable_controls:
@@ -1284,6 +1363,7 @@ def main() -> None:
                     fs_index,
                     len(feature_sets),
                     baseline_vector=baseline_vector,
+                    probe_vector=probe_vector,
                 )
                 n_done += added
                 continue
@@ -1318,6 +1398,7 @@ def main() -> None:
                                 positions=pos, alpha=alpha, mode=mode,
                                 clamp_value=args.clamp_value,
                                 baseline_vector=baseline_vector,
+                                probe_vector=probe_vector,
                             )
                             inter = score_fn(model, tokenizer, prompt, answers, 512, hook_fn=hook_fn)
                             out = steering_output_row(row_s, fs, alpha, mode, pos_name, base, inter, time.perf_counter() - start)
