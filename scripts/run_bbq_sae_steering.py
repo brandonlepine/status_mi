@@ -115,7 +115,23 @@ def parse_args() -> argparse.Namespace:
             "amplification, look up the value in feature_stats.csv and pass it here."
         ),
     )
-    parser.add_argument("--include_unmapped", action="store_true")
+    parser.add_argument(
+        "--mapping_confidence_filter",
+        default="exact",
+        choices=["exact", "exact_and_fallback", "all"],
+        help="Audit 3.4: which BBQ rows to steer based on mapped_contrast_confidence "
+             "from prepare_bbq_for_steering.py. "
+             "exact (default, recommended for headline results): only rows where the "
+             "(target, nontarget) identity pair matches an SAE contrast exactly. "
+             "exact_and_fallback: also include fallback_axis rows where the BBQ "
+             "identity pair is on the same axis as some SAE contrast but is not the "
+             "same pair. fallback_axis rows let race_arab vs race_white be steered "
+             "with features selected for race_black vs race_white, which is the "
+             "audit's central feature-to-example matching concern. "
+             "all: also include unmapped rows (no axis match at all). "
+             "mapped_contrast_confidence is stamped on every output row so the "
+             "downstream analyzer can stratify regardless of this filter.",
+    )
     parser.add_argument(
         "--axis_match_mode",
         default="matched_only",
@@ -846,6 +862,7 @@ def steering_output_row(
         "feature_roles_json": json.dumps(fs.roles),
         **result_feature_metadata(fs),
         "mapped_contrast_name": row_s.get("mapped_contrast_name", ""),
+        "mapped_contrast_confidence": row_s.get("mapped_contrast_confidence", ""),  # audit 3.4: stratify-able
         "feature_contrast_name": fs.contrast_name,
         "axis_mapped": row_s.get("axis_mapped", ""),
         "category_raw": row_s.get("category_raw", ""),
@@ -983,8 +1000,26 @@ def main() -> None:
     (args.output_dir / "steering_config.json").write_text(json.dumps(config, indent=2) + "\n")
 
     prepared = read_table(args.prepared_data)
-    if not args.include_unmapped and "mapped_contrast_confidence" in prepared.columns:
-        prepared = prepared[prepared["mapped_contrast_confidence"].isin(["exact", "alias", "fallback_axis"])].copy()
+    # Audit 3.4: default to exact-only contrast mapping for headline results.
+    # fallback_axis silently let a BBQ item about (race_arab, race_white) be
+    # steered with features selected for (race_black, race_white) — feature-
+    # to-example matching is broken under that mapping. The confidence column
+    # is stamped on every output row regardless of the filter so the analyzer
+    # can stratify.
+    if "mapped_contrast_confidence" in prepared.columns:
+        confidence_keepers = {
+            "exact": {"exact", "alias"},
+            "exact_and_fallback": {"exact", "alias", "fallback_axis"},
+            "all": {"exact", "alias", "fallback_axis", "unmapped"},
+        }[args.mapping_confidence_filter]
+        before_filter = len(prepared)
+        prepared = prepared[prepared["mapped_contrast_confidence"].isin(confidence_keepers)].copy()
+        after_filter = len(prepared)
+        print(
+            f"Mapping-confidence filter ({args.mapping_confidence_filter}): "
+            f"kept {after_filter}/{before_filter} rows. "
+            f"Confidence breakdown: {prepared['mapped_contrast_confidence'].value_counts(dropna=False).to_dict()}"
+        )
     if args.max_examples:
         prepared = prepared.head(args.max_examples).copy()
     feature_sets = load_feature_sets(args.triage_csv, layers, modes, top_ks)
