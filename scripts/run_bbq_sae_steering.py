@@ -44,7 +44,15 @@ from encode_identity_saes import (  # noqa: E402
 #     just a direction.
 LEGACY_INTERVENTION_MODES = {"add_vector", "ablate_projection"}
 FEATURE_INTERVENTION_MODES = {"ablate", "clamp", "steer"}
-ALL_INTERVENTION_MODES = LEGACY_INTERVENTION_MODES | FEATURE_INTERVENTION_MODES
+# Audit 5.5: direction_baseline adds the difference-of-means contrast
+# direction at the target position. Same hook plumbing as add_vector
+# (h += alpha * vec) but the vector is loaded from
+# analyze_identity_geometry.py's contrast_directions_layer_*.npz instead
+# of being built from SAE decoder rows. Lets the BBQ analyzer compare
+# SAE feature interventions against the linear baseline head-to-head.
+BASELINE_INTERVENTION_MODES = {"direction_baseline"}
+ALL_INTERVENTION_MODES = LEGACY_INTERVENTION_MODES | FEATURE_INTERVENTION_MODES | BASELINE_INTERVENTION_MODES
+VECTOR_HOOK_MODES = LEGACY_INTERVENTION_MODES | BASELINE_INTERVENTION_MODES  # all modes that route through install_hook
 
 
 DEFAULT_MODEL_PATH = Path("/workspace/status_mi/models/llama-3.1-8b")
@@ -101,8 +109,25 @@ def parse_args() -> argparse.Namespace:
             "modes (audit 3.1): 'ablate' (clamp feature(s) to 0; primary causal "
             "test; alpha grid not used), 'clamp' (set feature(s) to --clamp_value "
             "in normalized latent space; alpha grid not used), 'steer' (add alpha "
-            "to feature(s) in normalized latent space; uses alpha grid). Default "
-            "'ablate' makes the headline causal claim defensible without an alpha grid."
+            "to feature(s) in normalized latent space; uses alpha grid). "
+            "Linear-baseline mode (audit 5.5): 'direction_baseline' (h += alpha*vec "
+            "where vec is the difference-of-means contrast direction from Step 7's "
+            "contrast_directions_layer_*.npz; requires --direction_baselines_path). "
+            "Default 'ablate' makes the headline causal claim defensible without an "
+            "alpha grid. Run 'ablate,direction_baseline' for the head-to-head SAE-vs-"
+            "linear-direction comparison the audit asks for."
+        ),
+    )
+    parser.add_argument(
+        "--direction_baselines_path",
+        type=Path,
+        default=None,
+        help=(
+            "Audit 5.5: path to the contrast direction store from Step 7 "
+            "(analyze_identity_geometry.py:run_contrasts). Either a single .npz "
+            "file or a directory containing one or more contrast_directions_layer_*.npz "
+            "files. Required when --intervention_modes includes 'direction_baseline'. "
+            "Keys inside each .npz are 'layer{LL}_{identity_a}_vs_{identity_b}'."
         ),
     )
     parser.add_argument(
@@ -527,16 +552,28 @@ def make_batched_hook_fn(
     alpha: float,
     mode: str,
     clamp_value: float | None,
+    baseline_vector: torch.Tensor | None = None,
 ) -> Callable[[], object]:
     """Dispatch factory: returns a no-arg callable that installs the right
     hook for the chosen intervention mode. Legacy modes (add_vector,
     ablate_projection) use the precomputed decoder direction `vector`;
     feature modes (ablate, clamp, steer) use the full SAE for the
-    encode -> modify -> decode -> patch loop (audit 3.1)."""
+    encode -> modify -> decode -> patch loop (audit 3.1); the baseline
+    mode (direction_baseline, audit 5.5) uses the difference-of-means
+    `baseline_vector` instead of a decoder-derived vector."""
     if mode in LEGACY_INTERVENTION_MODES:
         if vector is None:
             raise RuntimeError(f"vector was not built for legacy mode {mode!r}.")
         return lambda: install_batched_hook(model, fs.layer, vector, positions_by_example, alpha, mode)
+    if mode in BASELINE_INTERVENTION_MODES:
+        if baseline_vector is None:
+            raise RuntimeError(
+                f"direction_baseline mode requires a baseline_vector for "
+                f"feature set {fs.set_id!r} (layer {fs.layer}, contrast "
+                f"{fs.contrast_name!r}). Confirm --direction_baselines_path is "
+                f"set and the .npz contains the matching contrast."
+            )
+        return lambda: install_batched_hook(model, fs.layer, baseline_vector, positions_by_example, alpha, mode)
     if mode in FEATURE_INTERVENTION_MODES:
         return lambda: install_batched_feature_intervention_hook(
             model, fs.layer, sae, fs.feature_ids, fs.signs, positions_by_example, mode,
@@ -554,6 +591,7 @@ def make_hook_fn(
     alpha: float,
     mode: str,
     clamp_value: float | None,
+    baseline_vector: torch.Tensor | None = None,
 ) -> Callable[[], object]:
     """Non-batched variant of make_batched_hook_fn for the per-example
     scoring paths (answer_logprob scoring iterates one prompt at a time)."""
@@ -561,6 +599,14 @@ def make_hook_fn(
         if vector is None:
             raise RuntimeError(f"vector was not built for legacy mode {mode!r}.")
         return lambda: install_hook(model, fs.layer, vector, positions, alpha, mode)
+    if mode in BASELINE_INTERVENTION_MODES:
+        if baseline_vector is None:
+            raise RuntimeError(
+                f"direction_baseline mode requires a baseline_vector for "
+                f"feature set {fs.set_id!r} (layer {fs.layer}, contrast "
+                f"{fs.contrast_name!r})."
+            )
+        return lambda: install_hook(model, fs.layer, baseline_vector, positions, alpha, mode)
     if mode in FEATURE_INTERVENTION_MODES:
         return lambda: install_feature_intervention_hook(
             model, fs.layer, sae, fs.feature_ids, fs.signs, positions, mode,
@@ -665,6 +711,63 @@ def score_answer_logprob(model, tokenizer, prompt: str, answers: list[str], max_
         if handle is not None:
             handle.remove()
     return np.array(scores, dtype=np.float32)
+
+
+def load_contrast_directions(path: Path) -> dict[tuple[int, str], np.ndarray]:
+    """Audit 5.5: load the difference-of-means contrast directions persisted
+    by analyze_identity_geometry.py (Step 7). Returns a dict keyed by
+    (layer, contrast_name) where contrast_name is the canonical
+    'identity_a_vs_identity_b' string. Accepts either a single .npz file or
+    a directory containing one-or-more contrast_directions_layer_*.npz files.
+    """
+    if path is None or not path.exists():
+        raise FileNotFoundError(f"--direction_baselines_path does not exist: {path}")
+    files: list[Path]
+    if path.is_dir():
+        files = sorted(path.glob("contrast_directions_layer_*.npz"))
+        if not files:
+            raise FileNotFoundError(f"No contrast_directions_layer_*.npz files found in {path}")
+    else:
+        files = [path]
+    out: dict[tuple[int, str], np.ndarray] = {}
+    for fp in files:
+        with np.load(fp) as data:
+            for key in data.files:
+                # Key layout: "layer{LL}_{identity_a}_vs_{identity_b}"
+                if not key.startswith("layer"):
+                    continue
+                head, _, rest = key[5:].partition("_")
+                try:
+                    layer = int(head)
+                except ValueError:
+                    continue
+                if not rest:
+                    continue
+                vec = np.asarray(data[key], dtype=np.float32)
+                # Ensure unit-norm (idempotent — Step 7 already saves unit vectors).
+                norm = float(np.linalg.norm(vec))
+                if norm < 1e-9:
+                    continue
+                out[(layer, rest)] = vec / norm
+    return out
+
+
+def make_direction_baseline_vector(
+    directions: dict[tuple[int, str], np.ndarray],
+    feature_set: FeatureSet,
+    device: torch.device,
+) -> torch.Tensor | None:
+    """Audit 5.5: look up the difference-of-means direction for this feature
+    set's (layer, contrast_name). Returns None if the feature set has no
+    contrast_name (e.g., role_bundle modes) or if the matching direction is
+    not present — the caller decides whether to skip the run."""
+    if not feature_set.contrast_name:
+        return None
+    direction = directions.get((feature_set.layer, feature_set.contrast_name))
+    if direction is None:
+        return None
+    vec = torch.as_tensor(direction, dtype=torch.float32, device=device)
+    return vec
 
 
 def make_vector(sae, feature_set: FeatureSet, normalize: bool, device: torch.device, random_direction: bool = False) -> torch.Tensor:
@@ -905,6 +1008,7 @@ def run_first_token_batched_feature_set(
     job_bar: tqdm,
     fs_index: int,
     n_feature_sets: int,
+    baseline_vector: torch.Tensor | None = None,
 ) -> tuple[int, int]:
     n_done = 0
     batch_size = max(1, int(args.batch_size))
@@ -943,6 +1047,7 @@ def run_first_token_batched_feature_set(
                         model=model, fs=fs, vector=vector, sae=sae,
                         positions_by_example=positions_by_example,
                         alpha=alpha, mode=mode, clamp_value=args.clamp_value,
+                        baseline_vector=baseline_vector,
                     )
                     start = time.perf_counter()
                     inter_scores = score_first_token_batch(
@@ -1083,6 +1188,22 @@ def main() -> None:
     part_idx = len(list((args.output_dir / "results_parts").glob("part_*")))
     sae_cache = {}
     vector_cache = {}
+    # Audit 5.5: load the difference-of-means baseline directions if direction_baseline
+    # is in the requested modes. Empty dict otherwise (lookups will safely return None).
+    direction_baselines: dict[tuple[int, str], np.ndarray] = {}
+    if "direction_baseline" in intervention_modes:
+        if args.direction_baselines_path is None:
+            raise ValueError(
+                "--intervention_modes includes 'direction_baseline' but "
+                "--direction_baselines_path is not set. Point at the .npz "
+                "(or directory of .npz files) produced by Step 7's "
+                "analyze_identity_geometry.py:run_contrasts."
+            )
+        direction_baselines = load_contrast_directions(args.direction_baselines_path)
+        logger.info(
+            "Audit 5.5: loaded %d contrast directions from %s for direction_baseline mode.",
+            len(direction_baselines), args.direction_baselines_path,
+        )
     n_done = 0
     completed_buffer: list[dict[str, object]] = []
 
@@ -1118,6 +1239,23 @@ def main() -> None:
                 vector = vector_cache[vector_key]
             else:
                 vector = None
+            # Audit 5.5: look up the difference-of-means baseline direction
+            # when direction_baseline is in the requested modes. Bundle-mode
+            # feature sets (empty contrast_name) are skipped — the baseline
+            # is defined per-contrast and is not meaningful for averaged-
+            # decoder bundles.
+            baseline_vector: torch.Tensor | None = None
+            needs_baseline = "direction_baseline" in intervention_modes
+            if needs_baseline:
+                baseline_vector = make_direction_baseline_vector(direction_baselines, fs, device)
+                if baseline_vector is None:
+                    logger.warning(
+                        "Skipping direction_baseline for feature set %s (layer %d, "
+                        "contrast %r): no matching DoM direction in --direction_baselines_path. "
+                        "Either the contrast is missing from the .npz or this is a bundle-mode "
+                        "feature set with no contrast_name.",
+                        fs.set_id, fs.layer, fs.contrast_name,
+                    )
             if args.scoring_mode == "first_token" and args.disable_controls:
                 part_idx, added = run_first_token_batched_feature_set(
                     model,
@@ -1139,6 +1277,7 @@ def main() -> None:
                     job_bar,
                     fs_index,
                     len(feature_sets),
+                    baseline_vector=baseline_vector,
                 )
                 n_done += added
                 continue
@@ -1172,6 +1311,7 @@ def main() -> None:
                                 model=model, fs=fs, vector=vector, sae=sae,
                                 positions=pos, alpha=alpha, mode=mode,
                                 clamp_value=args.clamp_value,
+                                baseline_vector=baseline_vector,
                             )
                             inter = score_fn(model, tokenizer, prompt, answers, 512, hook_fn=hook_fn)
                             out = steering_output_row(row_s, fs, alpha, mode, pos_name, base, inter, time.perf_counter() - start)
