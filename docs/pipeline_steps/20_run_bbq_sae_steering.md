@@ -61,9 +61,11 @@ The steering "direction" is **always unit-norm**, so the `alpha` grid is the mag
 
 ### Position selection (`positions_for`)
 - `final_prompt_token`: the last non-pad token (`attention_mask.sum() - 1` minus offsets that map to empty strings).
-- `target_identity_last_token` / `nontarget_identity_last_token`: regex-locate all spans matching the identity label *and* the relevant answer-option text via `find_spans`, return `max(pos)` — the last token overlapping any match. **All matches anywhere in the prompt are eligible** (see issue 3.3).
-- `stereotype_language_last_token`: the last token overlapping any content word from the BBQ `question` (after removing the local `stop` set).
+- `target_identity_last_token` / `nontarget_identity_last_token` (legacy): regex-locate all spans matching the identity label *and* the relevant answer-option text via `find_spans`, return `max(pos)` — the last token overlapping any match anywhere in the prompt. Frequently lands in the answer-option list rather than the context (the audit's 3.3 failure mode); the new section-explicit variants below should be preferred for any "this feature acts at the identity mention" claim.
+- `stereotype_language_last_token` (legacy): the last token overlapping any content word from the BBQ `question` (after removing the local `stop` set).
+- **Section-explicit variants (audit 3.3 fix, 2026-05-28, commit `afb3ee3`):** `target_identity_last_context_token` / `target_identity_last_question_token`, plus `nontarget_*` and `stereotype_language_*` counterparts. These clip the term-match spans to the named section via `find_section_spans` + `intersect_spans_with_section` BEFORE taking the last-token argmax. Fall back to `final_prompt_token` (with `intervention_section = "final"` on the output row) when no in-section match exists.
 - `all_identity_tokens` / `all_stereotype_language_tokens`: every overlapping token.
+- Every `results_parts/*.parquet` row carries an `intervention_section` column (`context` / `question` / `answer_option` / `final` / `mixed` / `unknown`), stamped by `position_section_for()` after the hook runs. Downstream analyzers can `groupby("intervention_section")` to stratify any effect table.
 
 ### Scoring modes
 - **`first_token`**: `score_first_token` / `score_first_token_batch` take a single forward pass on the prompt (no answer appended), then read `log_softmax(logits[final_pos])` and gather the logprob of `first_token_ids(" " + answer)[0]` for each of `[ans0, ans1, ans2]`. Fast and batchable. **Used in the documented production long run** (`--scoring_mode first_token --disable_controls`).
@@ -196,16 +198,31 @@ The same problem now applies to the new `--intervention_modes clamp` and `--inte
   1. **Best (paired with the 3.1 fix — now landed)**: pass a per-feature clamp value derived from each feature's own `p95`/`p99`/`max` in `feature_stats.csv` — then `alpha` becomes "feature ablated" (0) or "feature amplified to k×p95" (k ∈ {1, 2, 4}). Requires extending `--clamp_value` to accept a per-feature map (e.g. `--clamp_values_from_stats feature_stats.csv:p95` and a `--clamp_multiplier` grid).
   2. **Within the current direction-addition design**: scale `alpha` to a fixed fraction (e.g. {2%, 5%, 10%, 20%}) of the median residual-stream RMS norm at that layer/position, computed on a stratified BBQ sample before the run starts. Save the per-layer norm in `steering_config.json` and use it as the scaling constant.
 
-### 3.3 [MAJOR] — Intervention positions are located by greedy regex and may hit the wrong span
+### 3.3 [MAJOR] — Intervention positions are located by greedy regex and may hit the wrong span (FIX LANDED 2026-05-28)
 
-**What's wrong:** `positions_for` calls `find_spans(prompt, [target_identity_label, ans{target_answer_idx}])`, which returns **all** regex matches anywhere in the prompt, then returns `max(pos)` for the `*_last_token` variants. The identity label often appears in the context, the question, and the answer option `B. the Black man` — and the *last* occurrence is the answer-choice list. So `target_identity_last_token` is frequently intervening on the identity inside the answer option, not the identity in the context. `stereotype_language_last_token` has the same problem (question content words also recur in context/answers). The same code-path is used in Step 19's token-role flagging.
+**Status:** Closed in commit `afb3ee3` across this script and [Step 19](19_extract_bbq_token_level_sae_activations.md).
 
-**Why it matters:** The position names imply causal loci (the feature acts at the identity mention; the feature acts at the stereotype-language predicate). If a "target_identity_last_token" intervention is actually editing the residual at the token inside `C. the Black man`, that is a different causal question and arguably uninterpretable — the answer-option text is what is being *predicted from*. The downstream Step 23 README treats these positions as answering different causal questions, but only if they land where the names imply.
+**What landed:**
+- Six new section-explicit position names alongside the legacy ones:
+  - `target_identity_last_context_token` / `target_identity_last_question_token`
+  - `nontarget_identity_last_context_token` / `nontarget_identity_last_question_token`
+  - `stereotype_language_last_context_token` / `stereotype_language_last_question_token`
+- New helpers: `find_section_spans` (mirrors [Step 19](19_extract_bbq_token_level_sae_activations.md)'s) plus `intersect_spans_with_section(term_spans, section_span)` and `position_section_for(tokenizer, prompt, row, max_length, positions)`. The first two are used by `positions_for` to clip the term-match spans to the named section BEFORE taking the last-token argmax; the third classifies where the chosen position(s) actually landed (`context` / `question` / `answer_option` / `final` / `mixed` / `unknown`).
+- New `intervention_section` column on every `results_parts/*.parquet` row, stamped by both call sites (batched first-token path and per-example scoring path). The downstream analyzer can `groupby("intervention_section")` to stratify causal claims by where the hook actually fired.
+- When a section-explicit position has no in-section match in a given prompt, `positions_for` falls back to `final_prompt_token` and the output row's `intervention_section = "final"` — operators can filter to detect this regime.
+- Legacy `target_identity_last_token` / `nontarget_identity_last_token` / `stereotype_language_last_token` positions are preserved for backward-compatible comparison runs; new code should prefer the `_context_token` variants for any "this feature acts at the identity mention" claim.
 
-**Targeted fix:**
-- Restrict identity-token search to the **context** span (and optionally the question span) by reusing the section spans built in Step 19's `find_section_spans` (already in this script as `section_spans`). Spans returned by `find_spans` should be intersected with the context span before `max(pos)` is taken.
-- Add an `intervention_section` column to the output (`context`, `question`, `answer_option`, `final`) recording where the intervened token actually fell. Audit the distribution.
-- Consider renaming the positions to be section-explicit: `target_identity_last_context_token`, `stereotype_language_last_question_token`, etc.
+**Validation (synthetic, audit's pathological prompt):**
+
+| Position name | Token chosen | `intervention_section` |
+| --- | --- | --- |
+| `target_identity_last_token` (legacy) | answer-option B | `answer_option` (confirms audit's failure mode) |
+| `target_identity_last_context_token` (new) | context | `context` |
+| `stereotype_language_last_question_token` (new) | question | `question` |
+| `final_prompt_token` | final | `final` |
+| `target_identity_last_context_token` on no-context-match prompt | final (fallback) | `final` |
+
+**Original audit (preserved):** `positions_for` called `find_spans(prompt, [target_identity_label, ans{target_answer_idx}])`, which returned **all** regex matches anywhere in the prompt, then returned `max(pos)` for the `*_last_token` variants. The identity label often appears in the context, the question, and the answer option `B. the Black man` — and the *last* occurrence is the answer-choice list. So `target_identity_last_token` was frequently intervening on the identity inside the answer option, not the identity in the context. `stereotype_language_last_token` had the same problem (question content words also recur in context/answers). The downstream Step 23 README treated these positions as answering different causal questions, but only if they landed where the names imply.
 
 ### 3.4 [MAJOR] — BBQ→SAE contrast mapping silently uses axis-fallback (FIX LANDED 2026-05-27)
 

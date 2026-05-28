@@ -300,13 +300,23 @@ The same problem now applies to the post-3.1 `--intervention_modes clamp` / `ste
 
 What to do: express the perturbation relative to a meaningful scale — e.g. as a multiple of the residual-stream RMS norm at that layer/position, or (better, now that 3.1 has landed) extend `--clamp_value` to accept a per-feature lookup against `feature_stats.csv` (`p95`/`p99`/`max`) and a multiplier grid. Then "α" is comparable across features.
 
-### 3.3 [MAJOR] Intervention positions are located by greedy regex and may hit the wrong span
+### 3.3 [MAJOR] Intervention positions are located by greedy regex and may hit the wrong span (FIX LANDED 2026-05-28)
 
-`run_bbq_sae_steering.py:positions_for` (and `extract_bbq_token_level_sae_activations.py:find_all_spans`) locate `target_identity_last_token` by searching the prompt for the identity label *and* the answer-option text, collecting **all** matches, and taking `max(pos)` — the last. The identity label often appears in the context, the question, *and* the listed answer option `B. the Black man`; the last occurrence is in the answer-choice list. So `target_identity_last_token` is frequently intervening on the identity token *inside the answer choice*, not the identity mention in the context. `stereotype_language_last_token` has the same problem (question content words recur in context/answers).
+**Status:** Closed in commit `afb3ee3` across `scripts/extract_bbq_token_level_sae_activations.py` and `scripts/run_bbq_sae_steering.py`.
 
-Why it matters: the position names imply a causal locus ("the feature acts at the identity mention") that the implementation does not guarantee. The `analyze_bbq_feature_level_causal_effects.py` README explicitly says these positions "answer different causal questions" — but only if they land where the names say.
+**What landed (Step 19 — extractor):**
+- New helper `overlap_in_section(start, end, term_spans, section_span)` returns True only when a token overlaps a term match AND lies within the given section span.
+- Per-token rows gain nine new boolean columns: `is_target_identity_token_in_{context, question, answer_option}`, plus `nontarget` and `stereotype_language` counterparts.
+- `bbq_token_level_sae_summary.csv` gains nine new mean-activation columns: `mean_*_activation_in_{context, question, answer_option}` (NaN when the section mask is empty for that feature). Downstream consumers can answer "is this feature firing on the **context** identity mention or just the answer-option mention?" without re-deriving from the token table.
 
-What to do: use `find_section_spans` (already implemented) to restrict identity-token search to the **context** span specifically, and disambiguate. Record, per job, which section the intervened token fell in, and audit the distribution.
+**What landed (Step 20 — steering runner):**
+- Six new section-explicit position names alongside the legacy ones: `target_identity_last_context_token`, `target_identity_last_question_token`, plus `nontarget_*` and `stereotype_language_*` variants. `positions_for` clips term-match spans to the named section via `find_section_spans` + `intersect_spans_with_section` BEFORE taking the last-token argmax. Falls back to `final_prompt_token` (with `intervention_section = "final"` on the row) when no in-section match exists.
+- New `position_section_for(...)` classifies the chosen position into `{context, question, answer_option, final, mixed, unknown}`.
+- New `intervention_section` column on every `results_parts/*.parquet` row, stamped by both call sites (batched first-token path and per-example scoring path). The downstream analyzer can `groupby("intervention_section")` to stratify any effect table — exactly what the audit asked for ("Record, per job, which section the intervened token fell in").
+
+**Validation (synthetic, audit's pathological prompt):** legacy `target_identity_last_token` lands in `answer_option`; new `target_identity_last_context_token` lands in `context`; new `stereotype_language_last_question_token` lands in `question`; no-match fallback lands in `final`.
+
+**Original audit (preserved):** `run_bbq_sae_steering.py:positions_for` (and `extract_bbq_token_level_sae_activations.py:find_all_spans`) located `target_identity_last_token` by searching the prompt for the identity label *and* the answer-option text, collecting **all** matches, and taking `max(pos)` — the last. The identity label often appears in the context, the question, *and* the listed answer option `B. the Black man`; the last occurrence was in the answer-choice list. So `target_identity_last_token` was frequently intervening on the identity token *inside the answer choice*, not the identity mention in the context. `stereotype_language_last_token` had the same problem (question content words recur in context/answers). The position names implied a causal locus ("the feature acts at the identity mention") that the implementation did not guarantee.
 
 ### 3.4 [MAJOR] BBQ→SAE contrast mapping silently uses axis-fallback (FIX LANDED 2026-05-27)
 
@@ -586,7 +596,7 @@ Ordered by what most threatens a defensible result.
 **Tier 3 — correctness, clarity, strengthening**
 
 15. Fix the reconstruction projection math (least-squares, not `BᵀB`) (5.1 — FIX LANDED 2026-05-27, commit `1a569c3`).
-16. Verify intervention positions land in the intended prompt section (3.3).
+16. Verify intervention positions land in the intended prompt section (3.3 — FIX LANDED 2026-05-28, commit `afb3ee3`: section-aware token flags + section-explicit position names + `intervention_section` output column).
 17. Tie steering magnitude to a meaningful scale (3.2).
 18. Decide intersectional BBQ handling — first-class or excluded, not flattened (4.2 — FIX LANDED 2026-05-28, commit `b189aef`: path (b) chosen; `--intersectional_handling drop` default; `is_intersectional` column added; first-class compound contrasts recorded as future work).
 19. Reframe triage as pre-registered *selection*; validate the taxonomy if it is a contribution (5.2 — PARTIAL FIX LANDED 2026-05-27: firing-count entropy `7f2c302`, soft scoring head `235b5f5`, sensitivity sweep `f306869`, pre-registration doc landed; behavioral criterion + inter-rater validation deferred to RunPod).
