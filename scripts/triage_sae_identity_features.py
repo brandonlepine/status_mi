@@ -83,6 +83,23 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Regenerate triage_index.html from an existing feature_triage.csv without recomputing metrics.",
     )
+    parser.add_argument(
+        "--sensitivity_sweep",
+        action="store_true",
+        help="Audit 5.2 part 3: after the baseline triage, re-run with perturbed "
+             "thresholds and score weights and write triage_sensitivity_per_feature.csv "
+             "+ triage_sensitivity_summary.csv. Reports the fraction of features whose "
+             "role label or keep_for_intervention flag changes per perturbation. Use to "
+             "test whether kept-feature set is stable to reasonable perturbations of the "
+             "hand-picked weights and thresholds.",
+    )
+    parser.add_argument(
+        "--sensitivity_perturb_fractions",
+        default="0.8,0.9,1.1,1.2",
+        help="Comma-separated multiplicative factors to apply to each scalar threshold "
+             "and score-weight tuple element when --sensitivity_sweep is set. "
+             "Baseline 1.0 is always included implicitly. Default: 0.8,0.9,1.1,1.2.",
+    )
     return parser.parse_args()
 
 
@@ -743,7 +760,48 @@ def assign_roles(df: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
     return pd.DataFrame(out_rows)
 
 
-def compute_scores(df: pd.DataFrame, shared_layer_scores: pd.DataFrame) -> pd.DataFrame:
+# Audit 5.2: score weights are hardcoded module constants so the
+# sensitivity sweep can perturb them and any consumer reading triage's
+# run_config can see exactly what weighting produced the kept-feature set.
+# These are pre-registered defaults; do not adjust based on BBQ outcomes.
+DEFAULT_SCORE_WEIGHTS: dict[str, dict[str, float]] = {
+    "contrast_specificity_score": {
+        "axes_inverse": 0.6,    # 1 - min(1, (n_axes_where_top - 1) / 4)
+        "top_axis_fraction": 0.2,
+        "d_capped": 0.2,        # min(1, max_abs_cohens_d / 2)
+    },
+    "sharedness_score": {
+        "axes_count": 0.5,      # min(1, n_axes_where_top / 5)
+        "contrast_count": 0.3,  # min(1, n_contrasts_where_top / 10)
+        "shared_pc_loading": 0.2,
+    },
+    "template_artifact_score": {
+        "template_word_fraction": 0.4,
+        "family_concentration": 0.3,    # 1 - family_entropy
+        "template_concentration": 0.2,  # 1 - template_entropy
+        "non_span_local": 0.1,          # 1 - identity_span_localization_score
+    },
+    "polysemanticity_score": {
+        "axis_entropy": 0.35,
+        "identity_entropy": 0.35,
+        "token_entropy": 0.2,
+        "non_top_axis": 0.1,            # 1 - top_axis_fraction
+    },
+}
+
+
+def compute_scores(
+    df: pd.DataFrame,
+    shared_layer_scores: pd.DataFrame,
+    weights: dict[str, dict[str, float]] | None = None,
+) -> pd.DataFrame:
+    """Compute the four hand-weighted triage scores.
+
+    Audit 5.2: weights are now a parameter rather than inline literals so
+    --sensitivity_sweep can perturb them. Defaults match DEFAULT_SCORE_WEIGHTS;
+    pre-registered in docs/triage_preregistration_2026-05-27.md.
+    """
+    w = weights if weights is not None else DEFAULT_SCORE_WEIGHTS
     out = df.copy()
     for col in [
         "n_contrasts_where_top_feature", "n_axes_where_top_feature", "top_axis_fraction",
@@ -759,10 +817,14 @@ def compute_scores(df: pd.DataFrame, shared_layer_scores: pd.DataFrame) -> pd.Da
             out[col] = 0
     if "feature_localization_type" not in out.columns:
         out["feature_localization_type"] = "diffuse_or_unclear"
+
+    cs_w = w["contrast_specificity_score"]
     out["contrast_specificity_score"] = (
-        1 - np.minimum(1, (out["n_axes_where_top_feature"].clip(lower=1) - 1) / 4)
-    ) * 0.6 + out["top_axis_fraction"].fillna(0) * 0.2 + np.minimum(1, out["max_abs_cohens_d"] / 2) * 0.2
-    out["contrast_specificity_score"] = out["contrast_specificity_score"].map(clip01)
+        cs_w["axes_inverse"] * (1 - np.minimum(1, (out["n_axes_where_top_feature"].clip(lower=1) - 1) / 4))
+        + cs_w["top_axis_fraction"] * out["top_axis_fraction"].fillna(0)
+        + cs_w["d_capped"] * np.minimum(1, out["max_abs_cohens_d"] / 2)
+    ).map(clip01)
+
     out["shared_pc_loading_score"] = 0.0
     if not shared_layer_scores.empty:
         shared_keys = ["layer", "feature_id"] if "feature_id" in shared_layer_scores.columns else ["layer"]
@@ -772,22 +834,28 @@ def compute_scores(df: pd.DataFrame, shared_layer_scores: pd.DataFrame) -> pd.Da
             out = out.drop(columns=["shared_pc_loading_score_shared_proxy"])
         elif "shared_pc_loading_score" in out.columns:
             out["shared_pc_loading_score"] = out["shared_pc_loading_score"].fillna(0)
+
+    sh_w = w["sharedness_score"]
     out["sharedness_score"] = (
-        0.5 * np.minimum(1, out["n_axes_where_top_feature"] / 5)
-        + 0.3 * np.minimum(1, out["n_contrasts_where_top_feature"] / 10)
-        + 0.2 * out["shared_pc_loading_score"].fillna(0).clip(0, 1)
+        sh_w["axes_count"] * np.minimum(1, out["n_axes_where_top_feature"] / 5)
+        + sh_w["contrast_count"] * np.minimum(1, out["n_contrasts_where_top_feature"] / 10)
+        + sh_w["shared_pc_loading"] * out["shared_pc_loading_score"].fillna(0).clip(0, 1)
     ).map(clip01)
+
+    ta_w = w["template_artifact_score"]
     out["template_artifact_score"] = (
-        0.4 * out["fraction_top_tokens_template_words"].fillna(0)
-        + 0.3 * (1 - out["family_entropy"].fillna(1))
-        + 0.2 * (1 - out["template_entropy"].fillna(1))
-        + 0.1 * (1 - out["identity_span_localization_score"].fillna(0))
+        ta_w["template_word_fraction"] * out["fraction_top_tokens_template_words"].fillna(0)
+        + ta_w["family_concentration"] * (1 - out["family_entropy"].fillna(1))
+        + ta_w["template_concentration"] * (1 - out["template_entropy"].fillna(1))
+        + ta_w["non_span_local"] * (1 - out["identity_span_localization_score"].fillna(0))
     ).map(clip01)
+
+    poly_w = w["polysemanticity_score"]
     out["polysemanticity_score"] = (
-        0.35 * out["axis_entropy"].fillna(0)
-        + 0.35 * out["identity_entropy"].fillna(0)
-        + 0.2 * out["token_entropy"].fillna(0)
-        + 0.1 * (1 - out["top_axis_fraction"].fillna(0))
+        poly_w["axis_entropy"] * out["axis_entropy"].fillna(0)
+        + poly_w["identity_entropy"] * out["identity_entropy"].fillna(0)
+        + poly_w["token_entropy"] * out["token_entropy"].fillna(0)
+        + poly_w["non_top_axis"] * (1 - out["top_axis_fraction"].fillna(0))
     ).map(clip01)
     out["cross_axis_activation_score"] = out["cross_axis_activation_score"].fillna(out["axis_entropy"]).map(clip01)
     return out
@@ -937,6 +1005,131 @@ function applyFilters() {{
 </body></html>""")
 
 
+def parse_perturb_fractions(value: str) -> list[float]:
+    """Parse --sensitivity_perturb_fractions into a list of positive floats,
+    always including 1.0 (baseline). Invalid entries raise."""
+    out = {1.0}
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        f = float(part)
+        if f <= 0:
+            raise ValueError(f"--sensitivity_perturb_fractions: non-positive entry {f!r} is not allowed")
+        out.add(f)
+    return sorted(out)
+
+
+def run_sensitivity_sweep(
+    triage_input: pd.DataFrame,
+    shared_scores: pd.DataFrame,
+    args: argparse.Namespace,
+    baseline_triage: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Audit 5.2 part 3: perturb each threshold and each score-weight tuple
+    element one-at-a-time by the multiplicative factors in
+    --sensitivity_perturb_fractions; re-run scoring + role assignment; report
+    role and keep changes vs. the baseline triage.
+
+    Returns:
+      per_feature: one row per (feature, perturbation) with baseline and
+        perturbed provisional_role / keep_for_intervention, plus boolean
+        role_changed and keep_changed flags.
+      summary: one row per perturbation with aggregate change rates.
+    """
+    fractions = parse_perturb_fractions(args.sensitivity_perturb_fractions)
+    fractions = [f for f in fractions if f != 1.0]  # baseline implicit
+
+    threshold_attrs = [
+        "min_abs_cohens_d",
+        "min_abs_decoder_cosine",
+        "identity_span_local_threshold",
+        "final_token_integrated_threshold",
+        "max_template_artifact_score_keep",
+        "min_contrast_specificity_keep",
+        "min_sharedness_score_shared",
+        "min_role_fit_keep",
+    ]
+
+    base_keep_index = baseline_triage.set_index(["layer", "feature_id"])
+    per_feature_rows: list[dict[str, object]] = []
+    summary_rows: list[dict[str, object]] = []
+
+    def record(perturb_label: str, perturb_kind: str, perturbed_triage: pd.DataFrame) -> None:
+        merged = perturbed_triage.merge(
+            base_keep_index[["provisional_role", "keep_for_intervention", "best_role"]]
+            .reset_index()
+            .rename(columns={
+                "provisional_role": "baseline_provisional_role",
+                "keep_for_intervention": "baseline_keep_for_intervention",
+                "best_role": "baseline_best_role",
+            }),
+            on=["layer", "feature_id"], how="inner",
+        )
+        merged["role_changed"] = merged["provisional_role"].astype(str).ne(merged["baseline_provisional_role"].astype(str))
+        merged["keep_changed"] = merged["keep_for_intervention"].astype(bool).ne(merged["baseline_keep_for_intervention"].astype(bool))
+        merged["best_role_changed"] = merged["best_role"].astype(str).ne(merged["baseline_best_role"].astype(str))
+        merged["perturbation"] = perturb_label
+        merged["perturbation_kind"] = perturb_kind
+        per_feature_rows.extend(
+            merged[[
+                "perturbation", "perturbation_kind", "layer", "feature_id",
+                "baseline_provisional_role", "provisional_role", "role_changed",
+                "baseline_best_role", "best_role", "best_role_changed",
+                "baseline_keep_for_intervention", "keep_for_intervention", "keep_changed",
+            ]].to_dict("records")
+        )
+        n = len(merged)
+        n_role_changed = int(merged["role_changed"].sum())
+        n_keep_changed = int(merged["keep_changed"].sum())
+        n_best_role_changed = int(merged["best_role_changed"].sum())
+        baseline_keep = int(merged["baseline_keep_for_intervention"].sum())
+        perturbed_keep = int(merged["keep_for_intervention"].sum())
+        summary_rows.append({
+            "perturbation": perturb_label,
+            "perturbation_kind": perturb_kind,
+            "n_features": n,
+            "role_change_fraction": n_role_changed / max(n, 1),
+            "best_role_change_fraction": n_best_role_changed / max(n, 1),
+            "keep_change_fraction": n_keep_changed / max(n, 1),
+            "baseline_n_keep": baseline_keep,
+            "perturbed_n_keep": perturbed_keep,
+            "delta_n_keep": perturbed_keep - baseline_keep,
+        })
+
+    # Sweep each threshold one-at-a-time.
+    for attr in threshold_attrs:
+        baseline_value = float(getattr(args, attr))
+        for f in fractions:
+            perturbed_args = argparse.Namespace(**vars(args))
+            setattr(perturbed_args, attr, baseline_value * f)
+            perturbed_triage = assign_roles(triage_input, perturbed_args)
+            record(
+                perturb_label=f"{attr}={baseline_value * f:.4g} (x{f:.2f})",
+                perturb_kind=f"threshold/{attr}",
+                perturbed_triage=perturbed_triage,
+            )
+
+    # Sweep each score-weight tuple element one-at-a-time.
+    import copy
+    for score_name, weight_dict in DEFAULT_SCORE_WEIGHTS.items():
+        for component, baseline_value in weight_dict.items():
+            for f in fractions:
+                perturbed_weights = copy.deepcopy(DEFAULT_SCORE_WEIGHTS)
+                perturbed_weights[score_name][component] = baseline_value * f
+                perturbed_scores = compute_scores(triage_input, shared_scores, weights=perturbed_weights)
+                perturbed_triage = assign_roles(perturbed_scores, args)
+                record(
+                    perturb_label=f"{score_name}.{component}={baseline_value * f:.4g} (x{f:.2f})",
+                    perturb_kind=f"weight/{score_name}/{component}",
+                    perturbed_triage=perturbed_triage,
+                )
+
+    per_feature_df = pd.DataFrame(per_feature_rows)
+    summary_df = pd.DataFrame(summary_rows).sort_values("role_change_fraction", ascending=False).reset_index(drop=True)
+    return per_feature_df, summary_df
+
+
 def main() -> None:
     args = parse_args()
     layers = parse_layers(args.layers)
@@ -1052,6 +1245,21 @@ def main() -> None:
 
     make_figures(triage, candidates.merge(triage[["layer", "feature_id", "keep_for_intervention"]], on=["layer", "feature_id"], how="left") if not candidates.empty else pd.DataFrame(), args.output_dir)
     write_html(triage, args.output_dir)
+
+    if args.sensitivity_sweep:
+        print(f"\nRunning sensitivity sweep (audit 5.2 part 3)...")
+        per_feature_df, summary_df = run_sensitivity_sweep(triage_input, shared_scores, args, triage)
+        per_feature_df.to_csv(args.output_dir / "triage_sensitivity_per_feature.csv", index=False)
+        summary_df.to_csv(args.output_dir / "triage_sensitivity_summary.csv", index=False)
+        print(f"Sensitivity sweep complete: {len(summary_df)} perturbations × {len(triage)} features.")
+        print(f"Top 5 perturbations by role-change fraction:")
+        print(summary_df.head(5)[["perturbation", "role_change_fraction", "keep_change_fraction", "delta_n_keep"]].to_string(index=False))
+        max_role_change = float(summary_df["role_change_fraction"].max()) if len(summary_df) else 0.0
+        max_keep_change = float(summary_df["keep_change_fraction"].max()) if len(summary_df) else 0.0
+        print(f"\nWorst-case role change: {max_role_change:.1%}; worst-case keep change: {max_keep_change:.1%}.")
+        print(f"BBQ-side stability check (does the kept-feature set's BBQ effect distribution change across "
+              f"these perturbations?) is RunPod-deferred — see docs/triage_preregistration_2026-05-27.md.")
+
     print(f"Triage complete: {args.output_dir}")
     print(summary)
 
