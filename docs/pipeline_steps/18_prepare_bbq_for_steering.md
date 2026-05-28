@@ -21,7 +21,7 @@ Convert raw BBQ JSONL benchmark rows into a steering-ready dataset by (a) normal
 - `prepared/bbq_prepare_config.json`, `prepared/logs/prepare_bbq.log`.
 
 ## Key implementation details
-- **AXIS_MAP** (lines 26–38) flattens `race_x_gender` and `race_x_ses` to `race_ethnicity`; everything else is identity-mapped, including `ses` → `socioeconomic_status`.
+- **AXIS_MAP** identity-maps single-axis categories (e.g. `ses` → `socioeconomic_status`). The intersectional categories `race_x_gender` and `race_x_ses` are NOT in `AXIS_MAP` — they're handled separately by `--intersectional_handling` (default `drop`; see audit 4.2 below, closed 2026-05-28 in commit `b189aef`).
 - **Identity alias table** is the union of (i) every non-empty surface form column for each identity row, (ii) each entry in the semicolon-delimited `aliases` column, (iii) the hardcoded `MANUAL_ALIASES` dict. Matching uses `norm_text` (lowercase, underscores/hyphens to spaces, alphanumerics only). If exact lookup fails, the script tries (a) whitespace-stripped matching, then (b) decomposing compound labels like `F-Black` via `identity_components` and looking each piece up individually.
 - **Role assignment** (`find_answer_indices`): an answer is `is_unknown` if it normalizes to a member of `UNKNOWN_ALIASES` (`"cannot be determined"`, `"not answerable"`, etc.). It is `is_stereo` if its mapped `identity_id`, normalized label, or any component identity is in the BBQ row's `stereotyped_groups`. Target = first stereotyped non-unknown; nontarget = first non-stereotyped non-unknown.
 - **Contrast mapping** (`map_contrast`) tries exact identity-pair match against the triage's contrast registry first (returns confidence `exact`), then any contrast on the same axis that touches either identity (`fallback_axis`), then any same-axis contrast at all (still `fallback_axis`), then `""/unmapped`. Note: `confidence == "alias"` is never produced by this code — the column is defined as `exact | fallback_axis | unmapped` despite downstream readers expecting four values.
@@ -82,13 +82,25 @@ Convert raw BBQ JSONL benchmark rows into a steering-ready dataset by (a) normal
 
 **Targeted fix:** Add a startup-time validation step: load `aliases | identity_meta` and assert every value in `MANUAL_ALIASES` exists as `identity_id` in `identity_meta`. Fail (or log `ERROR`-level warning per missing ID and count them at the end) if not. Decide whether to (a) add the missing identities to `bbq_identity_normalized_forms.csv` with proper surface forms or (b) remove the orphan aliases entirely.
 
-### 4.2 [MAJOR] — Intersectional BBQ categories are flattened to a single axis
+### 4.2 [MAJOR] — Intersectional BBQ categories are flattened to a single axis (FIX LANDED 2026-05-28)
 
-**What's wrong:** `AXIS_MAP` collapses `race_x_gender` and `race_x_ses` to `race_ethnicity`. `identity_components` splits compound labels like `F-Black` and `lowSES-Hispanic`, and `choose_identity_for_role` picks a *single* component as the target identity. The intersectional structure is discarded before steering ever runs.
+**Status:** Closed in commit `b189aef` with the audit's path (b) — explicit exclusion. Path (a) — first-class compound contrasts with their own directions and SAE features — needs templated compound prompts that the geometry pipeline doesn't produce, plus a compound-contrast registry; that's a separate research workstream.
 
-**Why it matters:** Intersectionality is central to the marginalized-identities literature this paper claims to address. Flattening Race×Gender to "race" loses the most interesting BBQ cases and can mislabel the stereotype-target answer when the BBQ stereotype actually targets the compound identity.
+**What landed:**
+- `race_x_gender` and `race_x_ses` removed from `AXIS_MAP` so the silent flatten path is gone. New module-level constants `INTERSECTIONAL_CATEGORIES = {"race_x_gender", "race_x_ses"}` + `INTERSECTIONAL_AXIS_FLATTEN_TO` record the prior flatten target for the opt-in legacy mode.
+- New CLI `--intersectional_handling {drop, axis_flatten}` (default `drop`). Default behavior: intersectional rows are excluded; per-category dropped counts are logged to stdout AND added to `bbq_prepare_summary.csv` as `n_intersectional_dropped_*` metrics. `axis_flatten` preserves the legacy "collapse to race_ethnicity" behavior, but every flattened row is stamped `is_intersectional=True` so downstream analyzers can stratify or drop them.
+- New `is_intersectional` column on `bbq_prepared_examples.parquet` (always present; `False` for non-intersectional rows). Under the audit-3.4 default mapping filter (`--mapping_confidence_filter exact`), intersectional rows passing through under `axis_flatten` are still filtered at Step 20 because no contrast in the registry matches an intersectional pair — but the `is_intersectional` flag makes the path explicit rather than relying on the unmapped-fallback to silently drop them.
+- New helper `resolve_intersectional(category, handling) -> (axis_or_None, is_intersectional)` exported alongside the constants for downstream consumers.
+- Synthetic validation: routing correct across both intersectional category names and a sample of non-intersectional ones; CLI default = `drop`; AXIS_MAP no longer contains `race_x_*`.
 
-**Targeted fix:** Choose explicitly: either (a) handle intersectional contrasts as first-class objects (preserve the compound `axis_mapped = "race_x_gender"`, build compound identity directions and intersectional contrast features upstream, and let downstream steering address them as new contrast names), or (b) drop `Race_x_*` from the default `--categories` list and document the exclusion. Do not silently flatten.
+**Path (a) — future work:** Genuine intersectional handling would require:
+1. Adding templated identity prompts that vary BOTH axes simultaneously (e.g. `"This person is {gender_form} and {race_form}."`) so the geometry pipeline can fit compound contrast directions.
+2. Extending `contrast_registry.py` with compound contrasts like `(race_black_x_gender_female, race_white_x_gender_male)`.
+3. Extending Step 7's `run_contrasts` / `run_contrast_probes` to compute compound directions (the math is unchanged — `compute_direction` is identity-agnostic — but the contrast pair iteration would need a compound case).
+4. Extending Step 18's `find_answer_indices` to map compound BBQ labels (`F-Black`) to compound identity IDs rather than picking a single component.
+5. Threading compound contrasts through `--mapping_confidence_filter`. This is a substantial paper-extension and is recorded as a follow-up, not the current commit.
+
+**Original audit (preserved):** `AXIS_MAP` collapsed `race_x_gender` and `race_x_ses` to `race_ethnicity`. `identity_components` splits compound labels like `F-Black` and `lowSES-Hispanic`, and `choose_identity_for_role` picks a single component as the target identity. The intersectional structure was discarded before steering ever ran. Intersectionality is central to the marginalized-identities literature this paper claims to address; flattening Race×Gender to "race" loses the most interesting BBQ cases and can mislabel the stereotype-target answer when the BBQ stereotype actually targets the compound identity.
 
 ### 4.4 [MINOR] — `MANUAL_ALIASES` has dozens of duplicate `"nondisabled"` keys
 
@@ -109,7 +121,7 @@ Convert raw BBQ JSONL benchmark rows into a steering-ready dataset by (a) normal
 ## Rebuild checklist
 - [ ] Validate every value in `MANUAL_ALIASES` against `bbq_identity_normalized_forms.csv` at startup; promote missing-ID skips from silent drops to `ERROR`-level log lines that are counted in `bbq_prepare_summary.csv`.
 - [ ] Remove the duplicate `"nondisabled"` entries and either delete or fix the entries that point to non-existent IDs (`ses_low_income`, `ses_high_socioeconomic_status`, `age_old`, `age_nonold`, `nationality_asia_pacific`, `nationality_african`, `nationality_european`).
-- [ ] Decide intersectional policy. If keeping `race_x_*` as first-class, stop collapsing them in `AXIS_MAP`, propagate the compound axis through the schema, and add compound identity directions upstream. If excluding, default `--categories` to omit them and assert exclusion.
+- [x] Decide intersectional policy. (4.2 FIX LANDED 2026-05-28 in commit `b189aef`: path (b) — `--intersectional_handling drop` is the new default, `axis_flatten` opt-in preserves legacy behavior; `is_intersectional` column added. Path (a) — compound contrasts as first-class objects — recorded as future work in the 4.2 section above.)
 - [ ] Add `bias_polarity_sign` column derived from `question_polarity` so downstream can sign the bias delta.
 - [ ] Add `bbq_prepare_confidence_breakdown.csv` listing per `(category_raw, axis_mapped)` the count of rows at each `mapped_contrast_confidence` level.
 - [ ] Add a one-page baseline diagnostic (answer-option mass, BBQ accuracy/bias, argmax-matches-greedy) computed on a stratified sample of the prepared prompts.

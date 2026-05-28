@@ -344,11 +344,18 @@ What to do: use `find_section_spans` (already implemented) to restrict identity-
 
 **Remaining work — BBQ side:** `prepare_bbq_for_steering.py:MANUAL_ALIASES` still maps to non-existent IDs (`ses_low_income`, `age_old`, `age_nonold`, `nationality_asia_pacific`, `nationality_african`, `nationality_european`, plus a possible `sexuality_*` / `appearance_obese` audit). There is also no `age` axis in the dataset at all, so any BBQ Age handling via these aliases is dead. Fold these into the BBQ prepare-side fix (separate commit; conceptually distinct from the geometry contrast registry).
 
-### 4.2 [MAJOR] Intersectional BBQ categories are flattened to a single axis
+### 4.2 [MAJOR] Intersectional BBQ categories are flattened to a single axis (FIX LANDED 2026-05-28)
 
-`prepare_bbq_for_steering.py:AXIS_MAP` collapses `race_x_gender` and `race_x_ses` to `race_ethnicity`. Intersectional examples have compound group labels (`F-Black`); `identity_components` splits them and `target_identity_id` becomes a single component. The intersectional structure is discarded.
+**Status:** Closed in commit `b189aef` (`scripts/prepare_bbq_for_steering.py`) with the audit's path (b) — explicit exclusion. Path (a) — first-class compound contrasts — is recorded as future work; it would need templated compound prompts that the geometry pipeline doesn't currently produce.
 
-Why it matters: the project's stated subject is *marginalized identities*, and intersectionality is central to that literature. Flattening Race×Gender to "race" both loses the most interesting cases and risks mislabeling the stereotyped answer. Either (a) handle intersectional contrasts as first-class objects (compound identity directions, intersectional steering), which would be a genuine contribution, or (b) explicitly exclude `race_x_*` and say so. Do not silently flatten.
+**What landed:**
+- `race_x_gender` and `race_x_ses` removed from `AXIS_MAP`. New CLI `--intersectional_handling {drop, axis_flatten}` (default `drop`). Default behavior: intersectional rows are excluded with per-category counts logged to stdout and added to `bbq_prepare_summary.csv` as `n_intersectional_dropped_*` metrics. `axis_flatten` opt-in preserves the legacy "collapse to race_ethnicity" behavior, but every flattened row is stamped `is_intersectional=True` so downstream consumers can stratify.
+- New `is_intersectional` column on `bbq_prepared_examples.parquet` (always present; `False` for non-intersectional rows). Under the audit-3.4 default mapping filter (`--mapping_confidence_filter exact`), intersectional rows passing through under `axis_flatten` would also be filtered at Step 20 because no contrast in the registry matches an intersectional pair — but the `is_intersectional` flag makes the exclusion explicit rather than relying on the unmapped-fallback to silently drop them.
+- New helper `resolve_intersectional(category, handling) -> (axis_or_None, is_intersectional)`.
+
+**Path (a) — recorded as future work:** Genuine intersectional handling would require (1) templated compound prompts in the identity-geometry corpus, (2) a compound-contrast registry, (3) Step 7 compound direction computation, (4) Step 18 compound BBQ-label mapping, and (5) compound-aware contrast filtering. Substantial paper-extension work.
+
+**Original audit (preserved):** `prepare_bbq_for_steering.py:AXIS_MAP` collapsed `race_x_gender` and `race_x_ses` to `race_ethnicity`. Intersectional examples have compound group labels (`F-Black`); `identity_components` splits them and `target_identity_id` becomes a single component. The intersectional structure was discarded. The project's stated subject is *marginalized identities*, and intersectionality is central to that literature; flattening Race×Gender to "race" both lost the most interesting cases and risked mislabeling the stereotyped answer.
 
 ### 4.3 [BLOCKER] `question_polarity` sign is not folded into the bias metric (FIX LANDED 2026-05-27)
 
@@ -570,7 +577,7 @@ Ordered by what most threatens a defensible result.
 15. Fix the reconstruction projection math (least-squares, not `BᵀB`) (5.1 — FIX LANDED 2026-05-27, commit `1a569c3`).
 16. Verify intervention positions land in the intended prompt section (3.3).
 17. Tie steering magnitude to a meaningful scale (3.2).
-18. Decide intersectional BBQ handling — first-class or excluded, not flattened (4.2).
+18. Decide intersectional BBQ handling — first-class or excluded, not flattened (4.2 — FIX LANDED 2026-05-28, commit `b189aef`: path (b) chosen; `--intersectional_handling drop` default; `is_intersectional` column added; first-class compound contrasts recorded as future work).
 19. Reframe triage as pre-registered *selection*; validate the taxonomy if it is a contribution (5.2 — PARTIAL FIX LANDED 2026-05-27: firing-count entropy `7f2c302`, soft scoring head `235b5f5`, sensitivity sweep `f306869`, pre-registration doc landed; behavioral criterion + inter-rater validation deferred to RunPod).
 20. Make representation use consistent (residualized vs raw) across the SAE analysis (5.4 — FIX LANDED 2026-05-27, commit `ebfdff7`: raw end-to-end).
 21. Extract shared code into a common module with a validated contrast registry (5.10, 4.1).
