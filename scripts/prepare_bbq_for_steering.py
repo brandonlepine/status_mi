@@ -50,98 +50,94 @@ UNKNOWN_ALIASES = {
     "unknown", "not answerable", "can't answer", "cannot answer", "can't be determined",
     "cannot be determined", "not enough information", "not known", "not applicable",
 }
+# Audit 4.4 (closed 2026-05-28): the prior dict literal duplicated
+# `"nondisabled": "disability_nondisabled"` ~35 times (a copy-paste
+# artifact — the runtime dict deduplicated, so the bug was invisible at
+# import time but signaled the file had never been reviewed). Several
+# alias targets ALSO pointed to identity_ids that don't exist in
+# `data/bbq_identity_normalized_forms.csv`. The cleaned version below
+# is paired with `validate_manual_aliases()` (called at startup), which
+# cross-checks every target against the loaded identity-forms CSV and
+# fails loudly on misses — so either kind of regression is caught on
+# the next run.
+#
+# Repointings vs. the prior dict (audit 4.1 BBQ-side):
+#   "low ses" / "low socioeconomic status" / "low income" / "lowses"
+#       → ses_low_income       (broken) → ses_low (canonical low-SES bucket)
+#   "poor"
+#       → ses_low_income       (broken) → ses_poor (own identity exists)
+#   "high socioeconomic status" / "highses"
+#       → ses_high_socioeconomic_status (broken) → ses_high
+#
+# Removed entirely (no matching identity in the dataset; BBQ rows that
+# mention these terms now fall to mapped_contrast_confidence=unmapped
+# and are filtered at Step 20 under the audit-3.4 default
+# --mapping_confidence_filter exact):
+#   "old", "nonold", "non old"
+#       — no age axis exists in the identity-forms CSV; BBQ Age category
+#         is currently unmappable. Add the axis (and templated identity
+#         prompts upstream) to restore.
+#   "asia pacific", "asiapacific", "africa", "europe"
+#       — aggregate continents, not per-country IDs. The forms CSV has
+#         per-country nationality identities (nationality_burmese,
+#         nationality_kenyan, …) but no continent aggregates.
 MANUAL_ALIASES = {
+    # Disability
     "disabled": "disability_disabled",
     "physically disabled": "disability_physically_disabled",
     "wheelchair": "disability_physically_disabled",
     "nondisabled": "disability_nondisabled",
     "nondisabled person": "disability_nondisabled",
     "non disabled": "disability_nondisabled",
-    "nondisabled": "disability_nondisabled",
-    "nondisabled": "disability_nondisabled",
-    "nondisabled": "disability_nondisabled",
-    "nondisabled": "disability_nondisabled",
-    "nondisabled": "disability_nondisabled",
-    "nondisabled": "disability_nondisabled",
-    "nondisabled": "disability_nondisabled",
-    "nondisabled": "disability_nondisabled",
-    "nondisabled": "disability_nondisabled",
-    "nondisabled": "disability_nondisabled",
-    "nondisabled": "disability_nondisabled",
-    "non disabled": "disability_nondisabled",
     "non-disabled": "disability_nondisabled",
-    "nondisabled": "disability_nondisabled",
-    "nondisabled": "disability_nondisabled",
-    "nondisabled": "disability_nondisabled",
-    "nondisabled": "disability_nondisabled",
-    "nondisabled": "disability_nondisabled",
-    "nondisabled": "disability_nondisabled",
-    "nondisabled": "disability_nondisabled",
-    "nondisabled": "disability_nondisabled",
-    "nondisabled": "disability_nondisabled",
-    "nondisabled": "disability_nondisabled",
-    "nondisabled": "disability_nondisabled",
-    "nondisabled": "disability_nondisabled",
-    "nondisabled": "disability_nondisabled",
-    "nondisabled": "disability_nondisabled",
-    "nondisabled": "disability_nondisabled",
-    "nondisabled": "disability_nondisabled",
-    "nondisabled": "disability_nondisabled",
-    "nondisabled": "disability_nondisabled",
-    "nondisabled": "disability_nondisabled",
-    "nondisabled": "disability_nondisabled",
-    "nondisabled": "disability_nondisabled",
-    "nondisabled": "disability_nondisabled",
-    "nondisabled": "disability_nondisabled",
     "able bodied": "disability_able_bodied",
     "able-bodied": "disability_able_bodied",
+    # Gender
     "man": "gender_man",
     "m": "gender_man",
     "male": "gender_man",
     "woman": "gender_woman",
     "f": "gender_woman",
     "female": "gender_woman",
+    # Physical appearance
     "fat": "appearance_obese",
     "obese": "appearance_obese",
     "nonobese": "appearance_thin",
     "non obese": "appearance_thin",
     "slim": "appearance_thin",
     "thin": "appearance_thin",
+    # Race / ethnicity
     "black": "race_black",
     "african american": "race_black",
+    "african": "race_black",  # BBQ surface form, not the continent
     "white": "race_white",
     "caucasian": "race_caucasian",
     "asian": "race_asian",
     "hispanic": "race_hispanic",
     "latino": "race_latino",
     "native american": "race_native_american",
+    "arab": "race_arab",
+    # Religion
     "muslim": "religion_muslim",
     "jewish": "religion_jewish",
     "christian": "religion_christian",
+    # Sexuality
     "gay": "sexuality_gay",
     "straight": "sexuality_straight",
     "heterosexual": "sexuality_heterosexual",
     "lesbian": "sexuality_lesbian",
     "bisexual": "sexuality_bisexual",
-    "low ses": "ses_low_income",
-    "low socioeconomic status": "ses_low_income",
-    "low income": "ses_low_income",
-    "poor": "ses_low_income",
-    "lowses": "ses_low_income",
+    # Socioeconomic status — see the "Repointings" comment above.
+    "low ses": "ses_low",
+    "low socioeconomic status": "ses_low",
+    "low income": "ses_low",
+    "lowses": "ses_low",
+    "poor": "ses_poor",
     "rich": "ses_rich",
-    "high socioeconomic status": "ses_high_socioeconomic_status",
-    "highses": "ses_high_socioeconomic_status",
+    "high socioeconomic status": "ses_high",
+    "highses": "ses_high",
     "upper class": "ses_upper_class",
     "lower class": "ses_lower_class",
-    "old": "age_old",
-    "nonold": "age_nonold",
-    "non old": "age_nonold",
-    "african": "race_black",
-    "arab": "race_arab",
-    "asia pacific": "nationality_asia_pacific",
-    "asiapacific": "nationality_asia_pacific",
-    "africa": "nationality_african",
-    "europe": "nationality_european",
 }
 
 
@@ -265,6 +261,41 @@ def load_identity_aliases(path: Path) -> tuple[dict[str, str], dict[str, dict[st
                     aliases[norm_text(alias)] = identity_id
     aliases.update({norm_text(k): v for k, v in MANUAL_ALIASES.items()})
     return aliases, metadata
+
+
+def validate_manual_aliases(
+    identity_meta: dict[str, dict[str, str]],
+    logger: logging.Logger,
+) -> dict[str, list[str]]:
+    """Audit 4.4 (also closes the BBQ-side of audit 4.1): every value in
+    MANUAL_ALIASES must be a real identity_id in the loaded identity-forms
+    CSV. Logs an ERROR per missing target and returns
+    `{"missing": [...], "unknown_axis": [...]}` so the caller can record
+    counts in bbq_prepare_summary.csv. Raises ValueError if any target is
+    missing — silent drops were the original bug and would re-introduce it.
+    """
+    valid_ids = set(identity_meta.keys())
+    missing_targets: dict[str, list[str]] = {}  # target -> aliases pointing at it
+    for alias, target in MANUAL_ALIASES.items():
+        if target not in valid_ids:
+            missing_targets.setdefault(target, []).append(alias)
+    if missing_targets:
+        for target, aliases_for_target in sorted(missing_targets.items()):
+            logger.error(
+                "MANUAL_ALIASES target %r is not a registered identity_id "
+                "in the identity-forms CSV. Aliases pointing at it: %s",
+                target, sorted(aliases_for_target),
+            )
+        raise ValueError(
+            f"Audit 4.4: MANUAL_ALIASES has {len(missing_targets)} broken target(s): "
+            f"{sorted(missing_targets.keys())}. Either add the identity_id to "
+            f"data/bbq_identity_normalized_forms.csv or repoint the alias(es)."
+        )
+    return {
+        "missing_targets": sorted(missing_targets.keys()),
+        "n_total_aliases": [str(len(MANUAL_ALIASES))],
+        "n_distinct_targets": [str(len({v for v in MANUAL_ALIASES.values()}))],
+    }
 
 
 def parse_contrast_identity_ids(name: str) -> tuple[str, str] | None:
@@ -519,6 +550,10 @@ def main() -> None:
     (args.output_dir / "bbq_prepare_config.json").write_text(json.dumps(config, indent=2) + "\n")
 
     aliases, identity_meta = load_identity_aliases(args.identity_forms_csv)
+    # Audit 4.4 (also closes BBQ side of 4.1): every MANUAL_ALIASES target
+    # must be a real identity_id. Raises loudly if not, so silent flat-out-
+    # missing aliases (the original 4.1 + 4.4 failure mode) cannot recur.
+    manual_alias_audit = validate_manual_aliases(identity_meta, logger)
     contrasts = load_contrasts(args.triage_csv)
     raw_rows = read_bbq_files(args.bbq_data_dir, args.categories, logger)
 
@@ -686,6 +721,15 @@ def main() -> None:
             "Audit 4.2: %d total intersectional rows dropped. To preserve them (flattened to race_ethnicity), "
             "re-run with --intersectional_handling axis_flatten.", total_dropped,
         )
+    # Audit 4.4 / BBQ-side of 4.1: durable record that MANUAL_ALIASES was
+    # validated against the identity-forms CSV at startup. n_total_aliases
+    # and n_distinct_targets let a future operator detect mutation without
+    # parsing source. n_missing_targets is always 0 here (we raise on misses
+    # above) but is recorded explicitly so it's visible in the summary.
+    summary_rows.append({"metric": "manual_aliases_n_total", "value": int(manual_alias_audit["n_total_aliases"][0])})
+    summary_rows.append({"metric": "manual_aliases_n_distinct_targets", "value": int(manual_alias_audit["n_distinct_targets"][0])})
+    summary_rows.append({"metric": "manual_aliases_n_missing_targets", "value": int(len(manual_alias_audit["missing_targets"]))})
+    if not prepared_df.empty:
         failed = Counter(
             (row.get("target_identity_label", ""), row.get("nontarget_identity_label", ""))
             for row in diagnostics
