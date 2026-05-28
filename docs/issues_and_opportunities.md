@@ -308,13 +308,17 @@ Why it matters: the position names imply a causal locus ("the feature acts at th
 
 What to do: use `find_section_spans` (already implemented) to restrict identity-token search to the **context** span specifically, and disambiguate. Record, per job, which section the intervened token fell in, and audit the distribution.
 
-### 3.4 [MAJOR] BBQ→SAE contrast mapping silently uses axis-fallback
+### 3.4 [MAJOR] BBQ→SAE contrast mapping silently uses axis-fallback (FIX LANDED 2026-05-27)
 
-`prepare_bbq_for_steering.py:map_contrast` returns `exact` when the BBQ example's `(target, nontarget)` identities match an SAE contrast, otherwise `fallback_axis` (any contrast on the same axis), otherwise `unmapped`. `run_bbq_sae_steering.py` keeps rows with confidence in `{exact, alias, fallback_axis}` by default. So a BBQ item about `race_arab vs race_white` can be steered with features selected for `race_black vs race_white`, and the downstream analyzer treats `mapped_contrast_name` as the relevant contrast.
+**Status:** Closed in commit `56a5f7e` (`scripts/run_bbq_sae_steering.py`). The mapping logic in `prepare_bbq_for_steering.py:map_contrast` is unchanged (it still emits `exact` / `fallback_axis` / `unmapped`); the steering runner now defaults to exact-only and stamps the confidence on every output row.
 
-Why it matters: feature-to-example matching is a load-bearing assumption for "this feature is implicated in *this* identity's bias." `fallback_axis` breaks it while leaving the data looking clean.
+**What landed:**
+- `--include_unmapped` (boolean) replaced with `--mapping_confidence_filter` (default `exact`; choices `exact`, `exact_and_fallback`, `all`). Headline runs use the default and silently drop `fallback_axis`. Users who want fallback rows for a separate analysis pass `exact_and_fallback`; full inclusive passes `all`. The runner prints the kept-row count and per-confidence breakdown to stdout.
+- `mapped_contrast_confidence` is stamped on every output row in `steering_output_row`. Previously the column was implicitly available by re-merging against the prepared parquet; downstream `analyze_bbq_feature_level_causal_effects.py` rows carried `mapped_contrast_name` but not the confidence. Now stratifying any effect table by mapping confidence is a `groupby` away.
 
-What to do: for headline results, restrict to `mapped_contrast_confidence == exact`. Report `fallback_axis` separately, if at all. At minimum, stratify every effect table by mapping confidence so the reader sees which rows rest on a fallback.
+**Behavior change:** under the prior default (`--include_unmapped` unset), the runner kept rows with confidence in `{exact, alias, fallback_axis}` — effectively `{exact, fallback_axis}` since `alias` never actually flows out of `map_contrast`. Under the new default (`--mapping_confidence_filter exact`), only `exact` rows are kept. Production runs that need the prior superset pass `--mapping_confidence_filter exact_and_fallback`.
+
+**Original audit (preserved):** `prepare_bbq_for_steering.py:map_contrast` returns `exact` when the BBQ example's `(target, nontarget)` identities match an SAE contrast, otherwise `fallback_axis` (any contrast on the same axis), otherwise `unmapped`. `run_bbq_sae_steering.py` kept rows with confidence in `{exact, alias, fallback_axis}` by default. So a BBQ item about `race_arab vs race_white` could be steered with features selected for `race_black vs race_white`, and the downstream analyzer treated `mapped_contrast_name` as the relevant contrast. Feature-to-example matching is a load-bearing assumption for "this feature is implicated in *this* identity's bias"; `fallback_axis` broke it while leaving the data looking clean.
 
 ### 3.5 [MINOR] Bundle steering averages decoder rows into one direction
 
@@ -522,7 +526,7 @@ Ordered by what most threatens a defensible result.
 8. Null models for geometry probes and the shared-subspace spectrum (2.2).
 9. Make held-out (cross-family/cross-template) AUC the headline; demote in-sample AUC (2.1).
 10. Fix answer scoring: score the letter A/B/C, or length-normalize `answer_logprob` (1.3, 2.4).
-11. Restrict headline steering to `exact` contrast mapping; stratify by mapping confidence (3.4).
+11. Restrict headline steering to `exact` contrast mapping; stratify by mapping confidence (3.4 — FIX LANDED 2026-05-27, commit `56a5f7e`).
 12. Audit every contrast/alias identity ID against the dataset; make missing-ID skips loud (4.1).
 13. Reduce the inference grid: one test per feature, not per feature×alpha×position (2.6).
 14. Drop `--smoke`; raise bootstrap/permutation budgets and per-cell minimums (2.7).

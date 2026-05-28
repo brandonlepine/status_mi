@@ -63,13 +63,16 @@ Convert raw BBQ JSONL benchmark rows into a steering-ready dataset by (a) normal
 - Re-prepare with the chosen mode, then rerun [Step 19](19_extract_bbq_token_level_sae_activations.md) and [Step 20](20_run_bbq_sae_steering.md).
 - Record the chosen mode and headline numbers in the methods writeup as the audit-required "baseline precondition" section.
 
-### 3.4 [MAJOR] — BBQ→SAE contrast mapping silently uses axis-fallback
+### 3.4 [MAJOR] — BBQ→SAE contrast mapping silently uses axis-fallback (FIX LANDED 2026-05-27)
 
-**What's wrong:** `map_contrast` falls back from exact-pair matching to "any same-axis contrast that touches either identity", labeling the result `fallback_axis`. A BBQ item about `race_arab vs race_white` can therefore be associated with features selected for `race_black vs race_white`. `run_bbq_sae_steering.py` keeps confidence ∈ `{exact, alias, fallback_axis}` by default and `analyze_bbq_feature_level_causal_effects.py` treats `mapped_contrast_name` as the relevant contrast.
+**Status:** Closed in commit `56a5f7e` ([Step 20](20_run_bbq_sae_steering.md)). The mapping logic in this script (`map_contrast`) is unchanged — it still emits the three labels `{exact, fallback_axis, unmapped}`. The downstream steering runner is what flipped:
 
-**Why it matters:** "Feature X is implicated in bias for *this* identity contrast" is the main causal claim. `fallback_axis` breaks the feature-to-example specificity needed to support that claim while leaving the data looking clean.
+- `--include_unmapped` boolean replaced with `--mapping_confidence_filter {exact, exact_and_fallback, all}` (default `exact`). Headline runs silently drop `fallback_axis` rows.
+- `mapped_contrast_confidence` is stamped on every steering output row, so `analyze_bbq_feature_level_causal_effects.py` can stratify any effect table by mapping confidence with a `groupby`.
 
-**Targeted fix:** Make `mapped_contrast_confidence` a first-class headline filter. In this script, also emit a `bbq_prepare_confidence_breakdown.csv` listing each `(category_raw, axis_mapped) → {exact: N, fallback_axis: M, unmapped: K}` so the user can audit coverage at prepare-time. Downstream (Step 20, Step 23), restrict headline results to `exact` and stratify everything else by mapping confidence.
+**Optional follow-up (still open, lower priority):** emit a `bbq_prepare_confidence_breakdown.csv` from this script listing each `(category_raw, axis_mapped) → {exact: N, fallback_axis: M, unmapped: K}` so the operator can audit coverage at prepare-time without running the downstream steering. The runner already prints the breakdown to stdout under the new filter, so this is convenience, not correctness.
+
+**Original audit (preserved):** `map_contrast` falls back from exact-pair matching to "any same-axis contrast that touches either identity", labeling the result `fallback_axis`. A BBQ item about `race_arab vs race_white` could therefore be associated with features selected for `race_black vs race_white`. The prior `run_bbq_sae_steering.py` default kept confidence ∈ `{exact, alias, fallback_axis}` and `analyze_bbq_feature_level_causal_effects.py` treated `mapped_contrast_name` as the relevant contrast — feature-to-example specificity broken, data looked clean. "Feature X is implicated in bias for *this* identity contrast" is the main causal claim, and the fallback path broke that specificity.
 
 ### 4.1 [MAJOR] — Contrast lists reference identities that do not exist — silently skipped
 

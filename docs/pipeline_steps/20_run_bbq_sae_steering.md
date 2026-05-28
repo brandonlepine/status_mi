@@ -11,7 +11,7 @@ Run a grid of steering interventions on the prepared BBQ examples, where each in
 
 ## Inputs
 - Llama model directory and OpenMOSS SAE directory.
-- `prepared/bbq_prepared_examples.parquet` — Step 18 output. Filtered (unless `--include_unmapped`) to rows with `mapped_contrast_confidence ∈ {exact, alias, fallback_axis}` (`alias` is never actually produced; see Step 18 notes).
+- `prepared/bbq_prepared_examples.parquet` — Step 18 output. Filtered by `--mapping_confidence_filter` (default `exact`; choices `exact`, `exact_and_fallback`, `all`). Audit 3.4 closed 2026-05-27 in commit `56a5f7e`; `mapped_contrast_confidence` is stamped on every output row so the analyzer can stratify regardless of which filter was used.
 - `results/.../triage/intervention_candidate_features_triaged.csv` — the feature pool. Filtered by `keep_for_intervention == True` and the requested `--layers`.
 
 ## Outputs
@@ -179,15 +179,17 @@ The same problem now applies to the new `--intervention_modes clamp` and `--inte
 - Add an `intervention_section` column to the output (`context`, `question`, `answer_option`, `final`) recording where the intervened token actually fell. Audit the distribution.
 - Consider renaming the positions to be section-explicit: `target_identity_last_context_token`, `stereotype_language_last_question_token`, etc.
 
-### 3.4 [MAJOR] — BBQ→SAE contrast mapping silently uses axis-fallback
+### 3.4 [MAJOR] — BBQ→SAE contrast mapping silently uses axis-fallback (FIX LANDED 2026-05-27)
 
-**What's wrong:** The default filter keeps `mapped_contrast_confidence ∈ {exact, alias, fallback_axis}`. The `fallback_axis` path means a BBQ row about `race_arab vs race_white` can be steered with features selected for `race_black vs race_white`, and the downstream analyzer treats `mapped_contrast_name` as the relevant contrast for that example. Full discussion in [Step 18](18_prepare_bbq_for_steering.md) issue 3.4.
+**Status:** Closed in commit `56a5f7e`.
 
-**Why it matters here:** This script is where the contamination becomes part of the causal results. Once a row is stamped with a fallback-mapped contrast, it is indistinguishable in `results_parts/*.parquet` from an `exact` row unless `mapped_contrast_confidence` is carried through and stratified on.
+**What landed:**
+- `--include_unmapped` boolean replaced with `--mapping_confidence_filter` (default `exact`; choices `exact`, `exact_and_fallback`, `all`). Headline runs use the default and silently drop `fallback_axis` rows. Operators who want fallback rows for a stratified analysis pass `exact_and_fallback`; full inclusive passes `all`. The runner prints the kept-row count and per-confidence breakdown to stdout so the operator sees what was dropped.
+- `mapped_contrast_confidence` is stamped on every output row in `steering_output_row` (next to `mapped_contrast_name`). `results_parts/*.parquet` now carries the column natively — stratifying any effect table in [Step 23](23_analyze_bbq_feature_level_causal_effects.md) by mapping confidence is a single `groupby` away.
 
-**Targeted fix:**
-- For headline results, change the default keep-list to `exact` only. Make `--include_fallback_axis` an explicit opt-in.
-- Always carry `mapped_contrast_confidence` into the output row (it is implicitly available through `prepared`-merging but not currently stamped on each `results_parts` row). Add it to `steering_output_row`.
+**Behavior change:** previously, `--include_unmapped` unset kept `{exact, alias, fallback_axis}` (effectively `{exact, fallback_axis}` since `alias` never actually flows out of `map_contrast`). Under the new default the runner keeps `exact` only. Anyone relying on the prior superset for a comparison run passes `--mapping_confidence_filter exact_and_fallback`.
+
+**Original audit (preserved):** The default filter kept `mapped_contrast_confidence ∈ {exact, alias, fallback_axis}`. The `fallback_axis` path meant a BBQ row about `race_arab vs race_white` could be steered with features selected for `race_black vs race_white`, and the downstream analyzer treated `mapped_contrast_name` as the relevant contrast for that example. Once a row was stamped with a fallback-mapped contrast, it was indistinguishable in `results_parts/*.parquet` from an `exact` row unless `mapped_contrast_confidence` was carried through and stratified on — and it wasn't. Full discussion in [Step 18](18_prepare_bbq_for_steering.md) issue 3.4.
 
 ### 3.5 [MINOR] — Bundle steering averages decoder rows into one direction
 
@@ -205,7 +207,7 @@ The same problem now applies to the new `--intervention_modes clamp` and `--inte
 - [ ] Add a `direction_baselines` control that steers with the difference-of-means contrast direction from `analyze_identity_geometry.py` — same prompts, same alphas, same positions. This is the SAE-vs-linear-direction comparison the paper needs (5.5).
 - [ ] Switch default `--scoring_mode` to a new `letter` mode (` A`/` B`/` C`); keep `first_token` for backward compatibility but mark deprecated. Length-normalize `answer_logprob` for argmax/accuracy.
 - [ ] Restrict identity- and stereotype-language position search to the prepared `context` (and optionally `question`) span; stamp the actual section onto each output row.
-- [ ] Change default keep-list to `exact`-only; carry `mapped_contrast_confidence` into every `results_parts` row.
+- [x] Change default keep-list to `exact`-only; carry `mapped_contrast_confidence` into every `results_parts` row. *(Done 2026-05-27: commit `56a5f7e` — `--mapping_confidence_filter` default `exact`; column stamped on each output row.)*
 - [ ] Scale `alpha` (and the new `--clamp_value`) to either a multiple of the feature's own `p95` (now unblocked by the 3.1 fix) or a fixed fraction of the layer-position residual RMS norm; record the scaling constant in `steering_config.json`.
 - [ ] Add `intervention_section` column to the output ∈ `{context, question, answer_option, final}`.
 - [ ] Deprecate bundle modes for headline results; keep them only as joint-clamp diagnostics once 3.1 lands.
