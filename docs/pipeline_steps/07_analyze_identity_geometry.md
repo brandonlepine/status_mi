@@ -18,6 +18,7 @@ First-pass characterization of identity geometry from the final-token residual s
 - `results/geometry/.../family_stability/family_cosines_layer_XX.csv`, `family_cosines_summary.csv`
 - `results/geometry/.../contrasts/contrast_scores.csv` (in-sample), `contrast_family_holdout_scores.csv`
 - `results/geometry/.../contrasts/contrast_projection_scores_layer_XX.csv` (only for `PROJECTION_LAYERS = {0, 8, 16, 24, 32}`)
+- `results/geometry/.../contrasts/contrast_directions_layer_XX.npz` — per-layer .npz of unit-norm difference-of-means contrast directions, keyed by `"layer{LL}_{identity_a}_vs_{identity_b}"` → float32 `(d_model,)`. Consumed by [Step 20](20_run_bbq_sae_steering.md)'s `direction_baseline` intervention mode for the audit-5.5 head-to-head SAE-vs-linear-direction comparison. Added 2026-05-27 in commit `8f84e5e`.
 - `results/geometry/.../run_config.json`
 
 ## Key implementation details

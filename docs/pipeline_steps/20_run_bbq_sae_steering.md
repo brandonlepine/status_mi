@@ -96,7 +96,7 @@ At `final_prompt_token` only, for each `(example, feature_set, alpha)`:
 - New torch primitives in [Step 5 — `encode_identity_saes.py`](05_encode_identity_saes.md): `ablate_features`, `clamp_features`, `steer_features`, plus the wrapper `patched_residual_with_intervention(h, sae, intervention_fn)` that runs the full loop. The wrapper accounts for the audit 1.4 dataset-wise normalization: `decode_full` un-scales the reconstruction back to residual space, so the patch math operates on the model's natural hidden-state scale. SAE reconstruction error cancels in the delta because only the change induced by the intervention is added.
 - This script now exposes `install_feature_intervention_hook` + `install_batched_feature_intervention_hook`. The forward hook on `model.model.layers[layer-1]` captures `h`, encodes through the corrected JumpReLU encoder, applies the intervention (ablate / clamp / steer), decodes back to residual space, and patches the residual with the delta.
 - `make_batched_hook_fn` / `make_hook_fn` are dispatch factories that take `mode` and return the right hook closure. Legacy modes (`add_vector`, `ablate_projection`) still get the precomputed decoder direction; feature modes pass the full SAE and `feature_ids` / `signs` through.
-- `--intervention_modes` default changed from `add_vector` to **`ablate`** (audit's recommended primary causal test; no alpha grid needed). Valid modes: `{add_vector, ablate_projection, ablate, clamp, steer}`. Startup validation raises on unknown modes.
+- `--intervention_modes` default changed from `add_vector` to **`ablate`** (audit's recommended primary causal test; no alpha grid needed). Valid modes: `{add_vector, ablate_projection, ablate, clamp, steer, direction_baseline}`. Startup validation raises on unknown modes. `direction_baseline` is the audit-5.5 linear-baseline mode added 2026-05-27 in commit `a11cbb8` — see the 5.5 section below.
 - `--clamp_value` flag added (required when `clamp` is in `--intervention_modes`). In normalized latent space units; user looks up the per-feature target in `feature_stats.csv` (p95 / p99 / max).
 - `alpha_grid_for_mode` special-cases `ablate` / `clamp` to a single alpha=0 sentinel; the alpha grid only sweeps for `steer` / `add_vector` / `ablate_projection`.
 - Vector cache build is skipped when no legacy mode is requested and controls are disabled.
@@ -116,7 +116,31 @@ python scripts/run_bbq_sae_steering.py \
 # Comparison: legacy decoder-direction add_vector run alongside ablate.
 python scripts/run_bbq_sae_steering.py \
     --intervention_modes ablate,add_vector ...
+
+# Audit 5.5 head-to-head: SAE feature ablation vs the linear baseline.
+python scripts/run_bbq_sae_steering.py \
+    --intervention_modes ablate,direction_baseline \
+    --direction_baselines_path /workspace/status_mi/results/geometry/.../contrasts
 ```
+
+### 5.5 [MAJOR] — Linear-baseline mode for "does the SAE beat a single direction?" (FIX LANDED 2026-05-27)
+
+**Status:** Closed in commits `8f84e5e` (Step 7 persists contrast directions) + `a11cbb8` (Step 20 adds the mode + dispatch + loader). The RunPod head-to-head run is the remainder.
+
+**What landed:**
+- New intervention mode `direction_baseline`: `h += alpha * vec` at the chosen positions, where `vec` is the unit-norm difference-of-means contrast direction loaded from [Step 7](07_analyze_identity_geometry.md)'s `contrast_directions_layer_*.npz`. Same hook plumbing as `add_vector`; the mode string differs so output rows can be stratified.
+- New CLI flag `--direction_baselines_path` (Path | None). Required when `direction_baseline` is in `--intervention_modes`. Accepts either a single `.npz` file or a directory of `contrast_directions_layer_*.npz` files.
+- `load_contrast_directions(path)` reads the .npz(s) and returns `{(layer, contrast_name): unit-norm direction}`. `make_direction_baseline_vector(directions, fs, device)` looks up the direction by `(fs.layer, fs.contrast_name)`. Bundle-mode feature sets (empty contrast_name) are skipped with a logged warning — the baseline is defined per-contrast.
+- `make_batched_hook_fn` and `make_hook_fn` gain a `baseline_vector` kwarg; when the mode is `direction_baseline` they route through `install_hook` / `install_batched_hook` (same hooks as `add_vector`).
+- Output rows stamped with `intervention_mode = "direction_baseline"` so the downstream analyzer can stratify SAE-feature effects vs DoM-direction effects on the same prompts.
+
+**Validation (synthetic):**
+- Loader round-trips multi-layer .npz directory and returns unit-norm vectors. Missing-contrast lookup → None (warning + skip). Bundle FeatureSet (empty contrast_name) → None.
+- End-to-end hook math: `direction_baseline` with a known baseline_vec produces `hidden[:, positions, :] += alpha * baseline_vec` with max diff = 0.00 from expected.
+
+**Remaining (RunPod):** Run `--intervention_modes ablate,direction_baseline` against the (audit-1.4 re-encoded) feature pool. The analyzer can then answer "for each (layer, contrast), does the SAE feature ablation produce a stronger bias-reducing effect than the linear direction at the same positions?" If SAE features do not beat the DoM direction, the paper should be reframed around directions instead — the audit's framing note flags this as load-bearing for the SAE story.
+
+**Original audit (preserved):** Throughout the project, the difference-of-means contrast direction was computed *and* SAE features were computed, but they were never put in head-to-head competition as *interventions*. The key scientific question for an SAE-based paper is "does decomposing into SAE features buy anything over a single linear direction?" — and there was no path to answer it.
 
 ### 2.3 [BLOCKER] — Steering controls are disabled in the production run
 
@@ -132,7 +156,7 @@ The whole "feature X is causally implicated" claim requires effect(X) ≫ effect
 **Targeted fix:**
 - Re-enable controls for the final run by removing `--disable_controls` from the production command.
 - If cost is the bottleneck: run controls on a stratified subsample of `(example, feature)` pairs rather than dropping them. Cost dominates with per-example, per-alpha controls; batching `random_feature_matched` across feature sets (since the vector is independent of the kept feature set) can amortize cost.
-- Add a fourth control: the **raw difference-of-means contrast direction** from the geometry pipeline (`analyze_identity_geometry.py` / `analyze_identity_sae_features.py:decoder_alignment`), steered identically. If SAE features do not beat the difference-of-means direction, the SAE is not adding causal value over a linear probe (see issue 5.5). Pre-compute these directions per contrast and pass them in via a new `--direction_baselines_path` argument.
+- Add a fourth control: the **raw difference-of-means contrast direction** from the geometry pipeline. ✅ **Closed 2026-05-27 (audit 5.5)** — the new `direction_baseline` mode loads pre-computed contrast directions from Step 7's `contrast_directions_layer_*.npz` via `--direction_baselines_path` and steers identically. Run `--intervention_modes ablate,direction_baseline` for the head-to-head. If SAE features do not beat the DoM direction, the SAE is not adding causal value over a linear probe and the paper should be reframed around directions.
 
 ### 1.3 [MAJOR] — First-token answer scoring is degenerate for BBQ answers
 
