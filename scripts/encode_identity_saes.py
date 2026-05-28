@@ -429,15 +429,28 @@ def ablate_features(latent: torch.Tensor, feature_ids: torch.Tensor | list[int])
 
 
 def clamp_features(
-    latent: torch.Tensor, feature_ids: torch.Tensor | list[int], value: float
+    latent: torch.Tensor,
+    feature_ids: torch.Tensor | list[int],
+    value: float | torch.Tensor | list[float],
 ) -> torch.Tensor:
-    """Clamp the specified latent features to a fixed value (normalized space).
-    Use with feature_stats.csv p95/p99/max to amplify a feature beyond its
-    typical activation — the audit's recommended amplification primitive
-    (audit 3.2 makes the amplitude interpretable per-feature)."""
+    """Clamp the specified latent features to a target value (normalized space).
+
+    `value` may be a scalar (the same clamp target for every feature) OR a
+    1-D tensor / list aligned with `feature_ids` (a per-feature target). The
+    per-feature form is the audit-3.2 amplitude fix: pass
+    `multiplier * feature_stats[f].{p95|p99|max}` so "clamp to the 95th
+    percentile of this feature's own activation" is comparable across
+    features whose natural activation magnitudes differ by orders of
+    magnitude. A single scalar is NOT comparable across features."""
     if not isinstance(feature_ids, torch.Tensor):
         feature_ids = torch.as_tensor(feature_ids, dtype=torch.long, device=latent.device)
     modified = latent.clone()
+    if isinstance(value, (list, tuple)):
+        value = torch.as_tensor(value, dtype=modified.dtype, device=modified.device)
+    elif isinstance(value, torch.Tensor):
+        value = value.to(dtype=modified.dtype, device=modified.device)
+    # A scalar broadcasts over (..., n_features); a (n_features,) tensor
+    # broadcasts over the leading (batch, position) dims.
     modified[..., feature_ids] = value
     return modified
 
@@ -445,27 +458,36 @@ def clamp_features(
 def steer_features(
     latent: torch.Tensor, feature_ids: torch.Tensor | list[int], alpha: float,
     signs: torch.Tensor | list[float] | None = None,
+    scale: torch.Tensor | list[float] | None = None,
 ) -> torch.Tensor:
-    """Add `alpha * sign_i` to each feature_id's latent activation
-    (NORMALIZED-space units). With `signs=None` the same `alpha` is added to
-    every feature; otherwise `signs[i]` scales the per-feature addition (e.g.
-    +1 / -1 from the contrast's direction_side).
+    """Add `alpha * scale_i * sign_i` to each feature_id's latent activation
+    (NORMALIZED-space units). With `signs=None` no sign is applied; with
+    `scale=None` the same `alpha` is added to every feature.
 
-    Note on units: alpha is in the same units as the latent activations
-    themselves, which means it is NOT directly comparable across features —
-    a feature whose typical activation is ~1 is amplified more by alpha=2
-    than a feature whose typical activation is ~100. Use clamp_features
-    with a p95-derived value for cross-feature comparable amplification.
+    Audit 3.2: pass a per-feature `scale` (1-D, aligned with `feature_ids`,
+    typically `feature_stats[f].{p95|p99|max}`) so that `alpha` becomes a
+    *multiple of each feature's own natural activation scale* rather than a
+    raw normalized-space increment. Without `scale`, alpha is NOT comparable
+    across features — a feature whose typical activation is ~1 is amplified
+    far more by alpha=2 than a feature whose typical activation is ~100.
     """
     if not isinstance(feature_ids, torch.Tensor):
         feature_ids = torch.as_tensor(feature_ids, dtype=torch.long, device=latent.device)
     modified = latent.clone()
-    if signs is None:
-        modified[..., feature_ids] = modified[..., feature_ids] + alpha
-    else:
+    delta = torch.as_tensor(float(alpha), dtype=modified.dtype, device=modified.device)
+    if scale is not None:
+        if not isinstance(scale, torch.Tensor):
+            scale = torch.as_tensor(scale, dtype=modified.dtype, device=modified.device)
+        else:
+            scale = scale.to(dtype=modified.dtype, device=modified.device)
+        delta = delta * scale
+    if signs is not None:
         if not isinstance(signs, torch.Tensor):
             signs = torch.as_tensor(signs, dtype=modified.dtype, device=modified.device)
-        modified[..., feature_ids] = modified[..., feature_ids] + alpha * signs
+        else:
+            signs = signs.to(dtype=modified.dtype, device=modified.device)
+        delta = delta * signs
+    modified[..., feature_ids] = modified[..., feature_ids] + delta
     return modified
 
 

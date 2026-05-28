@@ -61,6 +61,22 @@ BASELINE_INTERVENTION_MODES = {"direction_baseline", "probe_baseline"}
 ALL_INTERVENTION_MODES = LEGACY_INTERVENTION_MODES | FEATURE_INTERVENTION_MODES | BASELINE_INTERVENTION_MODES
 VECTOR_HOOK_MODES = LEGACY_INTERVENTION_MODES | BASELINE_INTERVENTION_MODES  # all modes that route through install_hook
 
+# Audit 3.2: a uniform clamp_value / alpha is not comparable across features
+# because features differ by orders of magnitude in natural activation scale.
+# --feature_scale_stat picks a per-feature scale column from feature_stats.csv
+# (written per layer by encode_identity_saes.py). The clamp target then becomes
+# `multiplier * scale[f]` and the steer increment `alpha * sign * scale[f]`, so
+# the grid value ("how many p95s") means the same thing for every feature.
+# `none` keeps the legacy uniform behavior (clamp uses --clamp_value; steer uses
+# raw alpha). `ablate` is unaffected (it sets the latent to exactly 0).
+FEATURE_SCALE_STAT_COLUMN = {
+    "p95": "p95_activation",
+    "p99": "p99_activation",
+    "max": "max_activation",
+    "mean_nonzero": "mean_activation_nonzero",
+}
+FEATURE_SCALE_STATS = {"none", *FEATURE_SCALE_STAT_COLUMN.keys()}
+
 
 DEFAULT_MODEL_PATH = Path("/workspace/status_mi/models/llama-3.1-8b")
 DEFAULT_SAE_DIR = Path("/workspace/status_mi/saes/openmoss/Llama3_1-8B-Base-LXR-32x")
@@ -174,9 +190,54 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help=(
-            "Value to clamp feature(s) to when --intervention_modes includes 'clamp'. "
-            "In NORMALIZED latent space units. For per-feature p95/p99-based "
-            "amplification, look up the value in feature_stats.csv and pass it here."
+            "Value to clamp feature(s) to when --intervention_modes includes 'clamp' "
+            "AND --feature_scale_stat=none (the legacy uniform path). In NORMALIZED "
+            "latent space units, applied identically to every feature (audit 3.2 "
+            "warns this is not comparable across features). When --feature_scale_stat "
+            "is a stat (the default p95), --clamp_value is ignored and the per-feature "
+            "clamp target is built from feature_stats.csv instead."
+        ),
+    )
+    parser.add_argument(
+        "--feature_scale_stat",
+        default="p95",
+        choices=sorted(FEATURE_SCALE_STATS),
+        help=(
+            "Audit 3.2: per-feature activation scale used to make the clamp target "
+            "and steer increment comparable across features. Picks a column from "
+            "feature_stats.csv (requires --feature_stats_dir): 'p95'/'p99' = that "
+            "percentile of the feature's nonzero activations, 'max' = its observed "
+            "maximum, 'mean_nonzero' = its mean nonzero activation. With a stat, "
+            "clamp target = clamp_multiplier * scale[f] and steer increment = "
+            "alpha * sign * scale[f]. 'none' keeps the legacy uniform behavior "
+            "(clamp uses --clamp_value; steer adds raw alpha). 'ablate' is "
+            "unaffected by this flag (it always sets the latent to exactly 0). "
+            "Default 'p95' makes the amplitude interpretable; pass 'none' to "
+            "reproduce pre-3.2 runs."
+        ),
+    )
+    parser.add_argument(
+        "--feature_stats_dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory holding per-layer feature stats as layer_<NN>/feature_stats.csv "
+            "(the encode_identity_saes.py output dir). Required when "
+            "--feature_scale_stat is not 'none'. Used to build the per-feature clamp "
+            "target / steer scale (audit 3.2)."
+        ),
+    )
+    parser.add_argument(
+        "--clamp_multipliers",
+        type=str,
+        default="1.0",
+        help=(
+            "Audit 3.2: comma-separated grid of multipliers applied to the per-feature "
+            "scale to form clamp targets when --intervention_modes includes 'clamp' and "
+            "--feature_scale_stat is a stat. e.g. '1.0,2.0,4.0' clamps each feature to "
+            "1x/2x/4x its own p95. Each multiplier is a distinct job and is recorded in "
+            "the output row's 'alpha' column. Ignored when --feature_scale_stat=none "
+            "(clamp then runs once at --clamp_value)."
         ),
     )
     parser.add_argument(
@@ -716,22 +777,112 @@ def install_hook(model, layer: int, vector: torch.Tensor, positions: list[int], 
     return module.register_forward_hook(hook)
 
 
+def load_feature_stats_lookup(
+    feature_stats_dir: Path, layer: int, stat: str
+) -> dict[int, float]:
+    """Audit 3.2: load the per-feature activation scale for one layer.
+
+    Reads `feature_stats_dir/layer_<NN>/feature_stats.csv` (written by
+    encode_identity_saes.py) and returns {feature_id: scale} for the chosen
+    `stat` column. Raises if the file or column is missing — a missing scale
+    table would otherwise silently collapse every clamp target to the
+    fallback, so we fail loudly instead."""
+    if stat == "none":
+        return {}
+    column = FEATURE_SCALE_STAT_COLUMN[stat]
+    path = feature_stats_dir / f"layer_{layer:02d}" / "feature_stats.csv"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"--feature_scale_stat={stat} needs {path}, but it does not exist. "
+            f"Point --feature_stats_dir at the encode_identity_saes.py output dir "
+            f"(which holds layer_<NN>/feature_stats.csv), or pass "
+            f"--feature_scale_stat none to use the uniform --clamp_value path."
+        )
+    df = pd.read_csv(path)
+    if "feature_id" not in df.columns or column not in df.columns:
+        raise ValueError(
+            f"{path} is missing required columns; expected 'feature_id' and "
+            f"{column!r}, found {list(df.columns)}."
+        )
+    return dict(zip(df["feature_id"].astype(int), df[column].astype(float)))
+
+
+def feature_scale_for_set(
+    lookup: dict[int, float],
+    feature_ids: list[int],
+    stat: str,
+    set_id: str = "",
+    logger: logging.Logger | None = None,
+) -> list[float] | None:
+    """Audit 3.2: build the per-feature scale list aligned with `feature_ids`.
+
+    Returns None when stat=='none' (signals the uniform legacy path to the
+    intervention builders). Features absent from feature_stats.csv get scale
+    0.0; features whose stat is non-positive (dead / rare, or fillna(0)) also
+    yield 0.0 — both make the clamp target / steer increment collapse to ~0
+    (≈ no-op, or ≈ ablate for clamp). These are silent-failure modes against
+    real saved stats, so we count and warn; scripts/audit_feature_scale.py
+    checks the same condition pre-run on RunPod."""
+    if stat == "none":
+        return None
+    scales: list[float] = []
+    missing: list[int] = []
+    nonpositive: list[int] = []
+    for fid in feature_ids:
+        v = lookup.get(int(fid))
+        if v is None:
+            v = 0.0
+            missing.append(int(fid))
+        elif not (v > 0):
+            v = float(v)
+            nonpositive.append(int(fid))
+        scales.append(float(v))
+    if logger and missing:
+        logger.warning(
+            "feature_scale (%s) for set %s: %d/%d feature_ids absent from "
+            "feature_stats.csv -> scale=0 (clamp target / steer increment "
+            "collapses to ~0 for those features): %s",
+            stat, set_id or "?", len(missing), len(feature_ids), missing[:10],
+        )
+    if logger and nonpositive:
+        logger.warning(
+            "feature_scale (%s) for set %s: %d/%d feature_ids have a "
+            "non-positive %s -> scale<=0 (degenerate amplitude): %s",
+            stat, set_id or "?", len(nonpositive), len(feature_ids), stat, nonpositive[:10],
+        )
+    return scales
+
+
 def _build_intervention_fn(
     mode: str,
     feature_ids: torch.Tensor,
     signs: torch.Tensor | None,
     alpha: float,
     clamp_value: float | None,
+    scale: torch.Tensor | None = None,
 ):
-    """Build the latent -> latent intervention closure for a feature-level mode."""
+    """Build the latent -> latent intervention closure for a feature-level mode.
+
+    Audit 3.2: when `scale` is provided (a per-feature tensor aligned with
+    `feature_ids`), clamp targets each feature to `alpha * scale[f]` (alpha is
+    the clamp multiplier) and steer adds `alpha * sign[f] * scale[f]`, so the
+    grid value is comparable across features. When `scale` is None the legacy
+    uniform behavior applies (clamp uses the scalar clamp_value; steer adds raw
+    alpha). `ablate` ignores both."""
     if mode == "ablate":
         return lambda latent: ablate_features(latent, feature_ids)
     if mode == "clamp":
+        if scale is not None:
+            target = alpha * scale  # per-feature clamp target = multiplier * scale[f]
+            return lambda latent: clamp_features(latent, feature_ids, target)
         if clamp_value is None:
-            raise ValueError("--clamp_value is required when --intervention_modes includes 'clamp'.")
+            raise ValueError(
+                "--clamp_value is required when --intervention_modes includes 'clamp' "
+                "and --feature_scale_stat=none."
+            )
         return lambda latent: clamp_features(latent, feature_ids, clamp_value)
     if mode == "steer":
-        return lambda latent: steer_features(latent, feature_ids, alpha, signs)
+        return lambda latent: steer_features(latent, feature_ids, alpha, signs, scale=scale)
     raise ValueError(f"Unknown feature intervention mode: {mode!r}")
 
 
@@ -745,6 +896,7 @@ def install_feature_intervention_hook(
     mode: str,
     alpha: float = 0.0,
     clamp_value: float | None = None,
+    scale: list[float] | None = None,
 ):
     """Audit 3.1: the encode -> modify-latent-f -> decode -> patch hook.
 
@@ -755,6 +907,9 @@ def install_feature_intervention_hook(
     specified `feature_ids`, decodes back to residual space, and adds
     only the delta to the original residual. SAE reconstruction error
     cancels in the delta.
+
+    Audit 3.2: `scale` (per-feature, aligned with `feature_ids`) makes the
+    clamp/steer amplitude comparable across features; None = legacy uniform.
     """
     if layer <= 0:
         raise ValueError("Steering hooks require layer >= 1 because LkR maps to post-block k.")
@@ -762,8 +917,9 @@ def install_feature_intervention_hook(
     device = next(model.parameters()).device
     fid = torch.as_tensor(feature_ids, dtype=torch.long, device=device)
     sgn = None if signs is None else torch.as_tensor(signs, dtype=torch.float32, device=device)
+    scl = None if scale is None else torch.as_tensor(scale, dtype=torch.float32, device=device)
     pos = torch.as_tensor(positions, dtype=torch.long, device=device)
-    intervention = _build_intervention_fn(mode, fid, sgn, alpha, clamp_value)
+    intervention = _build_intervention_fn(mode, fid, sgn, alpha, clamp_value, scale=scl)
 
     def hook(_module, _inputs, output):
         hidden = output[0] if isinstance(output, tuple) else output
@@ -788,16 +944,19 @@ def install_batched_feature_intervention_hook(
     mode: str,
     alpha: float = 0.0,
     clamp_value: float | None = None,
+    scale: list[float] | None = None,
 ):
     """Per-example variant of install_feature_intervention_hook. Applies the
-    encode -> modify -> decode -> patch only at this example's `positions`."""
+    encode -> modify -> decode -> patch only at this example's `positions`.
+    Audit 3.2: `scale` is the per-feature amplitude scale (None = uniform)."""
     if layer <= 0:
         raise ValueError("Steering hooks require layer >= 1 because LkR maps to post-block k.")
     module = model.model.layers[layer - 1]
     device = next(model.parameters()).device
     fid = torch.as_tensor(feature_ids, dtype=torch.long, device=device)
     sgn = None if signs is None else torch.as_tensor(signs, dtype=torch.float32, device=device)
-    intervention = _build_intervention_fn(mode, fid, sgn, alpha, clamp_value)
+    scl = None if scale is None else torch.as_tensor(scale, dtype=torch.float32, device=device)
+    intervention = _build_intervention_fn(mode, fid, sgn, alpha, clamp_value, scale=scl)
 
     def hook(_module, _inputs, output):
         hidden = output[0] if isinstance(output, tuple) else output
@@ -844,6 +1003,7 @@ def make_batched_hook_fn(
     clamp_value: float | None,
     baseline_vector: torch.Tensor | None = None,
     probe_vector: torch.Tensor | None = None,
+    scale: list[float] | None = None,
 ) -> Callable[[], object]:
     """Dispatch factory: returns a no-arg callable that installs the right
     hook for the chosen intervention mode. Legacy modes (add_vector,
@@ -851,7 +1011,8 @@ def make_batched_hook_fn(
     feature modes (ablate, clamp, steer) use the full SAE for the
     encode -> modify -> decode -> patch loop (audit 3.1); baseline modes
     (direction_baseline, probe_baseline; audit 5.5) use the matching
-    baseline vector loaded from Step 7."""
+    baseline vector loaded from Step 7. `scale` (audit 3.2) is the per-feature
+    amplitude scale for clamp/steer (None = uniform)."""
     if mode in LEGACY_INTERVENTION_MODES:
         if vector is None:
             raise RuntimeError(f"vector was not built for legacy mode {mode!r}.")
@@ -869,7 +1030,7 @@ def make_batched_hook_fn(
     if mode in FEATURE_INTERVENTION_MODES:
         return lambda: install_batched_feature_intervention_hook(
             model, fs.layer, sae, fs.feature_ids, fs.signs, positions_by_example, mode,
-            alpha=alpha, clamp_value=clamp_value,
+            alpha=alpha, clamp_value=clamp_value, scale=scale,
         )
     raise ValueError(f"Unknown intervention mode: {mode!r}; expected one of {sorted(ALL_INTERVENTION_MODES)}.")
 
@@ -885,9 +1046,11 @@ def make_hook_fn(
     clamp_value: float | None,
     baseline_vector: torch.Tensor | None = None,
     probe_vector: torch.Tensor | None = None,
+    scale: list[float] | None = None,
 ) -> Callable[[], object]:
     """Non-batched variant of make_batched_hook_fn for the per-example
-    scoring paths (answer_logprob scoring iterates one prompt at a time)."""
+    scoring paths (answer_logprob scoring iterates one prompt at a time).
+    `scale` (audit 3.2) is the per-feature amplitude scale (None = uniform)."""
     if mode in LEGACY_INTERVENTION_MODES:
         if vector is None:
             raise RuntimeError(f"vector was not built for legacy mode {mode!r}.")
@@ -905,17 +1068,32 @@ def make_hook_fn(
     if mode in FEATURE_INTERVENTION_MODES:
         return lambda: install_feature_intervention_hook(
             model, fs.layer, sae, fs.feature_ids, fs.signs, positions, mode,
-            alpha=alpha, clamp_value=clamp_value,
+            alpha=alpha, clamp_value=clamp_value, scale=scale,
         )
     raise ValueError(f"Unknown intervention mode: {mode!r}; expected one of {sorted(ALL_INTERVENTION_MODES)}.")
 
 
-def alpha_grid_for_mode(mode: str, alphas: list[float]) -> list[float]:
-    """ablate and clamp modes don't use the alpha grid (the audit's primary
-    causal test is just ablation; clamp uses --clamp_value). Run them once
-    with a sentinel alpha so downstream output rows have a consistent
-    schema. add_vector / ablate_projection / steer use the full alpha grid."""
-    if mode in {"ablate", "clamp"}:
+def alpha_grid_for_mode(
+    mode: str,
+    alphas: list[float],
+    clamp_multipliers: list[float] | None = None,
+    feature_scaled: bool = False,
+) -> list[float]:
+    """Grid of per-job amplitude knobs for a mode.
+
+    - ablate: always a single sentinel (0.0) — the audit's primary causal test
+      needs no grid.
+    - clamp: a single sentinel (0.0) under the legacy uniform path
+      (--feature_scale_stat=none, clamp uses --clamp_value); under audit-3.2
+      per-feature scaling it sweeps `clamp_multipliers` (each multiplier is its
+      own job, recorded in the output row's 'alpha' column as "how many p95s").
+    - add_vector / ablate_projection / steer: the full --alphas grid.
+    """
+    if mode == "ablate":
+        return [0.0]
+    if mode == "clamp":
+        if feature_scaled and clamp_multipliers:
+            return list(clamp_multipliers)
         return [0.0]
     return alphas
 
@@ -1490,6 +1668,22 @@ def flush_completed_jobs(done_path: Path, completed_buffer: list[dict[str, objec
     completed_buffer.clear()
 
 
+def jobs_per_example_for_modes(
+    alphas: list[float],
+    positions: list[str],
+    intervention_modes: list[str],
+    clamp_multipliers: list[float] | None = None,
+    feature_scaled: bool = False,
+) -> int:
+    """Per-example main-job count, summing each mode's own grid length (audit
+    3.2: clamp may sweep the multiplier grid; ablate/clamp-uniform are 1)."""
+    per_mode = sum(
+        len(alpha_grid_for_mode(m, alphas, clamp_multipliers, feature_scaled))
+        for m in intervention_modes
+    )
+    return max(1, len(positions) * per_mode)
+
+
 def count_pending_main_jobs(
     prepared: pd.DataFrame,
     feature_sets: list[FeatureSet],
@@ -1500,6 +1694,8 @@ def count_pending_main_jobs(
     scoring_mode: str,
     done: set[str],
     axis_match_mode: str,
+    clamp_multipliers: list[float] | None = None,
+    feature_scaled: bool = False,
 ) -> int:
     pending = 0
     for fs in feature_sets:
@@ -1508,18 +1704,27 @@ def count_pending_main_jobs(
         fs_prepared = eligible_prepared_for_feature_set(prepared, fs, axis_match_mode)
         for _, row in fs_prepared.iterrows():
             uid = row["bbq_uid"]
-            for alpha in alphas:
-                for pos_name in positions:
-                    for mode in intervention_modes:
+            for pos_name in positions:
+                for mode in intervention_modes:
+                    for alpha in alpha_grid_for_mode(mode, alphas, clamp_multipliers, feature_scaled):
                         jid = job_id([uid, fs.layer, fs.set_id, alpha, pos_name, mode, scoring_mode])
                         if jid not in done:
                             pending += 1
     return pending
 
 
-def checkpoint_job_threshold(save_every_examples: int, alphas: list[float], positions: list[str], intervention_modes: list[str]) -> int:
+def checkpoint_job_threshold(
+    save_every_examples: int,
+    alphas: list[float],
+    positions: list[str],
+    intervention_modes: list[str],
+    clamp_multipliers: list[float] | None = None,
+    feature_scaled: bool = False,
+) -> int:
     """Convert the user-facing example checkpoint interval into a job-row threshold."""
-    jobs_per_example = max(1, len(alphas) * len(positions) * len(intervention_modes))
+    jobs_per_example = jobs_per_example_for_modes(
+        alphas, positions, intervention_modes, clamp_multipliers, feature_scaled
+    )
     return max(1, int(save_every_examples) * jobs_per_example)
 
 
@@ -1536,6 +1741,8 @@ def steering_output_row(
     base_lengths: np.ndarray | None = None,
     inter_lengths: np.ndarray | None = None,
     scoring_mode: str = "",
+    feature_scale_stat: str = "none",
+    feature_scale_value: float = float("nan"),
 ) -> dict[str, object]:
     out = {
         "bbq_uid": row_s["bbq_uid"],
@@ -1544,6 +1751,13 @@ def steering_output_row(
         "intervention_mode": mode,
         "intervention_position": pos_name,
         "intervention_section": intervention_section,  # audit 3.3: where the chosen token landed
+        # Audit 3.2: which feature_stats column scaled the amplitude (or 'none'),
+        # and the per-feature scale value for single-feature sets (NaN for
+        # bundles and for ablate/uniform). For clamp, the effective per-feature
+        # target = alpha * feature_scale_value; for steer, the per-feature
+        # increment = alpha * sign * feature_scale_value.
+        "feature_scale_stat": feature_scale_stat,
+        "feature_scale_value": feature_scale_value,
         "feature_set_mode": fs.mode,
         "feature_set_id": fs.set_id,
         "feature_ids_json": json.dumps(fs.feature_ids),
@@ -1578,6 +1792,18 @@ def steering_output_row(
     return out
 
 
+def scale_value_for_row(scale: list[float] | None, fs: FeatureSet, mode: str) -> float:
+    """Audit 3.2: the single-feature scale to stamp on an output row.
+
+    Returns the feature's scale only when (a) per-feature scaling is active,
+    (b) the mode actually uses it (clamp/steer), and (c) the set is a single
+    feature (so one scalar is meaningful). Otherwise NaN — bundles vary
+    per-feature, and ablate/uniform don't scale at all."""
+    if scale is None or mode not in {"clamp", "steer"}:
+        return float("nan")
+    return float(scale[0]) if len(fs.feature_ids) == 1 else float("nan")
+
+
 def run_first_token_batched_feature_set(
     model,
     tokenizer,
@@ -1600,6 +1826,7 @@ def run_first_token_batched_feature_set(
     n_feature_sets: int,
     baseline_vector: torch.Tensor | None = None,
     probe_vector: torch.Tensor | None = None,
+    scale: list[float] | None = None,
 ) -> tuple[int, int]:
     n_done = 0
     # Audit 1.3: dispatch the batched scorer by mode. 'letter' (the new default)
@@ -1607,6 +1834,9 @@ def run_first_token_batched_feature_set(
     # the first token of the answer text.
     score_batch_fn = score_letter_batch if args.scoring_mode == "letter" else score_first_token_batch
     batch_size = max(1, int(args.batch_size))
+    # Audit 3.2: per-feature scaling state for clamp/steer amplitude grids.
+    feature_scaled = scale is not None
+    clamp_multipliers = parse_floats(args.clamp_multipliers)
     for batch_start in range(0, len(fs_prepared), batch_size):
         batch_df = fs_prepared.iloc[batch_start:batch_start + batch_size].copy()
         row_series = [pd.Series(row._asdict()) for row in batch_df.itertuples(index=False)]
@@ -1616,9 +1846,10 @@ def run_first_token_batched_feature_set(
         for pos_name in positions:
             positions_by_example = [positions_for(tokenizer, prompt, row, 512, pos_name) for prompt, row in zip(prompts, row_series)]
             for mode in intervention_modes:
-                # ablate/clamp ignore the alpha grid; the audit's primary
-                # causal test is just ablation. See alpha_grid_for_mode.
-                for alpha in alpha_grid_for_mode(mode, alphas):
+                # ablate ignores the alpha grid (the audit's primary causal
+                # test is just ablation); clamp sweeps the multiplier grid
+                # under audit-3.2 per-feature scaling, else a single sentinel.
+                for alpha in alpha_grid_for_mode(mode, alphas, clamp_multipliers, feature_scaled):
                     pending_indices = []
                     for batch_idx, row in enumerate(row_series):
                         jid = job_id([row["bbq_uid"], fs.layer, fs.set_id, alpha, pos_name, mode, args.scoring_mode])
@@ -1644,12 +1875,15 @@ def run_first_token_batched_feature_set(
                         alpha=alpha, mode=mode, clamp_value=args.clamp_value,
                         baseline_vector=baseline_vector,
                         probe_vector=probe_vector,
+                        scale=scale,
                     )
                     start = time.perf_counter()
                     inter_scores = score_batch_fn(
                         model, tokenizer, prompts, answers_batch, 512, hook_fn=hook_fn,
                     )
                     runtime = (time.perf_counter() - start) / max(1, len(pending_indices))
+                    row_scale_value = scale_value_for_row(scale, fs, mode)
+                    row_scale_stat = args.feature_scale_stat if (feature_scaled and mode in {"clamp", "steer"}) else "none"
                     for batch_idx, jid in pending_indices:
                         # Audit 3.3: stamp where the chosen position landed, per row.
                         section_label = position_section_for(
@@ -1661,6 +1895,8 @@ def run_first_token_batched_feature_set(
                             base_scores[batch_idx], inter_scores[batch_idx], runtime,
                             intervention_section=section_label,
                             scoring_mode=args.scoring_mode,
+                            feature_scale_stat=row_scale_stat,
+                            feature_scale_value=row_scale_value,
                         )
                         part_rows.append(out)
                         completed_buffer.append({"job_id": jid, "completed_at": datetime.now(timezone.utc).isoformat()})
@@ -1824,9 +2060,35 @@ def main() -> None:
             f"Expected one or more of {sorted(ALL_INTERVENTION_MODES)}. "
             "Audit 3.1: 'ablate' is the audit-preferred primary causal test."
         )
-    if "clamp" in intervention_modes and args.clamp_value is None:
+    # Audit 3.2: per-feature amplitude scaling for clamp/steer.
+    feature_scaled = args.feature_scale_stat != "none"
+    clamp_multipliers = parse_floats(args.clamp_multipliers)
+    if feature_scaled and args.feature_stats_dir is None:
         raise ValueError(
-            "--clamp_value is required when --intervention_modes includes 'clamp'."
+            f"--feature_scale_stat={args.feature_scale_stat} requires --feature_stats_dir "
+            "(the encode_identity_saes.py output dir holding layer_<NN>/feature_stats.csv). "
+            "Pass --feature_scale_stat none to use the uniform --clamp_value path."
+        )
+    if "clamp" in intervention_modes:
+        if feature_scaled:
+            if not clamp_multipliers:
+                raise ValueError(
+                    "--intervention_modes includes 'clamp' with per-feature scaling "
+                    f"(--feature_scale_stat={args.feature_scale_stat}), but --clamp_multipliers "
+                    "is empty. Pass e.g. --clamp_multipliers 1.0,2.0,4.0."
+                )
+        elif args.clamp_value is None:
+            raise ValueError(
+                "--clamp_value is required when --intervention_modes includes 'clamp' "
+                "and --feature_scale_stat=none. (Or pass --feature_scale_stat p95 with "
+                "--feature_stats_dir and --clamp_multipliers for per-feature targets.)"
+            )
+    if feature_scaled:
+        logger.info(
+            "Audit 3.2: per-feature amplitude scaling ON (stat=%s, stats_dir=%s). "
+            "clamp target = multiplier * scale[f] over multipliers=%s; "
+            "steer increment = alpha * sign * scale[f] over alphas=%s. ablate unaffected.",
+            args.feature_scale_stat, args.feature_stats_dir, clamp_multipliers, alphas,
         )
     config = vars(args).copy()
     config.update({k: str(v) for k, v in config.items() if isinstance(v, Path)})
@@ -1866,7 +2128,11 @@ def main() -> None:
         fs.set_id: len(eligible_prepared_for_feature_set(prepared, fs, args.axis_match_mode))
         for fs in feature_sets
     }
-    expected = sum(eligible_counts.values()) * len(alphas) * len(positions) * len(intervention_modes)
+    # Audit 3.2: each mode contributes its own grid length (clamp may sweep
+    # the multiplier grid), so sum per-mode rather than assume len(alphas).
+    expected = sum(eligible_counts.values()) * jobs_per_example_for_modes(
+        alphas, positions, intervention_modes, clamp_multipliers, feature_scaled
+    )
     logger.info(
         "Prepared examples: %d; feature sets: %d/%d after axis_match_mode=%s; expected main steering jobs: %d",
         len(prepared),
@@ -1887,7 +2153,10 @@ def main() -> None:
     done_path = args.output_dir / "completed_jobs.jsonl"
     done = completed_jobs(done_path, logger) if args.resume else set()
     logger.info("Resume metadata loaded before model weights: %d completed jobs", len(done))
-    checkpoint_threshold = checkpoint_job_threshold(args.save_every_examples, alphas, positions, intervention_modes)
+    checkpoint_threshold = checkpoint_job_threshold(
+        args.save_every_examples, alphas, positions, intervention_modes,
+        clamp_multipliers, feature_scaled,
+    )
     logger.info(
         "Checkpoint cadence: every %d examples ~= %d main job rows",
         args.save_every_examples,
@@ -1903,6 +2172,8 @@ def main() -> None:
         args.scoring_mode,
         done,
         args.axis_match_mode,
+        clamp_multipliers,
+        feature_scaled,
     )
     logger.info("Pending main steering jobs after resume filtering: %d", pending_main_jobs)
 
@@ -1923,6 +2194,9 @@ def main() -> None:
     part_idx = len(list((args.output_dir / "results_parts").glob("part_*")))
     sae_cache = {}
     vector_cache = {}
+    # Audit 3.2: per-layer feature_stats lookup cache for per-feature amplitude
+    # scaling. Empty (and unused) when --feature_scale_stat=none.
+    feature_stats_cache: dict[int, dict[int, float]] = {}
     # Audit 5.5: load the diff-of-means baseline directions if direction_baseline
     # is in the requested modes. Empty dict otherwise (lookups safely return None).
     direction_baselines: dict[tuple[int, str], np.ndarray] = {}
@@ -1985,6 +2259,20 @@ def main() -> None:
                 logger.info("Loading SAE for layer %02d", fs.layer)
                 sae_cache[fs.layer] = load_sae(args.sae_dir, fs.layer, hidden_dim, device, dtype)
             sae = sae_cache[fs.layer]
+            # Audit 3.2: per-feature amplitude scale aligned with fs.feature_ids,
+            # from this layer's feature_stats.csv. None under the legacy uniform
+            # path (--feature_scale_stat=none). Same scale for every example /
+            # position / alpha of this feature set, so compute once here.
+            fs_scale: list[float] | None = None
+            if feature_scaled:
+                if fs.layer not in feature_stats_cache:
+                    feature_stats_cache[fs.layer] = load_feature_stats_lookup(
+                        args.feature_stats_dir, fs.layer, args.feature_scale_stat
+                    )
+                fs_scale = feature_scale_for_set(
+                    feature_stats_cache[fs.layer], fs.feature_ids,
+                    args.feature_scale_stat, fs.set_id, logger,
+                )
             # Only build the decoder-direction vector when at least one
             # legacy intervention mode is in play (audit 3.1: feature
             # modes don't need a precomputed vector — they go through the
@@ -2050,6 +2338,7 @@ def main() -> None:
                     len(feature_sets),
                     baseline_vector=baseline_vector,
                     probe_vector=probe_vector,
+                    scale=fs_scale,
                 )
                 n_done += added
                 continue
@@ -2070,8 +2359,11 @@ def main() -> None:
                 for pos_name in positions:
                     pos = positions_for(tokenizer, prompt, row_s, 512, pos_name)
                     for mode in intervention_modes:
-                        # ablate/clamp don't sweep alpha — see alpha_grid_for_mode.
-                        for alpha in alpha_grid_for_mode(mode, alphas):
+                        # ablate doesn't sweep alpha; clamp sweeps the multiplier
+                        # grid under audit-3.2 scaling. See alpha_grid_for_mode.
+                        row_scale_value = scale_value_for_row(fs_scale, fs, mode)
+                        row_scale_stat = args.feature_scale_stat if (feature_scaled and mode in {"clamp", "steer"}) else "none"
+                        for alpha in alpha_grid_for_mode(mode, alphas, clamp_multipliers, feature_scaled):
                             jid = job_id([row_s["bbq_uid"], fs.layer, fs.set_id, alpha, pos_name, mode, args.scoring_mode])
                             if jid in done:
                                 continue
@@ -2094,6 +2386,7 @@ def main() -> None:
                                 clamp_value=args.clamp_value,
                                 baseline_vector=baseline_vector,
                                 probe_vector=probe_vector,
+                                scale=fs_scale,
                             )
                             inter = score_fn(model, tokenizer, prompt, answers, 512, hook_fn=hook_fn)
                             section_label = position_section_for(tokenizer, prompt, row_s, 512, pos)
@@ -2104,6 +2397,8 @@ def main() -> None:
                                 base_lengths=answer_lens_for_row,
                                 inter_lengths=answer_lens_for_row,
                                 scoring_mode=args.scoring_mode,
+                                feature_scale_stat=row_scale_stat,
+                                feature_scale_value=row_scale_value,
                             )
                             part_rows.append(out)
                             completed_buffer.append({"job_id": jid, "completed_at": datetime.now(timezone.utc).isoformat()})
