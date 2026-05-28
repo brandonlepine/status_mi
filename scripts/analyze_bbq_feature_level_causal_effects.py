@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import json
 import logging
@@ -67,6 +68,24 @@ def parse_args() -> argparse.Namespace:
     # these for fast dev runs only and must not be used for headline numbers.
     parser.add_argument("--bootstrap_samples", type=int, default=10000)
     parser.add_argument("--permutation_samples", type=int, default=10000)
+    parser.add_argument(
+        "--holdout_frac", type=float, default=0.5,
+        help="Audit 2.5: fraction of BBQ examples (per axis, keyed on bbq_uid) held "
+             "out as the CONFIRMATION set. Features are ranked on the complementary "
+             "selection set; reported effect sizes/CIs/q-values come from the "
+             "confirmation set, so headline numbers are not post-selection (winner's "
+             "curse) estimates. Default 0.5.",
+    )
+    parser.add_argument(
+        "--holdout_seed", type=int, default=0,
+        help="Audit 2.5: salt for the deterministic selection/confirmation split.",
+    )
+    parser.add_argument(
+        "--disable_holdout", action="store_true",
+        help="Audit 2.5: disable the selection/confirmation split and report the "
+             "pooled (winner's-curse-prone) estimate. For diagnostics only — headline "
+             "numbers should keep the split on.",
+    )
     parser.add_argument(
         "--headline_alpha", type=float, default=None,
         help="Audit 2.6: the single pre-registered intervention amplitude at which "
@@ -560,18 +579,96 @@ def feature_inference_table(expanded: pd.DataFrame, args: argparse.Namespace, lo
     if table.empty:
         return table
     table["headline_alpha"] = ha
-    table = _apply_power_filter_and_fdr(table, args, logger, n_col="n_examples")
+    table = _apply_power_filter_and_fdr(table, args, logger, n_cols=("n_examples",))
+    return table
+
+
+def assign_holdout_split(df: pd.DataFrame, frac_confirmation: float, seed: int) -> pd.Series:
+    """Audit 2.5: deterministically assign each BBQ example to 'selection' or
+    'confirmation'. The split is keyed on bbq_uid (so the same example lands in
+    the same half for every feature — selection and confirmation are disjoint
+    example sets) and salted by `seed`. Hashing gives ~frac_confirmation per axis
+    by the law of large numbers; the caller logs the realized per-axis balance."""
+    def bucket(uid: object) -> float:
+        h = hashlib.sha1(f"{seed}|{uid}".encode()).hexdigest()[:12]
+        return (int(h, 16) % 10_000_000) / 10_000_000
+    buckets = df["bbq_uid"].map(bucket)
+    return np.where(buckets < frac_confirmation, "confirmation", "selection")
+
+
+def feature_inference_with_holdout(
+    expanded: pd.DataFrame, args: argparse.Namespace, logger: logging.Logger,
+) -> pd.DataFrame:
+    """Audit 2.5: the held-out version of feature_inference_table.
+
+    Features are RANKED on the selection half and the reported effect sizes,
+    CIs, and q-values come from the disjoint confirmation half — so the headline
+    numbers are not the post-selection (winner's-curse) estimates. Unit, alpha
+    resolution, polarity pooling, power floor, and FDR strata match
+    feature_inference_table; the only change is that estimation and selection
+    use different examples.
+    """
+    if expanded.empty:
+        return expanded.copy()
+    ha = resolve_headline_alpha(expanded, args, logger)
+    if ha is None:
+        return expanded.iloc[0:0].copy()
+    sub = expanded[pd.to_numeric(expanded["alpha"], errors="coerce") == ha].copy()
+    if "control_type" in sub.columns:
+        sub = sub[sub["control_type"].astype(str).eq("kept_feature")].copy()
+    if sub.empty:
+        logger.warning("Audit 2.5: no kept_feature rows at headline_alpha=%s; feature_inference empty.", ha)
+        return sub
+    sub["holdout_split"] = assign_holdout_split(sub, args.holdout_frac, args.holdout_seed)
+    # Per-axis balance report (audit 2.5: "even a 50/50 split per axis works").
+    if "axis_mapped" in sub.columns:
+        bal = (
+            sub.drop_duplicates("bbq_uid")
+            .groupby(["axis_mapped", "holdout_split"])["bbq_uid"].nunique()
+            .unstack(fill_value=0)
+        )
+        logger.info("Audit 2.5: held-out example balance per axis (selection vs confirmation):\n%s", bal.to_string())
+    unit_cols = [c for c in HEADLINE_UNIT_COLS if c in sub.columns]
+
+    sel = summarize_effects(sub[sub["holdout_split"].eq("selection")], unit_cols, args)
+    conf = summarize_effects(sub[sub["holdout_split"].eq("confirmation")], unit_cols, args)
+    if sel.empty or conf.empty:
+        logger.warning("Audit 2.5: one held-out half is empty (frac=%s); falling back to pooled inference.", args.holdout_frac)
+        return feature_inference_table(expanded, args, logger)
+
+    # Selection half contributes ONLY the ranking effect + its n; everything
+    # reported (means, CI, p) comes from the confirmation half.
+    sel_keep = sel[unit_cols + ["mean_signed_stereotype_preference_delta", "n_examples"]].rename(
+        columns={
+            "mean_signed_stereotype_preference_delta": "selection_mean_signed_stereotype_preference_delta",
+            "n_examples": "n_selection",
+        }
+    )
+    conf = conf.rename(columns={
+        "n_examples": "n_confirmation",
+        "p_value_bootstrap_or_permutation": "p_value_confirmation",
+    })
+    table = conf.merge(sel_keep, on=unit_cols, how="inner")
+    table["headline_alpha"] = ha
+    # Power floor on BOTH halves, then FDR across features on confirmation p-values.
+    table = _apply_power_filter_and_fdr(table, args, logger, n_cols=("n_confirmation", "n_selection"))
     return table
 
 
 def _apply_power_filter_and_fdr(
-    table: pd.DataFrame, args: argparse.Namespace, logger: logging.Logger, n_col: str = "n_examples",
+    table: pd.DataFrame, args: argparse.Namespace, logger: logging.Logger,
+    n_cols: tuple[str, ...] = ("n_examples",),
 ) -> pd.DataFrame:
-    """Audit 2.7 + 2.6: drop units below --min_examples_inference, then recompute
-    FDR across features within (axis, context, position) on the survivors so
-    q-values reflect the actual tested set (not the pre-filter superset)."""
+    """Audit 2.7 + 2.6: drop units below --min_examples_inference (in EVERY
+    `n_cols` count — e.g. both held-out halves), then recompute FDR across
+    features within (axis, context, position) on the survivors so q-values
+    reflect the actual tested set (not the pre-filter superset)."""
     before = len(table)
-    table = table[pd.to_numeric(table[n_col], errors="coerce").fillna(0) >= args.min_examples_inference].copy()
+    mask = pd.Series(True, index=table.index)
+    for c in n_cols:
+        if c in table.columns:
+            mask &= pd.to_numeric(table[c], errors="coerce").fillna(0) >= args.min_examples_inference
+    table = table[mask].copy()
     dropped = before - len(table)
     if dropped:
         logger.info(
@@ -631,7 +728,16 @@ def make_rankings(effects: pd.DataFrame) -> pd.DataFrame:
     # Audit 4.3: rankings sort by the polarity-signed bias metric so
     # "strongest_bias_reducing" and "strongest_bias_amplifying" mean the same
     # thing across neg- and nonneg-polarity questions.
-    bias_col = "mean_signed_stereotype_preference_delta" if "mean_signed_stereotype_preference_delta" in effects.columns else "mean_stereotype_preference_delta"
+    # Audit 2.5: RANK on the selection-half effect when a held-out split is
+    # present, so the ordering is decided on different examples than the reported
+    # confirmation-half effect sizes/CIs/q-values carried on each row. Falls back
+    # to the (pooled) confirmation/headline metric when no split column exists.
+    if "selection_mean_signed_stereotype_preference_delta" in effects.columns:
+        bias_col = "selection_mean_signed_stereotype_preference_delta"
+    elif "mean_signed_stereotype_preference_delta" in effects.columns:
+        bias_col = "mean_signed_stereotype_preference_delta"
+    else:
+        bias_col = "mean_stereotype_preference_delta"
     frames = []
     specs = [
         ("strongest_bias_reducing_features", bias_col, True),
@@ -1247,7 +1353,13 @@ def main() -> None:
     # across features within (axis, context, position). Rankings + the
     # final-candidates report consume THIS table. feature_level_effects above
     # stays as the per-(alpha, position) dose-response diagnostic.
-    feature_inference = feature_inference_table(expanded, args, logger)
+    # Audit 2.5: held-out by default (rank on selection, report on confirmation);
+    # --disable_holdout reverts to the pooled winner's-curse-prone estimate.
+    if args.disable_holdout:
+        logger.warning("Audit 2.5: --disable_holdout set — feature_inference reports POOLED estimates (post-selection bias not controlled).")
+        feature_inference = feature_inference_table(expanded, args, logger)
+    else:
+        feature_inference = feature_inference_with_holdout(expanded, args, logger)
     if not feature_inference.empty:
         feature_inference = merge_metadata(feature_inference, triage, token_summary)
     write_table(feature_inference, args.output_dir, "feature_inference")
