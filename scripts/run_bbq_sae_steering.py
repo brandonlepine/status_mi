@@ -642,6 +642,23 @@ def first_token_ids(tokenizer, answers: list[str]) -> list[int]:
     return ids
 
 
+def answer_lengths(tokenizer, answers: list[str]) -> np.ndarray:
+    """Audit 2.4: per-answer token-span length under the answer_logprob
+    scoring mode. Used to length-normalize the raw summed logprobs before
+    computing argmax / accuracy metrics; the raw sum systematically penalizes
+    longer answer spans ('Cannot be determined' is typically the longest BBQ
+    option) and biases the argmax.
+
+    Returns lengths in TOKEN units, counting the same span score_answer_logprob
+    sums over: tokens of `" " + answer` (one forward pass per answer in the
+    scorer; here we just need the length, not the logprobs)."""
+    lengths = []
+    for answer in answers:
+        toks = tokenizer(" " + str(answer), add_special_tokens=False)["input_ids"]
+        lengths.append(max(1, len(toks)))  # guard against empty tokenization
+    return np.asarray(lengths, dtype=np.float32)
+
+
 # Audit 1.3: cache the letter token IDs once per tokenizer. The prompt format
 # is `... A. {ans0} B. {ans1} C. {ans2} Answer:` so the natural continuation
 # is the letter; scoring the letter logits directly answers "which option
@@ -1298,6 +1315,9 @@ def control_output_row(
     inter_scores,
     runtime_seconds: float,
     intervention_section: str = "",
+    base_lengths: np.ndarray | None = None,
+    inter_lengths: np.ndarray | None = None,
+    scoring_mode: str = "",
 ) -> dict[str, object]:
     """Audit 2.3: assemble the steering output row for a control. Shares the
     same schema as `steering_output_row` so analyzers don't need a separate
@@ -1306,6 +1326,8 @@ def control_output_row(
         row_s, fs, spec.alpha, spec.install_mode, pos_name,
         base_scores, inter_scores, runtime_seconds,
         intervention_section=intervention_section,
+        base_lengths=base_lengths, inter_lengths=inter_lengths,
+        scoring_mode=scoring_mode,
     ))
     out["control_type"] = spec.name
     out["feature_ids_json"] = json.dumps(spec.feature_ids)
@@ -1371,10 +1393,38 @@ def choice_value(values: np.ndarray, idx: object) -> float:
     return float(values[i]) if 0 <= i < len(values) else float("nan")
 
 
-def row_metrics(base: np.ndarray, inter: np.ndarray, row: pd.Series) -> dict[str, object]:
+def row_metrics(
+    base: np.ndarray,
+    inter: np.ndarray,
+    row: pd.Series,
+    base_lengths: np.ndarray | None = None,
+    inter_lengths: np.ndarray | None = None,
+    scoring_mode: str = "",
+) -> dict[str, object]:
+    """Audit 2.4: when `base_lengths` / `inter_lengths` are provided (the
+    answer_logprob scoring mode), `predicted_*` / `correct_*` / `prediction_changed`
+    are computed on LENGTH-NORMALIZED scores (per-token mean logprob) to remove
+    the length bias under `argmax`. The raw summed logprobs are preserved on
+    the output row as `ans*_logprob_*`; the length-normalized versions are
+    added as `ans*_logprob_per_token_*` for transparency.
+
+    Within-example deltas (`stereotyped_delta`, `bias_margin_delta`, etc.)
+    already cancel length because length is constant per example, so they
+    stay raw. The single-token scoring modes (`letter`, `first_token`) call
+    row_metrics without lengths and operate identically to the prior behavior.
+    """
     deltas = inter - base
-    pred_base = int(base.argmax())
-    pred_inter = int(inter.argmax())
+    # Audit 2.4: length-normalized scores for argmax. Falls back to raw scores
+    # when no lengths provided (single-token modes) so single-token argmax is
+    # unchanged.
+    if base_lengths is not None and inter_lengths is not None:
+        base_norm = base / np.maximum(base_lengths, 1e-9)
+        inter_norm = inter / np.maximum(inter_lengths, 1e-9)
+    else:
+        base_norm = base
+        inter_norm = inter
+    pred_base = int(base_norm.argmax())
+    pred_inter = int(inter_norm.argmax())
     stereo_idx = row.get("stereotyped_answer_idx", np.nan)
     unknown_idx = row.get("unknown_answer_idx", np.nan)
     correct_idx = row.get("correct_answer_idx", np.nan)
@@ -1388,7 +1438,7 @@ def row_metrics(base: np.ndarray, inter: np.ndarray, row: pd.Series) -> dict[str
         correct_i = choice_value(inter, correct_idx)
         others_i = [inter[i] for i in range(3) if i != int(correct_idx)] if pd.notna(correct_idx) else [float("nan")]
         margin_inter = correct_i - float(np.nanmax(others_i))
-    return {
+    out: dict[str, object] = {
         "ans0_logprob_base": float(base[0]), "ans1_logprob_base": float(base[1]), "ans2_logprob_base": float(base[2]),
         "ans0_logprob_intervened": float(inter[0]), "ans1_logprob_intervened": float(inter[1]), "ans2_logprob_intervened": float(inter[2]),
         "ans0_delta": float(deltas[0]), "ans1_delta": float(deltas[1]), "ans2_delta": float(deltas[2]),
@@ -1406,7 +1456,17 @@ def row_metrics(base: np.ndarray, inter: np.ndarray, row: pd.Series) -> dict[str
         "prediction_changed": pred_base != pred_inter,
         "correct_base": bool(pd.notna(correct_idx) and pred_base == int(correct_idx)),
         "correct_intervened": bool(pd.notna(correct_idx) and pred_inter == int(correct_idx)),
+        "scoring_mode": scoring_mode,
+        "argmax_length_normalized": bool(base_lengths is not None and inter_lengths is not None),
     }
+    if base_lengths is not None and inter_lengths is not None:
+        # Audit 2.4: persist the per-token logprobs alongside the raw sums so
+        # downstream analyzers can recompute or diagnose.
+        for i in range(3):
+            out[f"ans{i}_logprob_per_token_base"] = float(base_norm[i])
+            out[f"ans{i}_logprob_per_token_intervened"] = float(inter_norm[i])
+            out[f"ans{i}_token_length"] = float(base_lengths[i])
+    return out
 
 
 def write_part(rows: list[dict[str, object]], output_dir: Path, part_idx: int) -> Path:
@@ -1473,6 +1533,9 @@ def steering_output_row(
     inter: np.ndarray,
     runtime_seconds: float,
     intervention_section: str = "",
+    base_lengths: np.ndarray | None = None,
+    inter_lengths: np.ndarray | None = None,
+    scoring_mode: str = "",
 ) -> dict[str, object]:
     out = {
         "bbq_uid": row_s["bbq_uid"],
@@ -1507,7 +1570,11 @@ def steering_output_row(
         "control_type": "wrong_axis_features" if fs.control_type == "kept_feature" and not feature_set_matches_axis(fs, row_s.get("axis_mapped", "")) else fs.control_type,
         "runtime_seconds": runtime_seconds,
     }
-    out.update(row_metrics(base, inter, row_s))
+    out.update(row_metrics(
+        base, inter, row_s,
+        base_lengths=base_lengths, inter_lengths=inter_lengths,
+        scoring_mode=scoring_mode,
+    ))
     return out
 
 
@@ -1593,6 +1660,7 @@ def run_first_token_batched_feature_set(
                             row_series[batch_idx], fs, alpha, mode, pos_name,
                             base_scores[batch_idx], inter_scores[batch_idx], runtime,
                             intervention_section=section_label,
+                            scoring_mode=args.scoring_mode,
                         )
                         part_rows.append(out)
                         completed_buffer.append({"job_id": jid, "completed_at": datetime.now(timezone.utc).isoformat()})
@@ -1690,6 +1758,7 @@ def run_first_token_batched_feature_set(
                             row_series[batch_idx], fs, spec, ctrl_pos_name,
                             base_scores[batch_idx], inter_row, runtime_ctrl,
                             intervention_section=section_label,
+                            scoring_mode=args.scoring_mode,
                         )
                         part_rows.append(out)
                         completed_buffer.append({
@@ -1989,6 +2058,15 @@ def main() -> None:
                 answers = [str(row_s.get(f"ans{i}", "")) for i in range(3)]
                 prompt = str(row_s["prompt"])
                 base = score_fn(model, tokenizer, prompt, answers, 512)
+                # Audit 2.4: precompute per-answer token lengths once per example
+                # under the answer_logprob scoring mode. The lengths don't change
+                # across (alpha, position, mode, control) so we reuse them for
+                # every output-row construction below. Single-token modes (letter,
+                # first_token) pass None and row_metrics keeps the raw-argmax behavior.
+                answer_lens_for_row = (
+                    answer_lengths(tokenizer, answers)
+                    if args.scoring_mode == "answer_logprob" else None
+                )
                 for pos_name in positions:
                     pos = positions_for(tokenizer, prompt, row_s, 512, pos_name)
                     for mode in intervention_modes:
@@ -2023,6 +2101,9 @@ def main() -> None:
                                 row_s, fs, alpha, mode, pos_name, base, inter,
                                 time.perf_counter() - start,
                                 intervention_section=section_label,
+                                base_lengths=answer_lens_for_row,
+                                inter_lengths=answer_lens_for_row,
+                                scoring_mode=args.scoring_mode,
                             )
                             part_rows.append(out)
                             completed_buffer.append({"job_id": jid, "completed_at": datetime.now(timezone.utc).isoformat()})
@@ -2086,6 +2167,9 @@ def main() -> None:
                                     row_s, fs, spec, ctrl_pos_name, base, inter,
                                     time.perf_counter() - start_control,
                                     intervention_section=section_label,
+                                    base_lengths=answer_lens_for_row,
+                                    inter_lengths=answer_lens_for_row,
+                                    scoring_mode=args.scoring_mode,
                                 )
                                 part_rows.append(out)
                                 completed_buffer.append({
