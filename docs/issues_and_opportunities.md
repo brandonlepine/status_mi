@@ -366,7 +366,19 @@ What to do: express the perturbation relative to a meaningful scale — e.g. as 
 
 **Original audit (preserved):** `prepare_bbq_for_steering.py:map_contrast` returns `exact` when the BBQ example's `(target, nontarget)` identities match an SAE contrast, otherwise `fallback_axis` (any contrast on the same axis), otherwise `unmapped`. `run_bbq_sae_steering.py` kept rows with confidence in `{exact, alias, fallback_axis}` by default. So a BBQ item about `race_arab vs race_white` could be steered with features selected for `race_black vs race_white`, and the downstream analyzer treated `mapped_contrast_name` as the relevant contrast. Feature-to-example matching is a load-bearing assumption for "this feature is implicated in *this* identity's bias"; `fallback_axis` broke it while leaving the data looking clean.
 
-### 3.5 [MINOR] Bundle steering averages decoder rows into one direction
+### 3.5 [MINOR] Bundle steering averages decoder rows into one direction (FIX LANDED 2026-05-28)
+
+**Status:** Closed in commit `9b0fac8` (`scripts/run_bbq_sae_steering.py`). Structurally **superseded by the 3.1 feature-intervention path**: a bundle feature set run under `ablate`/`clamp`/`steer` already edits all latents in the set simultaneously. This commit adds the operator-facing guard + documentation that makes that the recommended (and, under the `ablate` default, actual) bundle path; the averaged-decoder direction is retained only for the legacy modes and the 5.5 baseline.
+
+**What landed:**
+- A bundle `FeatureSet` (`per_contrast_topk` / `role_bundle`, i.e. >1 `feature_id`) flows through `install_feature_intervention_hook` with the **full** `feature_ids` list, so `ablate`/`clamp`/`steer` intervene on every latent in the set **simultaneously** — the audit's recommended "clamp this set of latents simultaneously." Under the audit-3.1 default `--intervention_modes ablate` this is already the behavior; with audit 3.2 a bundle `clamp`/`steer` scales each member latent by its **own** `feature_stats` value (per-feature, not one shared magnitude). The averaged `make_vector` direction is now reached only by the legacy `add_vector`/`ablate_projection` modes and the direction-shaped controls.
+- Soft guard in `main()`: warns when bundle feature sets will run under a legacy averaged-decoder-vector mode, pointing to the set-intervention modes (the legacy modes stay available for the audit-5.5 linear-direction baseline). `make_vector`'s docstring is marked legacy/baseline-only and notes the feature-intervention path never calls it.
+
+**No behavioral change** to the default `ablate` path or the output schema: bundles were already stamped `feature_estimate_type="feature_bundle"` (`feature_id` sentinel `-1`, `n_features_in_set` = bundle size) and the downstream analyzer tags them `feature_bundle_membership`.
+
+**Validation (synthetic, 13/13 pass):** bundle `ablate` zeros every member latent and leaves non-members untouched; bundle `clamp` with distinct per-feature 3.2 scales sets each member to `mult × scale[f]` (three **distinct** targets — proving it is not one averaged direction); the feature-intervention dispatch needs no averaged vector while legacy `add_vector` without a vector raises; bundle metadata tags `feature_bundle` / `-1` / `n=3`. No GPU / Llama / SAE exercised (the encode→decode→patch hook is unchanged from 3.1).
+
+**Original audit (preserved):**
 
 `per_contrast_topk` and `role_bundle` modes average signed decoder rows into a single vector. The downstream analyzer correctly tags these `feature_bundle_membership` and warns against single-feature claims — good. But averaging *unit-normed* rows then *re-normalizing* produces a direction whose relation to any individual feature is weak; bundle effects are hard to interpret even as "membership." With the 3.1 feature-level fix landed, bundle interventions can now be implemented as "clamp this *set* of latents simultaneously" via a multi-feature `ablate` / `clamp` call — cleaner and interpretable. Prefer that.
 

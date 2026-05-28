@@ -546,6 +546,8 @@ The first aggregate analyzer collapsed over alpha signs, feature direction, axis
 
 Per-contrast top-k runs are useful diagnostics, but they do not isolate individual features. The feature-level analyzer marks these as `feature_bundle_membership`. Individual causal claims require `--feature_set_modes per_feature`.
 
+Audit 3.5 (closed 2026-05-28): when a bundle *is* run, prefer the feature-intervention modes (`ablate`/`clamp`/`steer`) over the legacy averaged-decoder modes. Under the audit-3.1 default `--intervention_modes ablate`, a bundle is ablated as a *set* — every latent in the bundle is zeroed simultaneously, so the effect is the joint causal effect of the set rather than the effect of one re-normalized average direction (which the old `add_vector` path produced and which is hard to interpret). Under audit 3.2, a bundle `clamp`/`steer` scales each member latent by its own `feature_stats`. The runner emits a startup WARNING if a bundle set is about to run under a legacy averaged-vector mode. The production command above sidesteps this entirely with `--feature_set_modes per_feature --require_per_feature`.
+
 ### First-token scoring is a speed-oriented approximation
 
 The current long runs use `--scoring_mode first_token` for speed. This scores the first token of each answer option. For final results, `answer_logprob` is more faithful but much slower.
