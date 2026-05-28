@@ -4,11 +4,11 @@
 **Runs after:** `analyze_identity_sae_features.py`, `extract_token_level_sae_activations.py`, and optionally `analyze_shared_social_subspace.py`
 **Feeds into:** `prepare_bbq_for_steering.py` (contrast→axis map), `run_bbq_sae_steering.py` (the feature pool, via `keep_for_intervention`), `analyze_bbq_feature_level_causal_effects.py` (metadata merge)
 
-> This is the single most consequential glue script in the project. It is the only place where per-feature signal, membership, identity, token-localization, and shared-subspace metrics are joined into one table, scored, and converted into a **role label** and a `keep_for_intervention` flag. Every causal claim downstream rests on the features this script keeps. The role definitions are heuristic — see issue 5.2 — but the **selection** they imply is load-bearing.
+> This is the single most consequential glue script in the project. It is the only place where per-feature signal, membership, identity, token-localization, and shared-subspace metrics are joined into one table, scored, and converted into role-fit scores and a `keep_for_intervention` flag. Every causal claim downstream rests on the features this script keeps. After the audit 5.2 fix (2026-05-27), the **selection** is the load-bearing finding and the role labels are descriptive only; the cascade was replaced by a soft scoring head with a single-threshold keep rule. See [`docs/triage_preregistration_2026-05-27.md`](../triage_preregistration_2026-05-27.md) for the frozen weights and rule.
 
 ## Purpose
 
-For each feature × layer, build a per-feature aggregate table that combines every upstream signal source, derive four hand-weighted summary scores (`contrast_specificity_score`, `sharedness_score`, `template_artifact_score`, `polysemanticity_score`), and run a rule-based cascade that assigns each feature a `provisional_role` and a `keep_for_intervention` flag. Emits the catalog (`intervention_candidate_features_triaged.csv`) that the BBQ steering pipeline reads as its feature pool.
+For each feature × layer, build a per-feature aggregate table that combines every upstream signal source, derive four hand-weighted summary scores (`contrast_specificity_score`, `sharedness_score`, `template_artifact_score`, `polysemanticity_score`), compute a 4-vector of soft role-fit scores, and decide `keep_for_intervention` via a single-threshold rule (audit 5.2, commit `235b5f5`). Emits the catalog (`intervention_candidate_features_triaged.csv`) that the BBQ steering pipeline reads as its feature pool. The descriptive `provisional_role` (argmax of the role-fit scores) is reported but **is not load-bearing** — see [`docs/triage_preregistration_2026-05-27.md`](../triage_preregistration_2026-05-27.md).
 
 ## Inputs
 
@@ -46,30 +46,52 @@ For each layer the script computes five families of metrics, each emitted as an 
 
 These are merged into one row per (layer, feature_id) by `complete_feature_table` + `compute_scores`.
 
-### Derived scores (`compute_scores`, lines 642-689)
+### Derived scores (`compute_scores`)
 
-Each is hand-weighted with hardcoded coefficients:
+Four scores are weighted sums of upstream signals. As of audit 5.2 (commit `f306869`), the weights live in `DEFAULT_SCORE_WEIGHTS` at module level (parameterizable for the sensitivity sweep) and are pre-registered in [`docs/triage_preregistration_2026-05-27.md`](../triage_preregistration_2026-05-27.md):
 
 - `contrast_specificity_score = 0.6 · (1 − min(1, (n_axes_top − 1) / 4)) + 0.2 · top_axis_fraction + 0.2 · min(1, max|d| / 2)`
 - `sharedness_score = 0.5 · min(1, n_axes_top / 5) + 0.3 · min(1, n_contrasts_top / 10) + 0.2 · shared_pc_loading_score`
 - `template_artifact_score = 0.4 · fraction_top_template_words + 0.3 · (1 − family_entropy) + 0.2 · (1 − template_entropy) + 0.1 · (1 − identity_span_localization_score)`
 - `polysemanticity_score = 0.35 · axis_entropy + 0.35 · identity_entropy + 0.20 · token_entropy + 0.10 · (1 − top_axis_fraction)`
 
-The `entropy()` helper used by axis/identity/token entropy treats activation magnitudes as a probability distribution after L1-normalizing, which is heuristic (not a true Shannon entropy over an actual probability model).
+`axis_entropy`, `identity_entropy`, `token_entropy` are now Shannon entropy of **firing-count** categorical distributions (audit 5.2 part 1, commit `7f2c302`) — the prior implementation treated activation magnitudes as a probability mass, which is not motivated by any probability model.
 
-### The role-assignment cascade (`assign_roles`, lines 582-639)
+### Soft scoring head and keep rule (`assign_roles`)
 
-Applied **in order** per feature; first match wins:
+Audit 5.2 part 2 (commit `235b5f5`) replaced the 7-branch first-match cascade with a soft scoring head plus a single-threshold keep rule. Each feature now gets a 4-vector of role-fit scores in `[0, 1]`:
 
-1. If `max|d| < min_abs_cohens_d` **and** `max|cos| < min_abs_decoder_cosine` → **`low_signal`**, `keep=False`.
-2. Else if `template_artifact_score ≥ max_template_artifact_score_keep` (default 0.5) → **`template_or_syntax_artifact`**, `keep=False`.
-3. Else if `identity_span_localization_score ≥ identity_span_local_threshold` (default 0.7) **and** `max|d| ≥ min_abs_cohens_d` → **`identity_token_local`**, `keep=True`.
-4. Else if `final_token_integration_score ≥ final_token_integrated_threshold` (default 0.7) **and** `max|d| ≥ min_abs_cohens_d` → **`sentence_final_integrated`**, `keep=True`.
-5. Else if `sharedness_score ≥ min_sharedness_score_shared` (default 0.5) **and** `n_axes_where_top_feature ≥ 3` → **`shared_social_feature`**, `keep = (|d| ≥ thresh) AND (artifact < thresh)`.
-6. Else if `contrast_specificity_score ≥ min_contrast_specificity_keep` (default 0.5) **and** `max|d| ≥ min_abs_cohens_d` **and** `max|cos| ≥ min_abs_decoder_cosine` → **`contrast_specific_identity`**, `keep=True`.
-7. Else → **`polysemantic_or_unclear`**, `keep=False`.
+```
+role_fit_identity_token_local       = mean(span_score, norm_d, 1 − template_artifact_score)
+role_fit_sentence_final_integrated  = mean(final_score, norm_d, 1 − template_artifact_score)
+role_fit_shared_social_feature      = mean(sharedness_score, min(n_axes_top / 3, 1), 1 − template_artifact_score)
+role_fit_contrast_specific_identity = mean(contrast_specificity_score, norm_d, norm_cos, 1 − template_artifact_score)
+```
 
-After the cascade, `keep` is **anded** with `(max|d| ≥ min_abs_cohens_d) AND (template_artifact_score < max_template_artifact_score_keep)` (line 623), enforcing the floor even on the keep branches. `intervention_priority` is `"high"` if `keep AND role_confidence ≥ 0.7 AND max|d| ≥ 1.5 × min_abs_cohens_d`, else `"medium"` if `keep`, else `"low"`.
+with `norm_d = clip01(max|d| / (2 · min_abs_cohens_d))` and `norm_cos = clip01(max|cos| / (4 · min_abs_decoder_cosine))`.
+
+The keep rule is independent of the role label:
+
+```
+keep_for_intervention =
+        (not is_low_signal)
+    AND (not is_template_artifact)
+    AND (max(role_fit_*) >= --min_role_fit_keep)         # default 0.5
+    AND (max_abs_cohens_d >= --min_abs_cohens_d)         # default 0.5
+```
+
+`is_low_signal = (max|d| < --min_abs_cohens_d) AND (max|cos| < --min_abs_decoder_cosine)`. `is_template_artifact = template_artifact_score >= --max_template_artifact_score_keep`.
+
+The descriptive `provisional_role` is `argmax(role_fit_*)`, with overrides to `low_signal`, `template_or_syntax_artifact`, or `polysemantic_or_unclear` when the corresponding flag fires or no role-fit reaches `--min_role_fit_keep`. The audit's pathological case (span=0.71 vs shared=0.85 → permanently `identity_token_local`) now correctly picks `shared_social_feature` because the soft head's argmax is honest about which signal is stronger. `intervention_priority` is `"high"` if `keep AND role_confidence ≥ 0.7 AND max|d| ≥ 1.5 × min_abs_cohens_d`, else `"medium"` if `keep`, else `"low"`.
+
+### Sensitivity sweep (`--sensitivity_sweep`)
+
+Audit 5.2 part 3 (commit `f306869`). When the flag is set, the script re-runs scoring + role assignment with each threshold and each score-weight tuple element perturbed one-at-a-time by `--sensitivity_perturb_fractions` (default `0.8,0.9,1.1,1.2`). Outputs:
+
+- `triage_sensitivity_per_feature.csv`: one row per (perturbation, feature) with baseline and perturbed labels.
+- `triage_sensitivity_summary.csv`: one row per perturbation with `role_change_fraction`, `best_role_change_fraction`, `keep_change_fraction`, `delta_n_keep`, sorted descending so the most-disruptive perturbations are at the top.
+
+The BBQ-side stability check (does the kept-feature set's BBQ effect distribution change across these perturbations?) is RunPod-deferred — see the pre-registration doc.
 
 A free-text `reason` string is built per feature recording every score and threshold that fired — this is the single most useful column for understanding why a given feature was kept or dropped.
 
@@ -81,18 +103,20 @@ Filterable table of the top-100 kept features sorted by priority → confidence 
 
 > **Upstream callout — issue 1.4 (FIX LANDED; regenerate inputs).** The encoder fix in [Step 5](05_encode_identity_saes.md#14-blocker--sae-preprocessing-convention-fix-landed-2026-05-26) landed in commit `4b8851a`. This script joins per-feature metrics from `feature_selectivity_alignment_joined.csv`, `intervention_candidate_features.csv`, `feature_identity_selectivity.csv`, and the token-level activations — every one of those was produced by the broken encoder. After re-running [Step 5](05_encode_identity_saes.md) → [Step 6](06_validate_sae_hook_alignment.md) (confirm `reconstruction_fvu <= 0.15`) → [Step 13](13_analyze_identity_sae_features.md), the prior `feature_triage.csv` and `intervention_candidate_features_triaged.csv` are stale and the feature pool that drove every BBQ steering result must be rebuilt from scratch. The triage *logic* (issue 5.2) is independent.
 
-### 5.2 [MAJOR] — Triage roles are heuristic definitions, not validated findings
+### 5.2 [MAJOR] — Triage roles are heuristic definitions, not validated findings (PARTIAL FIX LANDED 2026-05-27)
 
-**What's wrong:** The four derived scores (`contrast_specificity_score`, `sharedness_score`, `template_artifact_score`, `polysemanticity_score`) are linear combinations with hand-picked weights (0.6/0.2/0.2; 0.5/0.3/0.2; 0.4/0.3/0.2/0.1; 0.35/0.35/0.20/0.10). The seven role branches use hand-picked thresholds (0.5, 0.7) on those scores. The entropy components additionally treat L1-normalized activation magnitudes as probability distributions, which is heuristic. None of these weights or thresholds were validated against a behavioral or human-labelled criterion. As an engineering filter to pick which features get steered this is fine, but presenting "we identified N `identity_token_local` features and M `shared_social_feature` features" as a **finding** mistakes a definition for a discovery.
+**Status:** Four-part fix landed across commits `7f2c302` + `235b5f5` + `f306869` + the pre-registration doc. The two **validations** of the taxonomy (behavioral criterion + inter-rater agreement) are deferred to RunPod / human labeling and recorded in the pre-registration doc as outstanding work.
 
-**Why it matters:** The role labels propagate into the steering manifest (`run_bbq_sae_steering.py:load_feature_sets` uses `role` as a column), into the per-role aggregate analyses (`analyze_bbq_feature_level_causal_effects.py:summarize_effects` groups by role), and into the published feature taxonomy in `final_intervention_candidates_table.html`. If a reviewer asks "why these thresholds and not others?" there is no answer in the code.
+**What landed (parts 1-4 of the audit's targeted-fix list):**
+1. **Pre-register the rule:** [`docs/triage_preregistration_2026-05-27.md`](../triage_preregistration_2026-05-27.md) pins the score weights, role-fit definitions, and keep-rule thresholds to the three code commits. It also reframes the kept-feature count as the only load-bearing finding and the taxonomy as descriptive unless validated.
+2. **Sensitivity analysis:** `--sensitivity_sweep` runs the full triage with each threshold and each score-weight tuple element perturbed one-at-a-time. Writes `triage_sensitivity_summary.csv` with `role_change_fraction`, `keep_change_fraction`, `delta_n_keep` per perturbation. (Commit `f306869`.)
+3. **Validation paths for the taxonomy** are recorded in the pre-registration doc:
+   - *Behavioral criterion* — `identity_token_local` features must show larger absolute `bias_margin_delta` at `target_identity_last_token` than at `final_prompt_token`, and `sentence_final_integrated` features the opposite. Paired signed-rank test on `keep_for_intervention = True` features. Requires the BBQ steering run with `--intervention_modes ablate` at multiple positions.
+   - *Inter-rater criterion* — two human labelers, stratified sample of 80 features (20 per role), Cohen's κ ≥ 0.6 against the cascade label.
+4. **Entropy probability model** rewritten as categorical entropy over firing counts (audit's "Bernoulli feature-fired rate" option). The implicit probability model is "given the feature fired somewhere, what is the probability it fired in identity / token i." (Commit `7f2c302`.)
+5. **Soft scoring head replaces the first-match cascade.** Each feature gets a 4-vector of role-fit scores; `keep_for_intervention` is a single-threshold rule on `max(role_fits) ≥ --min_role_fit_keep AND not low_signal AND not template_artifact AND max|d| ≥ --min_abs_cohens_d`. The audit's pathological case (span=0.71 vs shared=0.85 → permanently `identity_token_local`) now correctly picks `shared_social_feature`. (Commit `235b5f5`.)
 
-**Targeted fix (in priority order):**
-1. **Reframe triage strictly as feature selection**, and pre-register the cascade and thresholds in `docs/` *before* looking at BBQ results, so the rule cannot be tuned to the causal outcome. The kept-feature *count* is fine to report; the role *taxonomy* is not a finding.
-2. **Sensitivity analysis.** Sweep the four weighting tuples and the seven thresholds (e.g. ±20% per coefficient) and report the fraction of features whose role changes. If conclusions on the BBQ side are stable to reasonable perturbations, say so; if not, that is itself important to know.
-3. **If the taxonomy is a paper contribution**, validate it: (a) human inter-rater agreement on a sample of feature cards (`identity_token_local` vs `sentence_final_integrated` vs `template_or_syntax_artifact` — a labeller using the feature cards from step 15 should agree with the cascade's label), (b) a falsifiable behavioral criterion: `identity_token_local` features should show their causal effect specifically at `target_identity_last_token` position and **not** at `final_prompt_token`; `sentence_final_integrated` features should show the opposite. `analyze_bbq_feature_level_causal_effects.py` already groups by `intervention_position`, so this prediction is testable from the existing steering data once the 3.1 fix lands.
-4. **Replace `entropy()` over L1-normalized activations** with either a properly motivated probability model (e.g. activation as Bernoulli "feature fired" rate and compute Shannon entropy of that), or use a simpler concentration index (e.g. Gini, or top-k share). Document the choice.
-5. **Replace the cascade with a soft scoring head** (e.g. each feature gets a vector of "role-fit" scores; the keep decision is a separate, single-threshold rule on `selectivity ∧ not-artifact`). The cascade's first-match-wins ordering is brittle: a feature that scores 0.71 on identity-span localization and 0.85 on sharedness is permanently labeled `identity_token_local`, never `shared_social_feature`, even though sharedness is the stronger signal.
+**Why it matters (preserved):** The role labels propagate into the steering manifest (`run_bbq_sae_steering.py:load_feature_sets` uses `role` as a column), into the per-role aggregate analyses (`analyze_bbq_feature_level_causal_effects.py:summarize_effects` groups by role), and into the published feature taxonomy. Under the original cascade, "why these thresholds and not others?" had no answer in the code. Under the soft head + sensitivity sweep + pre-registration, the answer is: the thresholds are pre-registered constants, their stability is measured, and the role labels are descriptive only unless a validation passes.
 
 ### Inherited issues that flow through this script
 
@@ -112,12 +136,13 @@ These are upstream root causes whose effects are visible in this file's outputs;
 
 Do these in order:
 
-- [ ] **Pre-register** the cascade and thresholds: write the current rule into `docs/triage_rule.md`, commit, then do not change the rule after looking at BBQ results. (5.2 → main fix)
-- [ ] Add a `--sensitivity_analysis` flag that sweeps each coefficient ±20% and each threshold ±0.1, and writes `triage_sensitivity.csv` with role-stability counts. (5.2)
-- [ ] Replace the heuristic `entropy()` over L1-normalized activations with a Bernoulli-firing-rate Shannon entropy or a Gini concentration; document the choice. (5.2)
+- [x] **Pre-register** the cascade and thresholds: [`docs/triage_preregistration_2026-05-27.md`](../triage_preregistration_2026-05-27.md). (5.2 → main fix, 2026-05-27)
+- [x] Add a `--sensitivity_sweep` flag that sweeps each coefficient and each threshold and writes `triage_sensitivity_per_feature.csv` + `triage_sensitivity_summary.csv` with role-stability counts. (5.2, commit `f306869`)
+- [x] Replace the heuristic `entropy()` over L1-normalized activations with categorical entropy over firing counts; documented in [`docs/triage_preregistration_2026-05-27.md`](../triage_preregistration_2026-05-27.md) §2.4. (5.2, commit `7f2c302`)
+- [x] Move the cascade out of `assign_roles` into a soft `role_fit_*` matrix + a single keep rule; roles become continuous and the order-of-arms artefact disappears. (5.2, commit `235b5f5`)
+- [ ] Validate the role taxonomy: after the steering 3.1 fix, check whether `identity_token_local` features actually have stronger effects at `target_identity_last_token` than at `final_prompt_token`, and vice versa for `sentence_final_integrated`. Add a `validation/` subdir to capture these checks. (5.2 RunPod follow-up; criteria in [pre-registration §5.1](../triage_preregistration_2026-05-27.md#51-behavioral-criterion--position-conditional-causal-effect))
+- [ ] Inter-rater validation of role labels: 80 stratified-sample features × 2 human labelers, Cohen's κ ≥ 0.6 against the cascade label. (5.2 follow-up; criteria in [pre-registration §5.2](../triage_preregistration_2026-05-27.md#52-inter-rater-criterion--human-labelers))
 - [ ] Re-run after upstream fixes (2.5, 5.1, 5.3, 5.4, 4.1) land in `analyze_identity_sae_features.py`. The downstream `keep_for_intervention` set will change; the BBQ steering pool changes with it.
-- [ ] Validate the role taxonomy: after the steering 3.1 fix, check whether `identity_token_local` features actually have stronger effects at `target_identity_last_token` than at `final_prompt_token`, and vice versa for `sentence_final_integrated`. Add a `validation/` subdir to capture these checks. (5.2)
-- [ ] (Optional, larger refactor) Move the cascade out of `assign_roles` into a soft "role-fit-score" matrix + a single keep rule. Roles become continuous; the cascade's order-of-arms artefact disappears. (5.2)
 - [ ] Add an explicit `--feature_card_dir` arg to remove the fragile multi-path search in `feature_card_link`.
 
 ## Notes from the doc audit

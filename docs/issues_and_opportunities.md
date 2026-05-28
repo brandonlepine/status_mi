@@ -399,16 +399,21 @@ What to do: define a **polarity-signed** bias quantity, e.g. `signed_bias_delta 
 
 The reconstruction analysis is meant to answer "how much of the identity direction do k SAE features capture" — a natural and reviewable claim. As written, the numbers were not that.
 
-### 5.2 [MAJOR] Triage roles are heuristic definitions, not validated findings
+### 5.2 [MAJOR] Triage roles are heuristic definitions, not validated findings (PARTIAL FIX LANDED 2026-05-27)
 
-`triage_sae_identity_features.py` builds `template_artifact_score`, `sharedness_score`, `polysemanticity_score`, `contrast_specificity_score` as linear combinations with hand-picked weights (0.4/0.3/0.2/0.1 …) and hand-picked thresholds (0.5, 0.7), then runs a decision cascade to assign roles (`identity_token_local`, `shared_social_feature`, …) and `keep_for_intervention`.
+**Status:** Four commits landed the structural and methodological fixes (parts 1-4 of the audit's targeted-fix list). The two **validations** (behavioral criterion + inter-rater agreement) are deferred to RunPod / human labeling and tracked as outstanding work in the pre-registration doc.
 
-As an *engineering* filter to choose which features to steer, this is fine. But the roles cannot be presented as *results* ("we identified N identity-token-local features and M shared social features") — they are definitions, and the weights/thresholds are unjustified and unvalidated. The `entropy()`-based scores additionally treat activation magnitudes as if they were a probability distribution, which is heuristic.
+**What landed:**
+- **Part 1 — firing-count entropy (commit `7f2c302`):** `identity_entropy` and `token_entropy` previously called `entropy()` on raw activation magnitudes — not a motivated probability mass. Replaced with categorical entropy over firing counts: per-identity firing count = `freq_identity × n_identity`; per-token firing count = number of token-rows with `token_feature_activation > 0`. The implicit probability model is "given the feature fired somewhere, what is the probability it fired in identity / token i."
+- **Part 2 — soft scoring head (commit `235b5f5`):** the 7-branch first-match cascade is gone. Each feature now has a 4-vector of soft role-fit scores (`role_fit_identity_token_local`, `role_fit_sentence_final_integrated`, `role_fit_shared_social_feature`, `role_fit_contrast_specific_identity`), and `keep_for_intervention` is a single-threshold rule on `max(role_fit_*) >= --min_role_fit_keep AND not low_signal AND not template_artifact AND max|d| >= --min_abs_cohens_d`. The audit's pathological case (span=0.71 vs shared=0.85 → permanently `identity_token_local`) now correctly picks `shared_social_feature`. Legacy `provisional_role` survives as `argmax(role_fits)` and is documented as descriptive only.
+- **Part 3 — sensitivity sweep (commit `f306869`):** `--sensitivity_sweep` runs the full triage with each threshold and each score-weight tuple element perturbed one-at-a-time by `--sensitivity_perturb_fractions` (default `0.8,0.9,1.1,1.2`). Outputs `triage_sensitivity_per_feature.csv` and `triage_sensitivity_summary.csv` with role-change fraction, keep-change fraction, and `delta_n_keep` per perturbation. On synthetic 100-feature data the sweep ran 88 perturbations cleanly; top disruptor was `max_template_artifact_score_keep` flipping ~18% of role labels.
+- **Part 4 — pre-registration (commit pending; docs only):** `docs/triage_preregistration_2026-05-27.md` pins the score weights, role-fit definitions, and keep-rule thresholds to the three commits above. It also frames the kept-feature count as the only load-bearing finding and the taxonomy as descriptive unless one of two validations passes (see below). Any future modification of those constants after BBQ data is materialized must be recorded as a changelog entry on the pre-registration doc with date and rationale.
 
-What to do:
-- Treat triage strictly as feature *selection*, and pre-register the selection rule (so it is not tuned to the outcome).
-- If a feature *taxonomy* is a paper contribution, validate it: human inter-rater agreement on a sample of feature cards, and/or a behavioral criterion (e.g. "identity-token-local" features should show their causal effect specifically at `target_identity_last_token` and not at `final_prompt_token` — that is a testable, falsifiable prediction the steering data can check).
-- Sensitivity analysis: show conclusions are stable to reasonable changes in the weights/thresholds.
+**Remaining (validations of the taxonomy):**
+- *Behavioral criterion* — under the audit-3.1 feature-level intervention, `identity_token_local` features must show a larger absolute `bias_margin_delta` at `target_identity_last_token` than at `final_prompt_token`, and `sentence_final_integrated` features the opposite. Paired-contrast signed-rank test on `keep_for_intervention = True` features, stratified by `provisional_role`. Requires the BBQ steering run with `--intervention_modes ablate` at multiple positions.
+- *Inter-rater criterion* — two human labelers, stratified sample of 80 features (20 per role), Cohen's κ ≥ 0.6 against the cascade label. Rubric and sample list to be pre-registered as a sub-document of the triage pre-registration when the feature cards are regenerated post-1.4.
+
+**Original audit (preserved):** `triage_sae_identity_features.py` built `template_artifact_score`, `sharedness_score`, `polysemanticity_score`, `contrast_specificity_score` as linear combinations with hand-picked weights and hand-picked thresholds, then ran a decision cascade to assign roles. As an engineering filter to choose which features to steer, this was fine; but the roles could not be presented as results — they were definitions, and the weights/thresholds were unjustified and unvalidated. The `entropy()`-based scores additionally treated activation magnitudes as if they were a probability distribution, which was heuristic.
 
 ### 5.3 [MINOR] `combined_score` sums three near-duplicate, equally-weighted metrics (FIX LANDED 2026-05-27)
 
@@ -528,7 +533,7 @@ Ordered by what most threatens a defensible result.
 16. Verify intervention positions land in the intended prompt section (3.3).
 17. Tie steering magnitude to a meaningful scale (3.2).
 18. Decide intersectional BBQ handling — first-class or excluded, not flattened (4.2).
-19. Reframe triage as pre-registered *selection*; validate the taxonomy if it is a contribution (5.2).
+19. Reframe triage as pre-registered *selection*; validate the taxonomy if it is a contribution (5.2 — PARTIAL FIX LANDED 2026-05-27: firing-count entropy `7f2c302`, soft scoring head `235b5f5`, sensitivity sweep `f306869`, pre-registration doc landed; behavioral criterion + inter-rater validation deferred to RunPod).
 20. Make representation use consistent (residualized vs raw) across the SAE analysis (5.4 — FIX LANDED 2026-05-27, commit `ebfdff7`: raw end-to-end).
 21. Extract shared code into a common module with a validated contrast registry (5.10, 4.1).
 22. Multi-layer SAE coverage (5.8); consider counterfactual/patching methods (5.6, 5.7).
