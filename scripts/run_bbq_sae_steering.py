@@ -1296,6 +1296,17 @@ def make_direction_baseline_vector(
 
 
 def make_vector(sae, feature_set: FeatureSet, normalize: bool, device: torch.device, random_direction: bool = False) -> torch.Tensor:
+    """Build the averaged-decoder-direction vector for the LEGACY add_vector /
+    ablate_projection modes and the direction-shaped controls.
+
+    Audit 3.5: for a bundle feature set (>1 feature_id) this averages the
+    signed, optionally unit-normed decoder rows and re-normalizes — a single
+    direction whose relation to any individual feature is weak. It is retained
+    only for the legacy modes and the audit-5.5 linear-direction baseline; the
+    interpretable bundle intervention is to edit all latents in the set
+    simultaneously via the feature-intervention modes (ablate/clamp/steer),
+    which go through install_feature_intervention_hook with the full
+    feature_ids list and never call this function."""
     if random_direction:
         vec = torch.randn(sae.w_dec.shape[1], dtype=torch.float32)
         return (vec / vec.norm().clamp_min(1e-9)).to(device)
@@ -2124,6 +2135,27 @@ def main() -> None:
     feature_sets = filter_feature_sets_for_prepared(feature_sets, prepared, args.axis_match_mode)
     if args.max_feature_sets:
         feature_sets = feature_sets[: args.max_feature_sets]
+    # Audit 3.5: bundle feature sets (per_contrast_topk / role_bundle, i.e. more
+    # than one feature_id) are interpretable under the 3.1 feature-intervention
+    # modes (ablate/clamp/steer), which edit ALL latents in the set
+    # simultaneously. The legacy averaged-decoder-vector modes (add_vector,
+    # ablate_projection) collapse the set to one re-normalized mean direction
+    # whose relation to any individual feature is weak. Warn if a bundle will be
+    # run under a legacy mode so the operator prefers the set-intervention path.
+    n_bundle_sets = sum(1 for fs in feature_sets if len(fs.feature_ids) > 1)
+    legacy_modes_in_use = [m for m in intervention_modes if m in LEGACY_INTERVENTION_MODES]
+    if n_bundle_sets and legacy_modes_in_use:
+        logger.warning(
+            "Audit 3.5: %d bundle feature set(s) will run under legacy "
+            "averaged-decoder-vector mode(s) %s. The averaged direction's "
+            "relation to individual features is weak and bundle effects are hard "
+            "to interpret even as 'membership'. Prefer --intervention_modes "
+            "ablate/clamp/steer, which intervene on all latents in the set "
+            "simultaneously (and, under audit 3.2, scale each by its own "
+            "feature_stats). The legacy modes remain available for the audit-5.5 "
+            "linear-direction baseline comparison.",
+            n_bundle_sets, legacy_modes_in_use,
+        )
     eligible_counts = {
         fs.set_id: len(eligible_prepared_for_feature_set(prepared, fs, args.axis_match_mode))
         for fs in feature_sets
