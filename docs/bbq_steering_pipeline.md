@@ -374,7 +374,7 @@ nohup python scripts/run_bbq_sae_steering.py \
   --feature_set_modes per_feature \
   --require_per_feature \
   --intervention_positions final_prompt_token,target_identity_last_token,stereotype_language_last_token \
-  --scoring_mode first_token \
+  --scoring_mode letter \
   --controls_subsample_frac 0.20 \
   --batch_size 16 \
   --save_every_examples 100 \
@@ -383,6 +383,8 @@ nohup python scripts/run_bbq_sae_steering.py \
 ```
 
 Audit 2.3 (closed 2026-05-28): `--disable_controls` removed from the production command and replaced with `--controls_subsample_frac 0.20`. Specificity controls now run alongside the headline in the batched first-token path (no per-example fallback needed) on a deterministic stratified 20% subsample of `(example, feature_set)` pairs. For the audit-3.1 default `--intervention_modes ablate`, the natural control `random_feature_ablate` (ablate K random features) runs automatically; pass `--intervention_modes ablate,add_vector,direction_baseline,probe_baseline` to get the direction-shaped controls too. To skip controls for smoke tests only, pass `--disable_controls` (the runner emits a startup WARNING if it's set on a non-smoke-sized run).
+
+Audit 1.3 (closed 2026-05-28): `--scoring_mode` switched from `first_token` to `letter`. The new `letter` mode scores the answer LETTERS ` A`/` B`/` C` at the final prompt position — single tokens, mutually distinct, matched to the prompt format (`A. {ans0} B. {ans1} C. {ans2} Answer:` makes the letter the natural continuation). Removes the first-token-of-noun-phrase degeneracy where two of three options had identical first-token logprobs ("The grandmother" vs "The boy" → identical "The" logprobs). The legacy `first_token` mode is preserved as a comparison option but should not be the headline; `answer_logprob` remains available as a confirmatory mode (its argmax/accuracy use is still length-biased — audit 2.4 — and headline rankings should not rely on it).
 
 Monitor:
 

@@ -52,18 +52,20 @@ Remaining work:
 - Pick the prompt mode for steering based on that diff; record the headline numbers in the methods writeup as the precondition the audit requires.
 - If even few-shot leaves the model degenerate, fall back to one of the audit's honest options: (a) frame results around logprob *margins* (still defined), or (b) reconsider scope.
 
-### 1.3 [MAJOR] First-token answer scoring is degenerate for BBQ answers
+### 1.3 [MAJOR] First-token answer scoring is degenerate for BBQ answers (FIX LANDED 2026-05-28)
 
-`run_bbq_sae_steering.py:score_first_token` scores the log-probability of the **first token of the answer text** (`first_token_ids` tokenizes `" " + answer`). BBQ answers are noun phrases; many begin with the same word (`"The grandmother"`, `"The boy"`, `"Cannot be determined"`). When two of three options share a first token, their first-token logprobs are *identical* and the metric cannot distinguish them.
+**Status:** Closed in commit `2829417` (`scripts/run_bbq_sae_steering.py`) + operational doc update in `docs/bbq_steering_pipeline.md`.
 
-Separately, the prompt presents labelled choices `A. / B. / C.` and ends with `"Answer:"`. The natural model continuation is the **letter** (` A`/` B`/` C`), but scoring targets the answer *text*. There is a mismatch between prompt design and scoring target.
+**What landed:**
+- **New scoring mode `letter`, now the default.** `score_letter` / `score_letter_batch` gather logprobs at the cached token IDs for ` A` / ` B` / ` C` — single tokens, mutually distinct, matched to the prompt format (`A. {ans0} B. {ans1} C. {ans2} Answer:`). Removes the first-token-of-noun-phrase degeneracy entirely.
+- **`answer_letter_ids(tokenizer)` helper** caches the three letter IDs per tokenizer and raises a clear `ValueError` (suggesting `--scoring_mode answer_logprob` as the fallback) if any letter tokenizes to more than one token.
+- **`--scoring_mode` choices**: `{letter, answer_logprob, first_token}`, default `letter`. Legacy `first_token` preserved for backward-compatible comparison runs.
+- **Both scoring paths dispatch by mode.** Per-example `score_fn` and batched `score_batch_fn` each pick the right scorer; the fast batched path runs for `--scoring_mode in {letter, first_token}`.
+- **`docs/bbq_steering_pipeline.md` production command** updated from `--scoring_mode first_token` to `--scoring_mode letter`.
 
-The documented production long run uses `--scoring_mode first_token`.
+**Remaining:** RunPod headline run with the new default. Audit 2.4 (length bias of `answer_logprob` argmax / accuracy) is a separate, still-open analyzer-side fix.
 
-What to do:
-- Score the answer **letters** ` A`/` B`/` C` (single tokens, mutually distinct, matched to the prompt format). This is as fast as current first-token scoring and removes the degeneracy.
-- Keep `answer_logprob` as a confirmatory mode, but length-normalize it (see 2.4).
-- Re-run; first-token-text results should be treated as preliminary.
+**Original audit (preserved):** `run_bbq_sae_steering.py:score_first_token` scored the log-probability of the first token of the answer text (`first_token_ids` tokenizes `" " + answer`). BBQ answers are noun phrases; many begin with the same word (`"The grandmother"`, `"The boy"`, `"Cannot be determined"`). When two of three options shared a first token, their first-token logprobs were identical and the metric could not distinguish them. The prompt presents labelled choices `A. / B. / C.` and ends with `"Answer:"`; the natural model continuation is the letter, but scoring targeted the answer text. The documented production long run used `--scoring_mode first_token`.
 
 ### 1.4 [BLOCKER] SAE preprocessing convention (FIX LANDED 2026-05-26; RunPod re-encode + validate pending)
 
@@ -612,7 +614,7 @@ Ordered by what most threatens a defensible result.
 7. Held-out split for feature selection vs. effect estimation (2.5 — PARTIAL FIX LANDED 2026-05-27: identity-prompt selectivity half closed in commit `4481445`; BBQ-side rankings + held-out confirmation set still open).
 8. Null models for geometry probes and the shared-subspace spectrum (2.2).
 9. Make held-out (cross-family/cross-template) AUC the headline; demote in-sample AUC (2.1).
-10. Fix answer scoring: score the letter A/B/C, or length-normalize `answer_logprob` (1.3, 2.4).
+10. Fix answer scoring: score the letter A/B/C, or length-normalize `answer_logprob` (1.3 — FIX LANDED 2026-05-28 commit `2829417`: `--scoring_mode letter` is the new default. 2.4 — still open analyzer-side fix; length-normalize for argmax/accuracy).
 11. Restrict headline steering to `exact` contrast mapping; stratify by mapping confidence (3.4 — FIX LANDED 2026-05-27, commit `56a5f7e`).
 12. Audit every contrast/alias identity ID against the dataset; make missing-ID skips loud (4.1).
 13. Reduce the inference grid: one test per feature, not per feature×alpha×position (2.6).
