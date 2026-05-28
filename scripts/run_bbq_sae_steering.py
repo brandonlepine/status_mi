@@ -188,7 +188,45 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--no_normalize_features", action="store_true")
     parser.add_argument("--max_feature_sets", type=int, default=None, help="Optional cap for quick smoke tests.")
-    parser.add_argument("--disable_controls", action="store_true", help="Skip sign-flip/random controls for quick smoke tests.")
+    parser.add_argument(
+        "--disable_controls",
+        action="store_true",
+        help=(
+            "Audit 2.3: SMOKE-TEST ONLY. Skips every specificity control "
+            "(sign_flip, random_direction_norm_matched, random_feature_matched, "
+            "random_feature_ablate) AND skips the batched first-token control "
+            "loop. Without controls the headline 'feature X is causally implicated' "
+            "claim cannot be distinguished from 'any norm-matched perturbation at "
+            "this position would shift the logits by ~this much' — do NOT pass "
+            "this flag on production runs. Use --controls_subsample_frac to "
+            "amortize cost instead. The runner emits a startup WARNING if this "
+            "flag is set on a non-smoke-sized run."
+        ),
+    )
+    parser.add_argument(
+        "--controls_subsample_frac",
+        type=float,
+        default=1.0,
+        help=(
+            "Audit 2.3 cost knob. Fraction of (example, feature_set) pairs on "
+            "which controls run. Deterministic per (bbq_uid, feature_set_id) "
+            "via SHA1 hash so resume is stable across runs. Default 1.0 (controls "
+            "run on every example). Set e.g. 0.20 to run controls on a stratified "
+            "20%% subsample of pairs — keeps the specificity claim defensible "
+            "while cutting control cost ~5x."
+        ),
+    )
+    parser.add_argument(
+        "--controls_positions",
+        default="final_prompt_token",
+        help=(
+            "Comma-separated list of positions at which to run controls. Default "
+            "'final_prompt_token' matches the prior behavior. Pass 'same_as_headline' "
+            "to run controls at every position the headline runs at (5x cost in "
+            "the default --intervention_positions, but lets the specificity claim "
+            "track each position individually)."
+        ),
+    )
     parser.add_argument("--max_examples", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--save_every_examples", type=int, default=25)
@@ -989,6 +1027,197 @@ def make_random_feature_vector(sae, n_features: int, normalize: bool, device: to
     return (vec.to(device) / vec.norm().clamp_min(1e-9), random_ids)
 
 
+def make_random_feature_ids(sae, n_features: int, seed: int) -> list[int]:
+    """Audit 2.3: pick `n_features` random SAE feature IDs disjoint from the
+    headline feature set. Used by the `random_feature_ablate` control to test
+    whether the headline ablation effect is specific to the kept features or
+    is just a property of ablating any K features."""
+    rng = np.random.default_rng(seed)
+    return rng.choice(
+        np.arange(sae.w_dec.shape[0]), size=max(1, n_features), replace=False,
+    ).astype(int).tolist()
+
+
+# Audit 2.3: a single description of how to install one control hook for one
+# (fs, alpha) tuple. The per-example and batched paths each iterate the list
+# returned by build_control_specs() and install via the existing hook plumbing.
+@dataclass
+class ControlSpec:
+    name: str                      # value for the output row's `control_type`
+    install_kind: str              # "vector" (install_hook) or "feature_intervention"
+    install_mode: str              # mode string passed to install_hook / install_feature_intervention_hook
+    feature_ids: list[int]         # written to the output row's feature_ids_json
+    signs: list[float]             # written to feature_signs_json
+    vector: torch.Tensor | None    # required when install_kind=="vector"; None otherwise
+    alpha: float                   # alpha to apply at the hook
+    clamp_value: float | None      # clamp_value for clamp-style feature interventions
+    seed: int                      # random seed used to build this control (for audit trail)
+
+
+def should_run_controls_for_pair(bbq_uid: str, fs_set_id: str, frac: float) -> bool:
+    """Audit 2.3 subsampling. Deterministic by SHA1(bbq_uid|fs_set_id) so that
+    `--resume` is stable across runs and the same (example, feature_set) pair
+    is either always or never selected. frac=1.0 returns True for every pair;
+    frac=0.0 returns False; frac=0.2 selects ~20% of pairs."""
+    if frac >= 1.0:
+        return True
+    if frac <= 0.0:
+        return False
+    key = f"{bbq_uid}|{fs_set_id}".encode()
+    # Map a stable hash to [0, 1) and compare to frac.
+    hashed = int(hashlib.sha1(key).hexdigest()[:12], 16)
+    bucket = (hashed % 10_000_000) / 10_000_000
+    return bucket < frac
+
+
+def build_control_specs(
+    fs: FeatureSet,
+    intervention_modes: set[str],
+    sae,
+    args: argparse.Namespace,
+    alpha: float,
+    pos_name: str,
+    seed_input: str,
+    device: torch.device,
+) -> list[ControlSpec]:
+    """Audit 2.3: enumerate the controls that apply to this (fs, mode, alpha)
+    situation. Returns a list of ControlSpec; the caller iterates and installs
+    each via install_hook / install_feature_intervention_hook.
+
+    Coupling rationale:
+      - DIRECTION-shaped headlines (add_vector, ablate_projection,
+        direction_baseline, probe_baseline) get the three direction-shaped
+        controls (sign_flip, random_direction_norm_matched, random_feature_matched).
+      - FEATURE-INTERVENTION headlines (ablate, clamp, steer) get
+        `random_feature_ablate` — the specificity question becomes "is the
+        effect specific to THESE features, or would ablating K random features
+        produce the same shift?" — which is what the audit's whole point
+        about SAE causal claims requires under the audit-3.1 default.
+
+    `seed_input` is a stable string (typically a job_id derivative) used to
+    seed the per-control RNG; the same (control_name, fs, alpha, pos, example)
+    tuple produces the same random features / vector across re-runs.
+    """
+    specs: list[ControlSpec] = []
+    has_direction_headline = any(
+        m in {"add_vector", "ablate_projection", "direction_baseline", "probe_baseline"}
+        for m in intervention_modes
+    )
+    has_feature_headline = any(
+        m in {"ablate", "clamp", "steer"} for m in intervention_modes
+    )
+
+    def seed_for(name: str) -> int:
+        return int(hashlib.sha1(f"{seed_input}|{name}".encode()).hexdigest()[:8], 16)
+
+    if has_direction_headline:
+        # sign_flip: same SAE-derived direction vector, negated.
+        s = seed_for("sign_flip")
+        vec = -make_vector(sae, fs, not args.no_normalize_features, device)
+        specs.append(ControlSpec(
+            name="sign_flip", install_kind="vector", install_mode="add_vector",
+            feature_ids=list(fs.feature_ids), signs=[-x for x in fs.signs],
+            vector=vec, alpha=alpha, clamp_value=None, seed=s,
+        ))
+        # random_direction_norm_matched: random unit vector in residual stream.
+        s = seed_for("random_direction_norm_matched")
+        torch.manual_seed(s)
+        vec = make_vector(sae, fs, not args.no_normalize_features, device, random_direction=True)
+        specs.append(ControlSpec(
+            name="random_direction_norm_matched", install_kind="vector", install_mode="add_vector",
+            feature_ids=list(fs.feature_ids), signs=list(fs.signs),
+            vector=vec, alpha=alpha, clamp_value=None, seed=s,
+        ))
+        # random_feature_matched: SAE-decoder vector built from K random features.
+        s = seed_for("random_feature_matched")
+        vec, random_ids = make_random_feature_vector(
+            sae, len(fs.feature_ids), not args.no_normalize_features, device, s,
+        )
+        specs.append(ControlSpec(
+            name="random_feature_matched", install_kind="vector", install_mode="add_vector",
+            feature_ids=random_ids, signs=list(fs.signs),
+            vector=vec, alpha=alpha, clamp_value=None, seed=s,
+        ))
+
+    if has_feature_headline:
+        # random_feature_ablate: ablate K random features. Specificity test for
+        # the audit-3.1 default headline `ablate`. Uses install_feature_intervention_hook.
+        s = seed_for("random_feature_ablate")
+        random_ids = make_random_feature_ids(sae, len(fs.feature_ids), s)
+        specs.append(ControlSpec(
+            name="random_feature_ablate", install_kind="feature_intervention",
+            install_mode="ablate",
+            feature_ids=random_ids, signs=[1.0] * len(random_ids),
+            vector=None, alpha=0.0, clamp_value=None, seed=s,
+        ))
+
+    return specs
+
+
+def install_control_hook(
+    model,
+    fs: FeatureSet,
+    sae,
+    spec: ControlSpec,
+    positions: list[int],
+):
+    """Apply a ControlSpec at one position list (single-example path)."""
+    if spec.install_kind == "vector":
+        assert spec.vector is not None
+        return install_hook(model, fs.layer, spec.vector, positions, spec.alpha, spec.install_mode)
+    if spec.install_kind == "feature_intervention":
+        return install_feature_intervention_hook(
+            model, fs.layer, sae, spec.feature_ids, spec.signs, positions, spec.install_mode,
+            alpha=spec.alpha, clamp_value=spec.clamp_value,
+        )
+    raise ValueError(f"Unknown control install_kind: {spec.install_kind!r}")
+
+
+def install_batched_control_hook(
+    model,
+    fs: FeatureSet,
+    sae,
+    spec: ControlSpec,
+    positions_by_example: list[list[int]],
+):
+    """Apply a ControlSpec across a batch (batched first-token path)."""
+    if spec.install_kind == "vector":
+        assert spec.vector is not None
+        return install_batched_hook(
+            model, fs.layer, spec.vector, positions_by_example, spec.alpha, spec.install_mode,
+        )
+    if spec.install_kind == "feature_intervention":
+        return install_batched_feature_intervention_hook(
+            model, fs.layer, sae, spec.feature_ids, spec.signs, positions_by_example,
+            spec.install_mode, alpha=spec.alpha, clamp_value=spec.clamp_value,
+        )
+    raise ValueError(f"Unknown control install_kind: {spec.install_kind!r}")
+
+
+def control_output_row(
+    row_s: pd.Series,
+    fs: FeatureSet,
+    spec: ControlSpec,
+    pos_name: str,
+    base_scores,
+    inter_scores,
+    runtime_seconds: float,
+    intervention_section: str = "",
+) -> dict[str, object]:
+    """Audit 2.3: assemble the steering output row for a control. Shares the
+    same schema as `steering_output_row` so analyzers don't need a separate
+    code path; the differentiator is `control_type`."""
+    out = dict(steering_output_row(
+        row_s, fs, spec.alpha, spec.install_mode, pos_name,
+        base_scores, inter_scores, runtime_seconds,
+        intervention_section=intervention_section,
+    ))
+    out["control_type"] = spec.name
+    out["feature_ids_json"] = json.dumps(spec.feature_ids)
+    out["feature_signs_json"] = json.dumps(spec.signs)
+    return out
+
+
 def result_feature_metadata(feature_set: FeatureSet) -> dict[str, object]:
     single = len(feature_set.feature_ids) == 1
     return {
@@ -1277,6 +1506,106 @@ def run_first_token_batched_feature_set(
                         job_bar.write(f"Checkpoint saved: {part_path} ({len(part_rows)} rows)")
                         part_idx += 1
                         part_rows.clear()
+        # Audit 2.3: batched specificity controls — runs alongside the headline
+        # in the fast first-token batched path so production can have controls
+        # without paying the per-example loop cost. One batched score per
+        # (control_spec, ctrl_pos_name); pending rows filtered by job_id (so
+        # resume is stable) and by --controls_subsample_frac.
+        if args.disable_controls:
+            continue
+        control_position_names = (
+            list(positions) if args.controls_positions == "same_as_headline"
+            else [p.strip() for p in args.controls_positions.split(",") if p.strip()]
+        )
+        for ctrl_pos_name in control_position_names:
+            if (
+                ctrl_pos_name not in positions
+                and args.controls_positions != "same_as_headline"
+            ):
+                continue
+            ctrl_positions_by_example = [
+                positions_for(tokenizer, prompt, row, 512, ctrl_pos_name)
+                for prompt, row in zip(prompts, row_series)
+            ]
+            # Spec list is per-alpha; we generate at alpha=0 for the feature-
+            # intervention `ablate` control (which ignores alpha) and at every
+            # alpha in the headline grid for direction-shaped controls.
+            for alpha_for_controls in alpha_grid_for_mode("steer", alphas):
+                seed_input_template = "|".join([
+                    str(fs.layer), fs.set_id, str(alpha_for_controls),
+                    ctrl_pos_name, str(set(intervention_modes)),
+                ])
+                # Build specs once per (alpha, position); the specs are
+                # shared across the batch.
+                specs = build_control_specs(
+                    fs, set(intervention_modes), sae, args, alpha_for_controls,
+                    ctrl_pos_name, seed_input_template, device,
+                )
+                for spec in specs:
+                    # Filter batch to (a) rows the subsample selected for
+                    # controls and (b) rows not already done at this jid.
+                    pending = []
+                    for batch_idx, row in enumerate(row_series):
+                        if not should_run_controls_for_pair(
+                            row["bbq_uid"], fs.set_id, args.controls_subsample_frac,
+                        ):
+                            continue
+                        jid = job_id([
+                            row["bbq_uid"], fs.layer, fs.set_id, alpha_for_controls,
+                            ctrl_pos_name, spec.name, args.scoring_mode,
+                        ])
+                        if jid in done:
+                            continue
+                        pending.append((batch_idx, jid))
+                    if not pending:
+                        continue
+                    job_bar.set_postfix(
+                        {
+                            "fs": f"{fs_index}/{n_feature_sets}",
+                            "ctrl": spec.name,
+                            "alpha": alpha_for_controls,
+                            "pos": ctrl_pos_name,
+                        },
+                        refresh=False,
+                    )
+                    pending_positions = [
+                        ctrl_positions_by_example[batch_idx] for batch_idx, _ in pending
+                    ]
+                    pending_prompts = [prompts[batch_idx] for batch_idx, _ in pending]
+                    pending_answers = [answers_batch[batch_idx] for batch_idx, _ in pending]
+                    pending_base = [base_scores[batch_idx] for batch_idx, _ in pending]
+                    start_ctrl = time.perf_counter()
+                    inter_ctrl = score_first_token_batch(
+                        model, tokenizer, pending_prompts, pending_answers, 512,
+                        hook_fn=lambda s=spec, pp=pending_positions: install_batched_control_hook(
+                            model, fs, sae, s, pp,
+                        ),
+                    )
+                    runtime_ctrl = (time.perf_counter() - start_ctrl) / max(1, len(pending))
+                    for (batch_idx, jid), inter_row in zip(pending, inter_ctrl):
+                        section_label = position_section_for(
+                            tokenizer, prompts[batch_idx], row_series[batch_idx], 512,
+                            ctrl_positions_by_example[batch_idx],
+                        )
+                        out = control_output_row(
+                            row_series[batch_idx], fs, spec, ctrl_pos_name,
+                            base_scores[batch_idx], inter_row, runtime_ctrl,
+                            intervention_section=section_label,
+                        )
+                        part_rows.append(out)
+                        completed_buffer.append({
+                            "job_id": jid,
+                            "completed_at": datetime.now(timezone.utc).isoformat(),
+                        })
+                        done.add(jid)
+                        n_done += 1
+                        job_bar.update(1)
+                    if len(part_rows) >= checkpoint_threshold:
+                        part_path = write_part(part_rows, args.output_dir, part_idx)
+                        flush_completed_jobs(done_path, completed_buffer)
+                        job_bar.write(f"Checkpoint saved: {part_path} ({len(part_rows)} rows)")
+                        part_idx += 1
+                        part_rows.clear()
     return part_idx, n_done
 
 
@@ -1286,6 +1615,28 @@ def main() -> None:
     if args.device == "cuda" and not torch.cuda.is_available():
         logger.warning("CUDA unavailable; using CPU.")
         args.device = "cpu"
+    # Audit 2.3: warn loudly if a production-shaped run disables controls.
+    # `max_examples` and `max_feature_sets` < small cutoffs signal a smoke test;
+    # anything larger is treated as production-shaped.
+    if args.disable_controls:
+        is_smoke_like = (
+            (args.max_examples is not None and args.max_examples <= 50)
+            or (args.max_feature_sets is not None and args.max_feature_sets <= 5)
+        )
+        if not is_smoke_like:
+            logger.warning(
+                "Audit 2.3: --disable_controls is set on a non-smoke-sized run "
+                "(--max_examples=%s, --max_feature_sets=%s). Without specificity "
+                "controls, 'feature X is causally implicated' cannot be "
+                "distinguished from 'any norm-matched perturbation would shift "
+                "the logits by this much.' Drop --disable_controls and use "
+                "--controls_subsample_frac to amortize cost instead.",
+                args.max_examples, args.max_feature_sets,
+            )
+    if not 0.0 <= args.controls_subsample_frac <= 1.0:
+        raise ValueError(
+            f"--controls_subsample_frac must be in [0, 1]; got {args.controls_subsample_frac!r}."
+        )
     device = torch.device(args.device)
     dtype = torch_dtype(args.dtype)
     layers = parse_ints(args.layers)
@@ -1499,7 +1850,11 @@ def main() -> None:
                         "contrast %r): no matching probe direction in --probe_baselines_path.",
                         fs.set_id, fs.layer, fs.contrast_name,
                     )
-            if args.scoring_mode == "first_token" and args.disable_controls:
+            # Audit 2.3: the batched first-token path now runs controls too,
+            # so the gating decision is just scoring_mode (first_token = fast
+            # batched path; answer_logprob = slow per-example loop). The
+            # --disable_controls flag remains as a smoke-test-only escape.
+            if args.scoring_mode == "first_token":
                 part_idx, added = run_first_token_batched_feature_set(
                     model,
                     tokenizer,
@@ -1576,36 +1931,63 @@ def main() -> None:
                                 job_bar.write(f"Checkpoint saved: {part_path} ({len(part_rows)} rows)")
                                 part_idx += 1
                                 part_rows = []
-                    # Sign-flip control for the same feature set at final token only.
-                    if not args.disable_controls and "final_prompt_token" in positions:
-                        jid = job_id([row_s["bbq_uid"], fs.layer, fs.set_id, alpha, "final_prompt_token", "sign_flip", args.scoring_mode])
-                        if jid not in done:
-                            pos = positions_for(tokenizer, prompt, row_s, 512, "final_prompt_token")
-                            vector = -make_vector(sae, fs, not args.no_normalize_features, device)
-                            inter = score_fn(model, tokenizer, prompt, answers, 512, hook_fn=lambda v=vector, p=pos, a=alpha: install_hook(model, fs.layer, v, p, a, "add_vector"))
-                            out = {"bbq_uid": row_s["bbq_uid"], "layer": fs.layer, "alpha": alpha, "intervention_mode": "add_vector", "intervention_position": "final_prompt_token", "feature_set_mode": fs.mode, "feature_set_id": fs.set_id, "feature_ids_json": json.dumps(fs.feature_ids), "feature_signs_json": json.dumps([-s for s in fs.signs]), "feature_roles_json": json.dumps(fs.roles), **result_feature_metadata(fs), "mapped_contrast_name": row_s.get("mapped_contrast_name", ""), "feature_contrast_name": fs.contrast_name, "axis_mapped": row_s.get("axis_mapped", ""), "category_raw": row_s.get("category_raw", ""), "context_condition": row_s.get("context_condition", ""), "question_polarity": row_s.get("question_polarity", ""), "stereotyped_answer_idx": row_s.get("stereotyped_answer_idx", np.nan), "nonstereotyped_answer_idx": row_s.get("nonstereotyped_answer_idx", np.nan), "unknown_answer_idx": row_s.get("unknown_answer_idx", np.nan), "correct_answer_idx": row_s.get("correct_answer_idx", np.nan), "control_type": "sign_flip", "runtime_seconds": 0.0}
-                            out.update(row_metrics(base, inter, row_s))
-                            part_rows.append(out)
-                            completed_buffer.append({"job_id": jid, "completed_at": datetime.now(timezone.utc).isoformat()})
-                    for control_name in ["random_direction_norm_matched", "random_feature_matched"]:
-                        jid = job_id([row_s["bbq_uid"], fs.layer, fs.set_id, alpha, "final_prompt_token", control_name, args.scoring_mode])
-                        if jid in done:
-                            continue
-                        pos = positions_for(tokenizer, prompt, row_s, 512, "final_prompt_token")
-                        if control_name == "random_direction_norm_matched":
-                            seed = int(hashlib.sha1(jid.encode()).hexdigest()[:8], 16)
-                            torch.manual_seed(seed)
-                            vector = make_vector(sae, fs, not args.no_normalize_features, device, random_direction=True)
-                            control_feature_ids = []
-                        else:
-                            seed = int(hashlib.sha1(jid.encode()).hexdigest()[:8], 16)
-                            vector, control_feature_ids = make_random_feature_vector(sae, len(fs.feature_ids), not args.no_normalize_features, device, seed)
-                        start_control = time.perf_counter()
-                        inter = score_fn(model, tokenizer, prompt, answers, 512, hook_fn=lambda v=vector, p=pos, a=alpha: install_hook(model, fs.layer, v, p, a, "add_vector"))
-                        out = {"bbq_uid": row_s["bbq_uid"], "layer": fs.layer, "alpha": alpha, "intervention_mode": "add_vector", "intervention_position": "final_prompt_token", "feature_set_mode": fs.mode, "feature_set_id": fs.set_id, "feature_ids_json": json.dumps(control_feature_ids or fs.feature_ids), "feature_signs_json": json.dumps(fs.signs), "feature_roles_json": json.dumps(fs.roles), **result_feature_metadata(fs), "mapped_contrast_name": row_s.get("mapped_contrast_name", ""), "feature_contrast_name": fs.contrast_name, "axis_mapped": row_s.get("axis_mapped", ""), "category_raw": row_s.get("category_raw", ""), "context_condition": row_s.get("context_condition", ""), "question_polarity": row_s.get("question_polarity", ""), "stereotyped_answer_idx": row_s.get("stereotyped_answer_idx", np.nan), "nonstereotyped_answer_idx": row_s.get("nonstereotyped_answer_idx", np.nan), "unknown_answer_idx": row_s.get("unknown_answer_idx", np.nan), "correct_answer_idx": row_s.get("correct_answer_idx", np.nan), "control_type": control_name, "runtime_seconds": time.perf_counter() - start_control}
-                        out.update(row_metrics(base, inter, row_s))
-                        part_rows.append(out)
-                        completed_buffer.append({"job_id": jid, "completed_at": datetime.now(timezone.utc).isoformat()})
+                    # Audit 2.3: specificity controls. Direction-shaped controls
+                    # (sign_flip, random_direction_norm_matched, random_feature_matched)
+                    # apply when the headline includes a direction-addition mode;
+                    # random_feature_ablate applies under the audit-3.1 ablate default.
+                    # build_control_specs() returns the right set per the
+                    # intervention_modes union; subsample frac and per-position
+                    # gating are handled below.
+                    if (
+                        not args.disable_controls
+                        and should_run_controls_for_pair(
+                            row_s["bbq_uid"], fs.set_id, args.controls_subsample_frac,
+                        )
+                    ):
+                        control_positions = (
+                            list(positions) if args.controls_positions == "same_as_headline"
+                            else [p.strip() for p in args.controls_positions.split(",") if p.strip()]
+                        )
+                        for ctrl_pos_name in control_positions:
+                            if ctrl_pos_name not in positions and args.controls_positions != "same_as_headline":
+                                # Skip controls whose position isn't being run by the
+                                # headline; nothing to compare against.
+                                continue
+                            seed_input = "|".join([
+                                row_s["bbq_uid"], str(fs.layer), fs.set_id, str(alpha),
+                                ctrl_pos_name, str(set(intervention_modes)),
+                            ])
+                            for spec in build_control_specs(
+                                fs, set(intervention_modes), sae, args, alpha,
+                                ctrl_pos_name, seed_input, device,
+                            ):
+                                jid = job_id([
+                                    row_s["bbq_uid"], fs.layer, fs.set_id, alpha,
+                                    ctrl_pos_name, spec.name, args.scoring_mode,
+                                ])
+                                if jid in done:
+                                    continue
+                                pos_idx = positions_for(tokenizer, prompt, row_s, 512, ctrl_pos_name)
+                                section_label = position_section_for(
+                                    tokenizer, prompt, row_s, 512, pos_idx,
+                                )
+                                start_control = time.perf_counter()
+                                inter = score_fn(
+                                    model, tokenizer, prompt, answers, 512,
+                                    hook_fn=lambda s=spec, p=pos_idx: install_control_hook(
+                                        model, fs, sae, s, p,
+                                    ),
+                                )
+                                out = control_output_row(
+                                    row_s, fs, spec, ctrl_pos_name, base, inter,
+                                    time.perf_counter() - start_control,
+                                    intervention_section=section_label,
+                                )
+                                part_rows.append(out)
+                                completed_buffer.append({
+                                    "job_id": jid,
+                                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                                })
     if part_rows:
         write_part(part_rows, args.output_dir, part_idx)
     flush_completed_jobs(done_path, completed_buffer)
