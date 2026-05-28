@@ -29,12 +29,22 @@ AXIS_MAP = {
     "nationality": "nationality",
     "physical_appearance": "physical_appearance",
     "race_ethnicity": "race_ethnicity",
-    "race_x_gender": "race_ethnicity",
-    "race_x_ses": "race_ethnicity",
     "religion": "religion",
     "sexual_orientation": "sexual_orientation",
     "ses": "socioeconomic_status",
     "socioeconomic_status": "socioeconomic_status",
+}
+# Audit 4.2: BBQ categories that span TWO identity axes simultaneously
+# (race x gender, race x SES). The prior AXIS_MAP silently flattened these
+# to "race_ethnicity", which loses the intersectional structure that is
+# central to the marginalized-identities literature. Handling is now
+# controlled by --intersectional_handling: drop (default — explicit
+# exclusion, the audit's recommendation) or axis_flatten (legacy behavior:
+# collapse to race_ethnicity and stamp is_intersectional=True).
+INTERSECTIONAL_CATEGORIES = {"race_x_gender", "race_x_ses"}
+INTERSECTIONAL_AXIS_FLATTEN_TO = {
+    "race_x_gender": "race_ethnicity",
+    "race_x_ses": "race_ethnicity",
 }
 UNKNOWN_ALIASES = {
     "unknown", "not answerable", "can't answer", "cannot answer", "can't be determined",
@@ -157,6 +167,26 @@ def parse_args() -> argparse.Namespace:
             "also recorded in the new 'few_shot_prefix' column for inspection."
         ),
     )
+    parser.add_argument(
+        "--intersectional_handling",
+        default="drop",
+        choices=["drop", "axis_flatten"],
+        help=(
+            "Audit 4.2: how to handle the BBQ categories that span two identity "
+            "axes simultaneously (race_x_gender, race_x_ses). "
+            "drop (default, the audit's recommendation): exclude these rows from "
+            "the prepared output entirely; the dropped count is logged and added "
+            "to the run summary. The project's identity-geometry pipeline produces "
+            "single-axis directions only, so intersectional contrasts have no "
+            "matching contrast direction or SAE feature set under the current "
+            "pipeline; running them through with axis_flatten silently mixes them "
+            "into race_ethnicity results. "
+            "axis_flatten: preserve legacy behavior (collapse to race_ethnicity), "
+            "but stamp is_intersectional=True on each row so downstream analyzers "
+            "can stratify. Use this only when you specifically want a one-shot "
+            "intersectional-as-race analysis and have documented the caveat."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -185,6 +215,34 @@ def norm_text(value: object) -> str:
 
 def axis_from_category(category: str) -> str:
     return AXIS_MAP.get(norm_text(category).replace(" ", "_"), norm_text(category).replace(" ", "_"))
+
+
+def is_intersectional_category(category: str) -> bool:
+    """Audit 4.2: BBQ categories that span two identity axes simultaneously."""
+    return norm_text(category).replace(" ", "_") in INTERSECTIONAL_CATEGORIES
+
+
+def resolve_intersectional(category: str, handling: str) -> tuple[str | None, bool]:
+    """Audit 4.2: decide what axis to assign to a (possibly intersectional)
+    BBQ category, and whether the row should be dropped or stamped.
+
+    Returns (axis_or_None, is_intersectional):
+      - axis is None        -> drop this row (handling='drop' and the category
+                                is intersectional).
+      - axis is non-None    -> keep the row. is_intersectional==True means the
+                                row was flattened from an intersectional
+                                category (handling='axis_flatten'); downstream
+                                consumers can stratify on this column.
+    """
+    cat_norm = norm_text(category).replace(" ", "_")
+    if cat_norm in INTERSECTIONAL_CATEGORIES:
+        if handling == "drop":
+            return None, True
+        if handling == "axis_flatten":
+            return INTERSECTIONAL_AXIS_FLATTEN_TO[cat_norm], True
+        # Unknown handling — fall through to the AXIS_MAP default
+        # (will hit the raw cat_norm and be treated as a novel axis).
+    return axis_from_category(category), False
 
 
 def load_identity_aliases(path: Path) -> tuple[dict[str, str], dict[str, dict[str, str]]]:
@@ -494,11 +552,23 @@ def main() -> None:
     out_rows: list[dict[str, Any]] = []
     diagnostics: list[dict[str, Any]] = []
     checkpoint_path = args.output_dir / "bbq_prepared_examples.partial.csv"
+    # Audit 4.2: per-category intersectional drop / flatten counters.
+    intersectional_drop_counts: dict[str, int] = {}
+    intersectional_flatten_counts: dict[str, int] = {}
     for global_idx, (path, row) in enumerate(tqdm(raw_rows, desc="prepare BBQ")):
         answer_info = row.get("answer_info", {})
         additional = row.get("additional_metadata", {}) or {}
         stereotyped_groups = additional.get("stereotyped_groups", []) or []
-        axis = axis_from_category(str(row.get("category", path.stem)))
+        category_raw = str(row.get("category", path.stem))
+        axis, is_intersectional = resolve_intersectional(category_raw, args.intersectional_handling)
+        if axis is None:
+            # Audit 4.2: dropped intersectional row — record per-category count and skip.
+            cat_norm = norm_text(category_raw).replace(" ", "_")
+            intersectional_drop_counts[cat_norm] = intersectional_drop_counts.get(cat_norm, 0) + 1
+            continue
+        if is_intersectional:
+            cat_norm = norm_text(category_raw).replace(" ", "_")
+            intersectional_flatten_counts[cat_norm] = intersectional_flatten_counts.get(cat_norm, 0) + 1
         answer_indices = find_answer_indices(answer_info, stereotyped_groups, aliases)
         mapped_contrast, confidence = map_contrast(
             str(answer_indices["target_identity_id"]),
@@ -519,8 +589,9 @@ def main() -> None:
             "source_file": path.name,
             "example_id": row.get("example_id", global_idx),
             "question_index": row.get("question_index", ""),
-            "category_raw": row.get("category", path.stem),
+            "category_raw": category_raw,
             "axis_mapped": axis,
+            "is_intersectional": is_intersectional,
             "subcategory": additional.get("subcategory", ""),
             "context_condition": row.get("context_condition", ""),
             "question_polarity": row.get("question_polarity", ""),
@@ -595,6 +666,26 @@ def main() -> None:
         logger.info("Unknown-answer found: %.1f%%", prepared_df["unknown_answer_idx"].notna().mean() * 100)
         logger.info("Stereotyped-answer found: %.1f%%", prepared_df["stereotyped_answer_idx"].notna().mean() * 100)
         logger.info("Mapped to contrast: %.1f%%", mapped_rate * 100)
+    # Audit 4.2: log + persist intersectional handling counts so the operator
+    # always sees what happened, regardless of which mode was selected.
+    summary_rows.append({"metric": "intersectional_handling_mode", "value": args.intersectional_handling})
+    for cat_norm, count in sorted(intersectional_drop_counts.items()):
+        summary_rows.append({"metric": f"n_intersectional_dropped_{cat_norm}", "value": int(count)})
+        logger.info("Audit 4.2: dropped %d %s rows (--intersectional_handling=drop)", count, cat_norm)
+    for cat_norm, count in sorted(intersectional_flatten_counts.items()):
+        summary_rows.append({"metric": f"n_intersectional_flattened_{cat_norm}", "value": int(count)})
+        logger.warning(
+            "Audit 4.2: flattened %d %s rows to race_ethnicity (--intersectional_handling=axis_flatten); "
+            "these are stamped is_intersectional=True in the output and should be stratified or "
+            "excluded in downstream analyses.",
+            count, cat_norm,
+        )
+    if (intersectional_drop_counts or intersectional_flatten_counts) and args.intersectional_handling == "drop":
+        total_dropped = sum(intersectional_drop_counts.values())
+        logger.info(
+            "Audit 4.2: %d total intersectional rows dropped. To preserve them (flattened to race_ethnicity), "
+            "re-run with --intersectional_handling axis_flatten.", total_dropped,
+        )
         failed = Counter(
             (row.get("target_identity_label", ""), row.get("nontarget_identity_label", ""))
             for row in diagnostics
