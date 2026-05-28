@@ -57,9 +57,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--layers", default="24")
     parser.add_argument("--min_abs_cohens_d", type=float, default=0.5)
     parser.add_argument("--min_abs_decoder_cosine", type=float, default=0.03)
-    parser.add_argument("--identity_span_local_threshold", type=float, default=0.7)
-    parser.add_argument("--final_token_integrated_threshold", type=float, default=0.7)
-    parser.add_argument("--max_template_artifact_score_keep", type=float, default=0.5)
+    parser.add_argument("--identity_span_local_threshold", type=float, default=0.7,
+        help="Audit 5.2: now informational only. Soft head uses span_score as a "
+             "continuous input to role_fit_identity_token_local rather than a "
+             "first-match cascade threshold. Retained for the sensitivity sweep.")
+    parser.add_argument("--final_token_integrated_threshold", type=float, default=0.7,
+        help="Audit 5.2: now informational only. See --identity_span_local_threshold.")
+    parser.add_argument("--max_template_artifact_score_keep", type=float, default=0.5,
+        help="Hard ceiling: features with template_artifact_score >= this value "
+             "are dropped from keep_for_intervention regardless of role-fit scores.")
+    parser.add_argument("--min_role_fit_keep", type=float, default=0.5,
+        help="Audit 5.2 part 2: single-threshold keep rule. A feature is kept "
+             "for intervention iff max(role_fit_*) >= this value AND not "
+             "low_signal AND not template_artifact AND max|cohens_d| >= "
+             "--min_abs_cohens_d. Replaces the prior 7-branch first-match "
+             "cascade where a feature could be locked into a sub-optimal role "
+             "label (e.g., span=0.71 vs shared=0.85 -> identity_token_local) "
+             "and where the keep decision was entangled with the role label.")
     parser.add_argument("--min_contrast_specificity_keep", type=float, default=0.5)
     parser.add_argument("--min_sharedness_score_shared", type=float, default=0.5)
     parser.add_argument("--top_n_per_contrast", type=int, default=50)
@@ -628,6 +642,35 @@ def complete_feature_table(layers: list[int], *dfs: pd.DataFrame) -> pd.DataFram
 
 
 def assign_roles(df: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
+    """Soft scoring head (audit 5.2 part 2): each feature gets a vector of
+    role-fit scores in [0, 1]; the `keep_for_intervention` decision is a
+    separate, single-threshold rule on `(max_role_fit >= MIN_ROLE_FIT) AND
+    (template_artifact_score < MAX_ARTIFACT) AND (max_abs_cohens_d >= MIN_D)`.
+
+    The legacy `provisional_role` column survives as `argmax(role_fits)` for
+    backward compatibility and feature-card display, but the audit's
+    objection was specifically to first-match cascade ordering — a feature
+    scoring 0.71 on span_local and 0.85 on sharedness was permanently
+    labeled identity_token_local even though sharedness was the stronger
+    signal. With the soft head, the role_fit_* columns expose the full
+    profile and downstream consumers should treat the hard role as
+    descriptive only.
+
+    Role-fit definitions (all in [0, 1]):
+    - role_fit_identity_token_local = mean(span_score, norm_d, 1-artifact)
+    - role_fit_sentence_final_integrated = mean(final_score, norm_d, 1-artifact)
+    - role_fit_shared_social_feature = mean(sharedness, min(axes/3, 1), 1-artifact)
+    - role_fit_contrast_specific_identity = mean(specificity, norm_d, norm_cos, 1-artifact)
+
+    Low-signal and artifact flags are separate boolean columns so the keep
+    rule can apply them independently of which role wins the argmax.
+    """
+    role_keys = (
+        "identity_token_local",
+        "sentence_final_integrated",
+        "shared_social_feature",
+        "contrast_specific_identity",
+    )
     out_rows = []
     for row in df.fillna(0).itertuples(index=False):
         max_d = float(getattr(row, "max_abs_cohens_d", 0.0))
@@ -637,47 +680,60 @@ def assign_roles(df: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
         final_score = float(getattr(row, "final_token_integration_score", 0.0))
         shared = float(getattr(row, "sharedness_score", 0.0))
         specificity = float(getattr(row, "contrast_specificity_score", 0.0))
+        polysemanticity = float(getattr(row, "polysemanticity_score", 0.0))
         axes = int(getattr(row, "n_axes_where_top_feature", 0))
         norm_d = clip01(max_d / max(args.min_abs_cohens_d * 2, 1e-9))
         norm_cos = clip01(max_cos / max(args.min_abs_decoder_cosine * 4, 1e-9))
-        if max_d < args.min_abs_cohens_d and max_cos < args.min_abs_decoder_cosine:
-            role = "low_signal"
+        non_artifact = clip01(1 - artifact)
+        axes_norm = clip01(axes / 3.0)
+        # Soft role-fit scores (audit 5.2 part 2 — replaces first-match cascade).
+        role_fits = {
+            "identity_token_local": clip01(float(np.mean([span_score, norm_d, non_artifact]))),
+            "sentence_final_integrated": clip01(float(np.mean([final_score, norm_d, non_artifact]))),
+            "shared_social_feature": clip01(float(np.mean([shared, axes_norm, non_artifact]))),
+            "contrast_specific_identity": clip01(float(np.mean([specificity, norm_d, norm_cos, non_artifact]))),
+        }
+        # Low-signal and artifact flags are independent of which role wins.
+        low_signal = bool(max_d < args.min_abs_cohens_d and max_cos < args.min_abs_decoder_cosine)
+        artifact_flag = bool(artifact >= args.max_template_artifact_score_keep)
+        # Best role (argmax) is the descriptive label; not load-bearing.
+        best_role = max(role_fits, key=lambda k: role_fits[k])
+        best_role_fit = role_fits[best_role]
+        if low_signal:
+            descriptive_role = "low_signal"
             confidence = clip01(1 - max(norm_d, norm_cos))
-            keep = False
-        elif artifact >= args.max_template_artifact_score_keep:
-            role = "template_or_syntax_artifact"
+        elif artifact_flag:
+            descriptive_role = "template_or_syntax_artifact"
             confidence = artifact
-            keep = False
-        elif span_score >= args.identity_span_local_threshold and max_d >= args.min_abs_cohens_d:
-            role = "identity_token_local"
-            confidence = float(np.mean([span_score, norm_d, 1 - artifact]))
-            keep = True
-        elif final_score >= args.final_token_integrated_threshold and max_d >= args.min_abs_cohens_d:
-            role = "sentence_final_integrated"
-            confidence = float(np.mean([final_score, norm_d, 1 - artifact]))
-            keep = True
-        elif shared >= args.min_sharedness_score_shared and axes >= 3:
-            role = "shared_social_feature"
-            confidence = shared
-            keep = max_d >= args.min_abs_cohens_d and artifact < args.max_template_artifact_score_keep
-        elif specificity >= args.min_contrast_specificity_keep and max_d >= args.min_abs_cohens_d and max_cos >= args.min_abs_decoder_cosine:
-            role = "contrast_specific_identity"
-            confidence = float(np.mean([specificity, norm_d, norm_cos, 1 - artifact]))
-            keep = True
+        elif best_role_fit < args.min_role_fit_keep:
+            descriptive_role = "polysemantic_or_unclear"
+            confidence = polysemanticity
         else:
-            role = "polysemantic_or_unclear"
-            confidence = float(getattr(row, "polysemanticity_score", 0.0))
-            keep = False
-        keep = bool(keep and max_d >= args.min_abs_cohens_d and artifact < args.max_template_artifact_score_keep)
+            descriptive_role = best_role
+            confidence = best_role_fit
+        # Single-threshold keep rule — independent of which role won the argmax.
+        keep = bool(
+            not low_signal
+            and not artifact_flag
+            and best_role_fit >= args.min_role_fit_keep
+            and max_d >= args.min_abs_cohens_d
+        )
         priority = "high" if keep and confidence >= 0.7 and max_d >= args.min_abs_cohens_d * 1.5 else ("medium" if keep else "low")
         reason = (
-            f"{role}: span={span_score:.2f}, final={final_score:.2f}, artifact={artifact:.2f}, "
-            f"shared={shared:.2f}, specificity={specificity:.2f}, max|d|={max_d:.2f}, max|cos|={max_cos:.3f}, "
-            f"top_axis={getattr(row, 'top_axis', '')}."
+            f"{descriptive_role}: best_fit={best_role_fit:.2f} ({best_role}), "
+            f"span={span_score:.2f}, final={final_score:.2f}, artifact={artifact:.2f}, "
+            f"shared={shared:.2f}, specificity={specificity:.2f}, max|d|={max_d:.2f}, "
+            f"max|cos|={max_cos:.3f}, top_axis={getattr(row, 'top_axis', '')}."
         )
         values = row._asdict()
+        for key in role_keys:
+            values[f"role_fit_{key}"] = role_fits[key]
         values.update({
-            "provisional_role": role,
+            "best_role": best_role,
+            "best_role_fit": best_role_fit,
+            "is_low_signal": low_signal,
+            "is_template_artifact": artifact_flag,
+            "provisional_role": descriptive_role,  # descriptive (argmax); see docstring
             "role_confidence": clip01(confidence),
             "keep_for_intervention": keep,
             "intervention_priority": priority,
