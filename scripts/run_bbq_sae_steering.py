@@ -398,20 +398,118 @@ def find_spans(prompt: str, terms: list[str]) -> list[tuple[int, int]]:
     return spans
 
 
+def find_section_spans(prompt: str, row: pd.Series) -> dict[str, tuple[int, int]]:
+    """Audit 3.3: locate the context / question / answer-option spans in the
+    prompt so positions_for can restrict identity-token search to a single
+    section. Mirrors extract_bbq_token_level_sae_activations.find_section_spans."""
+    spans: dict[str, tuple[int, int]] = {}
+    for name, text in [("context", row.get("context", "")), ("question", row.get("question", ""))]:
+        idx = prompt.find(str(text))
+        if idx >= 0:
+            spans[name] = (idx, idx + len(str(text)))
+    for i in range(3):
+        marker = f"{chr(65 + i)}. {row.get(f'ans{i}', '')}"
+        idx = prompt.find(marker)
+        if idx >= 0:
+            spans[f"ans{i}"] = (idx, idx + len(marker))
+    return spans
+
+
+def intersect_spans_with_section(
+    term_spans: list[tuple[int, int]],
+    section_span: tuple[int, int] | None,
+) -> list[tuple[int, int]]:
+    """Audit 3.3: restrict the term-match spans to lie within a section.
+    Used when the user requests a section-explicit position like
+    target_identity_last_context_token — the identity label gets matched
+    everywhere it appears, then this helper clips the match list to the
+    context region before the last-token argmax."""
+    if section_span is None:
+        return []
+    sect_s, sect_e = section_span
+    clipped: list[tuple[int, int]] = []
+    for s, e in term_spans:
+        ns, ne = max(s, sect_s), min(e, sect_e)
+        if ne > ns:
+            clipped.append((ns, ne))
+    return clipped
+
+
+# Audit 3.3: position names that restrict the identity / stereotype match
+# to a specific section before taking the last-token. The original
+# `_last_token` variants matched anywhere in the prompt, so the very last
+# token mention frequently landed in the answer-option list (e.g.
+# `B. the Black man`) rather than in the context — exactly the bias-
+# relevant region. The new `_last_context_token` and `_last_question_token`
+# variants disambiguate.
+_SECTION_AWARE_POSITION_SECTIONS: dict[str, str] = {
+    "target_identity_last_context_token": "context",
+    "target_identity_last_question_token": "question",
+    "nontarget_identity_last_context_token": "context",
+    "nontarget_identity_last_question_token": "question",
+    "stereotype_language_last_context_token": "context",
+    "stereotype_language_last_question_token": "question",
+}
+
+
 def stereotype_terms(question: str) -> list[str]:
     stop = {"who", "what", "when", "where", "why", "how", "was", "were", "is", "are", "the", "a", "an", "to", "of", "in", "on", "for", "and", "or", "likely", "had", "has", "have"}
     return [tok for tok in re.findall(r"[A-Za-z][A-Za-z'-]+", str(question).lower()) if tok not in stop and len(tok) > 2]
 
 
 def positions_for(tokenizer, prompt: str, row: pd.Series, max_length: int, position_name: str) -> list[int]:
+    """Locate the token positions for an intervention. Audit 3.3:
+
+    - `final_prompt_token` is the last non-pad content token (unchanged).
+    - `target_identity_last_token` / `nontarget_identity_last_token` /
+      `stereotype_language_last_token` match the term ANYWHERE in the prompt
+      and take the last match — this is the legacy behavior that often
+      lands in the answer-option list rather than the context.
+    - `target_identity_last_context_token` (and `_question_token`) restrict
+      the search to the named section BEFORE taking the last match. Same
+      for nontarget and stereotype-language. Use these for the bias-relevant
+      "the model is shifting how it thinks about the identity mentioned in
+      the context / question" causal question.
+
+    Use `position_section_for(...)` to label where the chosen token actually
+    landed (`context` / `question` / `answer_option` / `final`); the caller
+    stamps that onto each output row so the analyzer can stratify."""
     encoded = tokenizer(prompt, truncation=True, max_length=max_length, return_offsets_mapping=True)
     offsets = encoded["offset_mapping"]
     content = [i for i, (s, e) in enumerate(offsets) if e > s]
     if not content:
         return [len(offsets) - 1]
     final_pos = content[-1]
-    spans = []
+    spans: list[tuple[int, int]] = []
     if position_name == "final_prompt_token":
+        return [final_pos]
+    # Section-aware position names (audit 3.3): build term spans, then clip
+    # to the requested section before the argmax.
+    if position_name in _SECTION_AWARE_POSITION_SECTIONS:
+        section_name = _SECTION_AWARE_POSITION_SECTIONS[position_name]
+        section_spans_map = find_section_spans(prompt, row)
+        section_span = section_spans_map.get(section_name)
+        if position_name.startswith("target_identity_"):
+            target_idx = row.get("target_answer_idx", np.nan)
+            terms = [row.get("target_identity_label", "")]
+            if pd.notna(target_idx):
+                terms.append(row.get(f"ans{int(target_idx)}", ""))
+            raw_spans = find_spans(prompt, terms)
+        elif position_name.startswith("nontarget_identity_"):
+            nt_idx = row.get("nontarget_answer_idx", np.nan)
+            terms = [row.get("nontarget_identity_label", "")]
+            if pd.notna(nt_idx):
+                terms.append(row.get(f"ans{int(nt_idx)}", ""))
+            raw_spans = find_spans(prompt, terms)
+        else:  # stereotype_language_*
+            raw_spans = find_spans(prompt, stereotype_terms(str(row.get("question", ""))))
+        spans = intersect_spans_with_section(raw_spans, section_span)
+        pos = [i for i, (s, e) in enumerate(offsets) if e > s and any(e > ss and s < ee for ss, ee in spans)]
+        if pos:
+            return [max(pos)]
+        # No section match — fall back to the final prompt token. Caller
+        # will see intervention_section='final' and can filter that out
+        # of headline causal claims.
         return [final_pos]
     if position_name in {"target_identity_last_token", "all_identity_tokens"}:
         target_idx = row.get("target_answer_idx", np.nan)
@@ -431,6 +529,55 @@ def positions_for(tokenizer, prompt: str, row: pd.Series, max_length: int, posit
     if position_name.endswith("last_token") and pos:
         return [max(pos)]
     return pos or [final_pos]
+
+
+def position_section_for(
+    tokenizer,
+    prompt: str,
+    row: pd.Series,
+    max_length: int,
+    positions: list[int],
+) -> str:
+    """Audit 3.3: classify where in the prompt the chosen position(s) landed.
+    Returns one of {context, question, answer_option, final, mixed, unknown}.
+    `mixed` fires when positions span multiple sections; `unknown` when no
+    section span was found at all. Stamped onto each steering output row so
+    the analyzer can stratify by `intervention_section`."""
+    if not positions:
+        return "unknown"
+    encoded = tokenizer(prompt, truncation=True, max_length=max_length, return_offsets_mapping=True)
+    offsets = encoded["offset_mapping"]
+    content = [i for i, (s, e) in enumerate(offsets) if e > s]
+    final_pos = content[-1] if content else None
+    section_spans_map = find_section_spans(prompt, row)
+    answer_spans = [section_spans_map[f"ans{i}"] for i in range(3) if f"ans{i}" in section_spans_map]
+    section_labels: set[str] = set()
+    for p in positions:
+        if final_pos is not None and p == final_pos:
+            section_labels.add("final")
+            continue
+        if p < 0 or p >= len(offsets):
+            section_labels.add("unknown")
+            continue
+        s, e = offsets[p]
+        if e <= s:
+            section_labels.add("unknown")
+            continue
+        ctx = section_spans_map.get("context")
+        qst = section_spans_map.get("question")
+        if ctx is not None and e > ctx[0] and s < ctx[1]:
+            section_labels.add("context")
+            continue
+        if qst is not None and e > qst[0] and s < qst[1]:
+            section_labels.add("question")
+            continue
+        if any(e > a[0] and s < a[1] for a in answer_spans):
+            section_labels.add("answer_option")
+            continue
+        section_labels.add("unknown")
+    if len(section_labels) == 1:
+        return section_labels.pop()
+    return "mixed"
 
 
 def first_token_ids(tokenizer, answers: list[str]) -> list[int]:
@@ -1001,6 +1148,7 @@ def steering_output_row(
     base: np.ndarray,
     inter: np.ndarray,
     runtime_seconds: float,
+    intervention_section: str = "",
 ) -> dict[str, object]:
     out = {
         "bbq_uid": row_s["bbq_uid"],
@@ -1008,6 +1156,7 @@ def steering_output_row(
         "alpha": alpha,
         "intervention_mode": mode,
         "intervention_position": pos_name,
+        "intervention_section": intervention_section,  # audit 3.3: where the chosen token landed
         "feature_set_mode": fs.mode,
         "feature_set_id": fs.set_id,
         "feature_ids_json": json.dumps(fs.feature_ids),
@@ -1107,7 +1256,16 @@ def run_first_token_batched_feature_set(
                     )
                     runtime = (time.perf_counter() - start) / max(1, len(pending_indices))
                     for batch_idx, jid in pending_indices:
-                        out = steering_output_row(row_series[batch_idx], fs, alpha, mode, pos_name, base_scores[batch_idx], inter_scores[batch_idx], runtime)
+                        # Audit 3.3: stamp where the chosen position landed, per row.
+                        section_label = position_section_for(
+                            tokenizer, prompts[batch_idx], row_series[batch_idx], 512,
+                            positions_by_example[batch_idx],
+                        )
+                        out = steering_output_row(
+                            row_series[batch_idx], fs, alpha, mode, pos_name,
+                            base_scores[batch_idx], inter_scores[batch_idx], runtime,
+                            intervention_section=section_label,
+                        )
                         part_rows.append(out)
                         completed_buffer.append({"job_id": jid, "completed_at": datetime.now(timezone.utc).isoformat()})
                         done.add(jid)
@@ -1401,7 +1559,12 @@ def main() -> None:
                                 probe_vector=probe_vector,
                             )
                             inter = score_fn(model, tokenizer, prompt, answers, 512, hook_fn=hook_fn)
-                            out = steering_output_row(row_s, fs, alpha, mode, pos_name, base, inter, time.perf_counter() - start)
+                            section_label = position_section_for(tokenizer, prompt, row_s, 512, pos)
+                            out = steering_output_row(
+                                row_s, fs, alpha, mode, pos_name, base, inter,
+                                time.perf_counter() - start,
+                                intervention_section=section_label,
+                            )
                             part_rows.append(out)
                             completed_buffer.append({"job_id": jid, "completed_at": datetime.now(timezone.utc).isoformat()})
                             done.add(jid)

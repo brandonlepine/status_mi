@@ -152,6 +152,30 @@ def overlap(start: int, end: int, spans: list[tuple[int, int]]) -> bool:
     return any(end > s and start < e for s, e in spans)
 
 
+def overlap_in_section(
+    start: int,
+    end: int,
+    term_spans: list[tuple[int, int]],
+    section_span: tuple[int, int] | None,
+) -> bool:
+    """Audit 3.3: a token is in the target/nontarget/stereotype span AND
+    within the given section span (context / question / answer option).
+    Used to disambiguate the prior `is_target_identity_token` flag, which
+    fired on every match of the identity label in the prompt — so a Black
+    woman in a context, plus `B. the Black woman` as an answer option,
+    yielded two flagged token regions and `_last_token` invariably picked
+    the answer-option one. The new section-aware flags let downstream
+    consumers (the analyzer + steering runner) attribute identity-language
+    activations to the right prompt region."""
+    if section_span is None:
+        return False
+    sect_s, sect_e = section_span
+    return any(
+        end > max(s, sect_s) and start < min(e, sect_e)
+        for s, e in term_spans
+    )
+
+
 def stereotype_terms(question: str) -> list[str]:
     return [tok for tok in re.findall(r"[A-Za-z][A-Za-z'-]+", str(question).lower()) if tok not in STOPWORDS and len(tok) > 2]
 
@@ -272,9 +296,25 @@ def main() -> None:
                     positive_positions = np.flatnonzero(vals > 0)
                     ranks = pd.Series(vals).rank(method="first", ascending=False).astype(int).to_numpy()
                     meta = feature_meta.get(feature_id, {})
+                    # Audit 3.3: precompute the (context, question, any-answer-option)
+                    # section spans so we can attribute each flagged token to a region.
+                    context_span = section_spans.get("context")
+                    question_span = section_spans.get("question")
+                    any_answer_spans = [section_spans[f"ans{i}"] for i in range(3) if f"ans{i}" in section_spans]
                     for token_idx in positive_positions:
                         start_char, end_char = map(int, offsets[batch_pos, token_idx])
                         option_idx = next((i for i in range(3) if f"ans{i}" in section_spans and overlap(start_char, end_char, [section_spans[f"ans{i}"]])), None)
+                        any_answer_span = any_answer_spans[0] if any_answer_spans else None  # only used as a fallback sentinel for the helper
+                        # Audit 3.3: section-aware identity / stereotype flags.
+                        is_target_in_ctx = overlap_in_section(start_char, end_char, target_spans, context_span)
+                        is_target_in_qst = overlap_in_section(start_char, end_char, target_spans, question_span)
+                        is_target_in_ans = any(overlap_in_section(start_char, end_char, target_spans, s) for s in any_answer_spans)
+                        is_nontarget_in_ctx = overlap_in_section(start_char, end_char, nontarget_spans, context_span)
+                        is_nontarget_in_qst = overlap_in_section(start_char, end_char, nontarget_spans, question_span)
+                        is_nontarget_in_ans = any(overlap_in_section(start_char, end_char, nontarget_spans, s) for s in any_answer_spans)
+                        is_stereo_in_ctx = overlap_in_section(start_char, end_char, stereotype_spans, context_span)
+                        is_stereo_in_qst = overlap_in_section(start_char, end_char, stereotype_spans, question_span)
+                        is_stereo_in_ans = any(overlap_in_section(start_char, end_char, stereotype_spans, s) for s in any_answer_spans)
                         rows.append({
                             "bbq_uid": row_s["bbq_uid"],
                             "layer": layer,
@@ -289,6 +329,20 @@ def main() -> None:
                             "is_nontarget_identity_token": overlap(start_char, end_char, nontarget_spans),
                             "is_any_identity_token": overlap(start_char, end_char, target_spans + nontarget_spans),
                             "is_stereotype_language_token": overlap(start_char, end_char, stereotype_spans),
+                            # Audit 3.3: section-aware identity / stereotype flags. These
+                            # break out where in the prompt the identity / stereotype
+                            # language was actually mentioned, so downstream consumers
+                            # can stratify activations by section (context vs question
+                            # vs answer-option) rather than mixing them.
+                            "is_target_identity_token_in_context": is_target_in_ctx,
+                            "is_target_identity_token_in_question": is_target_in_qst,
+                            "is_target_identity_token_in_answer_option": is_target_in_ans,
+                            "is_nontarget_identity_token_in_context": is_nontarget_in_ctx,
+                            "is_nontarget_identity_token_in_question": is_nontarget_in_qst,
+                            "is_nontarget_identity_token_in_answer_option": is_nontarget_in_ans,
+                            "is_stereotype_language_token_in_context": is_stereo_in_ctx,
+                            "is_stereotype_language_token_in_question": is_stereo_in_qst,
+                            "is_stereotype_language_token_in_answer_option": is_stereo_in_ans,
                             "is_question_token": "question" in section_spans and overlap(start_char, end_char, [section_spans["question"]]),
                             "is_context_token": "context" in section_spans and overlap(start_char, end_char, [section_spans["context"]]),
                             "is_answer_option_token": option_idx is not None,
@@ -320,13 +374,35 @@ def main() -> None:
         if frames:
             layer_long = pd.concat(frames, ignore_index=True)
             for (feature_id, group) in layer_long.groupby("feature_id", sort=True):
+                def _mean_where(col: str) -> float:
+                    if col not in group.columns:
+                        return float("nan")
+                    mask = group[col].astype(bool)
+                    if not mask.any():
+                        return float("nan")
+                    return float(group.loc[mask, "feature_activation"].mean())
                 summary_rows.append({
                     "layer": layer,
                     "feature_id": feature_id,
-                    "mean_target_identity_activation": group.loc[group["is_target_identity_token"].astype(bool), "feature_activation"].mean(),
-                    "mean_nontarget_identity_activation": group.loc[group["is_nontarget_identity_token"].astype(bool), "feature_activation"].mean(),
-                    "mean_stereotype_language_activation": group.loc[group["is_stereotype_language_token"].astype(bool), "feature_activation"].mean(),
-                    "mean_final_token_activation": group.loc[group["is_final_prompt_token"].astype(bool), "feature_activation"].mean(),
+                    "mean_target_identity_activation": _mean_where("is_target_identity_token"),
+                    "mean_nontarget_identity_activation": _mean_where("is_nontarget_identity_token"),
+                    "mean_stereotype_language_activation": _mean_where("is_stereotype_language_token"),
+                    "mean_final_token_activation": _mean_where("is_final_prompt_token"),
+                    # Audit 3.3: section-stratified mean activations. These break
+                    # out the identity / stereotype activations by where in the
+                    # prompt the language was mentioned, so downstream consumers
+                    # can answer "is this feature firing on identity mentions in
+                    # the CONTEXT (the bias-relevant region) or just on the
+                    # repeated identity in the answer-option list?".
+                    "mean_target_identity_activation_in_context": _mean_where("is_target_identity_token_in_context"),
+                    "mean_target_identity_activation_in_question": _mean_where("is_target_identity_token_in_question"),
+                    "mean_target_identity_activation_in_answer_option": _mean_where("is_target_identity_token_in_answer_option"),
+                    "mean_nontarget_identity_activation_in_context": _mean_where("is_nontarget_identity_token_in_context"),
+                    "mean_nontarget_identity_activation_in_question": _mean_where("is_nontarget_identity_token_in_question"),
+                    "mean_nontarget_identity_activation_in_answer_option": _mean_where("is_nontarget_identity_token_in_answer_option"),
+                    "mean_stereotype_language_activation_in_context": _mean_where("is_stereotype_language_token_in_context"),
+                    "mean_stereotype_language_activation_in_question": _mean_where("is_stereotype_language_token_in_question"),
+                    "mean_stereotype_language_activation_in_answer_option": _mean_where("is_stereotype_language_token_in_answer_option"),
                     "max_activation_per_prompt": group.groupby("bbq_uid")["feature_activation"].max().mean(),
                     "fraction_prompts_active": group["bbq_uid"].nunique() / max(1, len(prepared)),
                     "activation_by_context_condition": json.dumps(group.groupby("context_condition")["feature_activation"].mean().to_dict()),
