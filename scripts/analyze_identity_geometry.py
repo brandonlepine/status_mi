@@ -131,6 +131,24 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip logistic probe analyses and compute only PCA/means/stability/contrasts.",
     )
+    parser.add_argument(
+        "--skip_contrast_probes",
+        action="store_true",
+        help=(
+            "Audit 5.5 option (c): per-contrast binary L2-regularized logistic "
+            "regression in raw d_model space, with the unit-norm weight vector "
+            "persisted as a steering baseline (see Step 20's probe_baseline mode). "
+            "These are SEPARATE from --skip_probes' axis/identity-within-axis probes "
+            "(which run in PCA-reduced space and exist for decodability measurement, "
+            "not steering). Default: not skipped."
+        ),
+    )
+    parser.add_argument(
+        "--contrast_probe_C",
+        type=float,
+        default=1.0,
+        help="L2-regularization strength for the per-contrast probes (sklearn convention: smaller C = stronger regularization). Default 1.0.",
+    )
     parser.add_argument("--random_seed", type=int, default=42)
     parser.add_argument(
         "--n_permutations",
@@ -995,6 +1013,141 @@ def run_contrasts(
     return score_rows, holdout_rows
 
 
+def run_contrast_probes(
+    x: np.ndarray,
+    metadata: pd.DataFrame,
+    layer: int,
+    subdirs: dict[str, Path],
+    *,
+    C: float = 1.0,
+    max_iter: int = 2000,
+    random_seed: int = 0,
+) -> list[dict[str, object]]:
+    """Audit 5.5 option (c): fit a binary L2-regularized logistic regression
+    per (identity_a, identity_b) in CONTRASTS, in raw d_model space, and
+    persist the unit-norm weight vector for use as a steering baseline in
+    [Step 20]'s probe_baseline mode.
+
+    Why a separate function rather than reusing `run_probes`:
+    - The existing axis / identity-within-axis probes are multiclass classifiers
+      in PCA-reduced (256-D) feature space — useful for measuring decodability,
+      but the weight vector lives in the PCA basis, not residual-stream space.
+    - For a steering baseline we need a (d_model,) vector in the same coordinate
+      system as the residual stream. Raw-space binary logistic regression with
+      L2 yields that directly. C=1.0 is the sklearn default.
+
+    Sign convention: identity_a is the positive class, so positive projection
+    of an activation onto the probe direction means "more like identity_a" —
+    matching common.compute_direction's convention (used for the DoM directions
+    in run_contrasts above).
+
+    Returns one row per contrast with in-sample probe AUC + Cohen's d on the
+    projection scores, plus held-out-family AUC for an out-of-sample sanity
+    check (the family hold-out is the same scheme used in run_contrasts so the
+    two baselines are directly comparable). Writes:
+      - contrasts/contrast_probe_directions_layer_{LL}.npz
+        keys: 'layer{LL}_{identity_a}_vs_{identity_b}' -> float32 (d_model,)
+      - contrasts/contrast_probe_scores_layer_{LL}.csv  (appended via caller)
+    """
+    identity_set = set(metadata["identity_id"].unique())
+    family_set = sorted(metadata["family"].dropna().unique().tolist())
+    rows: list[dict[str, object]] = []
+    directions_for_save: dict[str, np.ndarray] = {}
+    axis_lookup = metadata.groupby("identity_id")["axis"].first().to_dict()
+
+    for identity_a, identity_b in CONTRASTS:
+        if identity_a not in identity_set or identity_b not in identity_set:
+            continue
+        mask_a = metadata["identity_id"].eq(identity_a).to_numpy()
+        mask_b = metadata["identity_id"].eq(identity_b).to_numpy()
+        n_a, n_b = int(mask_a.sum()), int(mask_b.sum())
+        if n_a < 2 or n_b < 2:
+            continue
+        pair_mask = mask_a | mask_b
+        X_pair = x[pair_mask]
+        y_pair = mask_a[pair_mask].astype(np.int64)
+        try:
+            clf = LogisticRegression(
+                C=C, solver="lbfgs", max_iter=max_iter,
+                random_state=random_seed,
+            )
+            clf.fit(X_pair, y_pair)
+        except Exception as exc:  # noqa: BLE001
+            print(f"Skipping contrast probe ({identity_a} vs {identity_b}, layer {layer}): {exc}")
+            continue
+        weight = clf.coef_.ravel().astype(np.float64)
+        norm = float(np.linalg.norm(weight))
+        if norm < 1e-12 or not np.isfinite(norm):
+            continue
+        direction = weight / norm
+        contrast_name = f"{identity_a}_vs_{identity_b}"
+        directions_for_save[f"layer{layer:02d}_{contrast_name}"] = direction.astype(np.float32)
+
+        # In-sample AUC + Cohen's d of the projection scores on the pair.
+        # These are diagnostics — the probe was fit on the same data — but
+        # match the columns reported by run_contrasts for direct comparison.
+        scores_full = x @ direction
+        metrics = evaluate_projection(scores_full, mask_a, mask_b)
+
+        # Held-out-family AUC mirrors the family hold-out in run_contrasts:
+        # for each family, refit on prompts NOT in that family and evaluate
+        # the resulting direction on the held-out family's rows.
+        heldout_aucs: list[float] = []
+        for heldout_family in family_set:
+            heldout = metadata["family"].eq(heldout_family).to_numpy()
+            train_mask = pair_mask & ~heldout
+            eval_mask_a = mask_a & heldout
+            eval_mask_b = mask_b & heldout
+            if int(eval_mask_a.sum()) < 1 or int(eval_mask_b.sum()) < 1:
+                continue
+            X_tr = x[train_mask]
+            y_tr = mask_a[train_mask].astype(np.int64)
+            if X_tr.shape[0] < 4 or len(np.unique(y_tr)) < 2:
+                continue
+            try:
+                clf_h = LogisticRegression(
+                    C=C, penalty="l2", solver="lbfgs", max_iter=max_iter,
+                    random_state=random_seed,
+                )
+                clf_h.fit(X_tr, y_tr)
+            except Exception:
+                continue
+            w_h = clf_h.coef_.ravel().astype(np.float64)
+            n_h = float(np.linalg.norm(w_h))
+            if n_h < 1e-12:
+                continue
+            d_h = w_h / n_h
+            scores_h = x @ d_h
+            metrics_h = evaluate_projection(scores_h, eval_mask_a, eval_mask_b)
+            if np.isfinite(metrics_h["auc"]):
+                heldout_aucs.append(float(metrics_h["auc"]))
+
+        rows.append({
+            "layer": layer,
+            "contrast_name": contrast_name,
+            "identity_a": identity_a,
+            "identity_b": identity_b,
+            "axis": axis_lookup.get(identity_a, ""),
+            "auc_in_sample": metrics["auc"],
+            "cohens_d_in_sample": metrics["cohens_d"],
+            "mean_a": metrics["mean_a"],
+            "mean_b": metrics["mean_b"],
+            "n_a": n_a,
+            "n_b": n_b,
+            "heldout_family_auc_mean": float(np.mean(heldout_aucs)) if heldout_aucs else float("nan"),
+            "heldout_family_auc_n_folds": len(heldout_aucs),
+            "probe_C": C,
+            "probe_penalty": "l2",
+        })
+
+    if directions_for_save:
+        np.savez(
+            subdirs["contrasts"] / f"contrast_probe_directions_layer_{layer:02d}.npz",
+            **directions_for_save,
+        )
+    return rows
+
+
 def write_run_config(
     args: argparse.Namespace,
     output_dir: Path,
@@ -1010,6 +1163,8 @@ def write_run_config(
         "pca_components": args.pca_components,
         "probe_pca_dim": args.probe_pca_dim,
         "skip_probes": args.skip_probes,
+        "skip_contrast_probes": args.skip_contrast_probes,
+        "contrast_probe_C": args.contrast_probe_C,
         "random_seed": args.random_seed,
         "scaling": args.scaling,
         "n_permutations": args.n_permutations,
@@ -1047,6 +1202,7 @@ def main() -> None:
     family_summary_inputs = []
     contrast_rows = []
     contrast_holdout_rows = []
+    contrast_probe_rows: list[dict[str, object]] = []  # audit 5.5 option (c)
     hidden_dim = None
 
     for layer in tqdm(layers, desc="Analyzing layers"):
@@ -1119,6 +1275,14 @@ def main() -> None:
         contrast_rows.extend(layer_contrast_rows)
         contrast_holdout_rows.extend(layer_holdout_rows)
 
+        if not args.skip_contrast_probes:
+            print("  Contrast probes (audit 5.5 option c)")
+            layer_probe_rows = run_contrast_probes(
+                x=x, metadata=metadata, layer=layer, subdirs=subdirs,
+                C=args.contrast_probe_C, random_seed=args.random_seed,
+            )
+            contrast_probe_rows.extend(layer_probe_rows)
+
     pd.concat(pca_evr_rows, ignore_index=True).to_csv(
         subdirs["pca"] / "pca_explained_variance.csv", index=False
     )
@@ -1161,6 +1325,12 @@ def main() -> None:
         CONTRAST_HOLDOUT_COLUMNS,
         subdirs["contrasts"] / "contrast_family_holdout_scores.csv",
     )
+    if contrast_probe_rows:
+        # Audit 5.5 option (c): probe diagnostic CSV. The .npz weight files
+        # are written per-layer inside run_contrast_probes.
+        pd.DataFrame(contrast_probe_rows).to_csv(
+            subdirs["contrasts"] / "contrast_probe_scores.csv", index=False
+        )
 
     # Headline held-out summary: one row per (layer, contrast) with mean / sd
     # / min / max / n_families across the held-out-family replicates. This is

@@ -713,20 +713,26 @@ def score_answer_logprob(model, tokenizer, prompt: str, answers: list[str], max_
     return np.array(scores, dtype=np.float32)
 
 
-def load_contrast_directions(path: Path) -> dict[tuple[int, str], np.ndarray]:
-    """Audit 5.5: load the difference-of-means contrast directions persisted
-    by analyze_identity_geometry.py (Step 7). Returns a dict keyed by
-    (layer, contrast_name) where contrast_name is the canonical
-    'identity_a_vs_identity_b' string. Accepts either a single .npz file or
-    a directory containing one-or-more contrast_directions_layer_*.npz files.
-    """
+def load_contrast_directions(path: Path, *, glob_patterns: tuple[str, ...] = ("contrast_directions_layer_*.npz", "contrast_probe_directions_layer_*.npz")) -> dict[tuple[int, str], np.ndarray]:
+    """Audit 5.5: load contrast directions persisted by analyze_identity_geometry.py
+    (Step 7). Returns a dict keyed by (layer, contrast_name) where contrast_name
+    is the canonical 'identity_a_vs_identity_b' string. Accepts either a single
+    .npz file or a directory; when a directory is given, all .npz files matching
+    `glob_patterns` are loaded and merged. The same key schema is used for both
+    the difference-of-means directions and the per-contrast logistic probe
+    directions (audit 5.5 option (c)), so the caller picks WHICH file/directory
+    by passing the right --direction_baselines_path or --probe_baselines_path."""
     if path is None or not path.exists():
-        raise FileNotFoundError(f"--direction_baselines_path does not exist: {path}")
+        raise FileNotFoundError(f"path does not exist: {path}")
     files: list[Path]
     if path.is_dir():
-        files = sorted(path.glob("contrast_directions_layer_*.npz"))
+        files = []
+        for pattern in glob_patterns:
+            files.extend(sorted(path.glob(pattern)))
         if not files:
-            raise FileNotFoundError(f"No contrast_directions_layer_*.npz files found in {path}")
+            raise FileNotFoundError(
+                f"No .npz files matching {glob_patterns} found in {path}"
+            )
     else:
         files = [path]
     out: dict[tuple[int, str], np.ndarray] = {}
