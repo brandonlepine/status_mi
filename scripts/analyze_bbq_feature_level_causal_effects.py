@@ -159,6 +159,24 @@ def correct_margin(row: pd.Series, suffix: str) -> float:
     return float(vals[correct_idx] - np.max(np.delete(vals, correct_idx)))
 
 
+def _polarity_sign_value(polarity: object) -> float:
+    """Audit 4.3: BBQ question_polarity ∈ {"neg", "nonneg"}.
+    For neg-polarity questions the stereotyped answer is the bias-aligned one
+    (e.g., "who looked nervous?" → stereotype-confirming answer is bias-aligned);
+    for nonneg-polarity questions the framing flips (e.g., "who looked calm?"
+    → the NON-stereotyped answer is bias-aligned). To keep
+    "positive = intervention made the model more biased" consistent across both
+    polarities, multiply the raw stereotype_preference_delta by +1 for neg and
+    -1 for nonneg. Unknown / missing polarity → NaN so the row is skipped from
+    polarity-sensitive aggregates instead of silently confounding them."""
+    s = str(polarity).strip().lower() if polarity is not None else ""
+    if s == "neg":
+        return 1.0
+    if s == "nonneg":
+        return -1.0
+    return float("nan")
+
+
 def enrich_results(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     out["feature_ids_list"] = out["feature_ids_json"].map(lambda v: [int(x) for x in parse_json_list(v)]) if "feature_ids_json" in out.columns else [[] for _ in range(len(out))]
@@ -196,6 +214,15 @@ def enrich_results(df: pd.DataFrame) -> pd.DataFrame:
         out["nonstereotyped_delta"] = out.apply(lambda r: choice_value(r, "nonstereotyped_answer_idx", "intervened") - choice_value(r, "nonstereotyped_answer_idx", "base"), axis=1)
     if "correct_delta" not in out.columns:
         out["correct_delta"] = out.apply(lambda r: choice_value(r, "correct_answer_idx", "intervened") - choice_value(r, "correct_answer_idx", "base"), axis=1)
+    # Audit 4.3: polarity-signed bias metrics. Positive = intervention made the
+    # model more biased regardless of question_polarity; negative = less biased.
+    # The unsigned `stereotype_preference_delta` / `stereotyped_delta` /
+    # `nonstereotyped_delta` are preserved for diagnostic comparison, but every
+    # downstream label, score, and ranking uses the signed versions.
+    out["polarity_sign"] = out["question_polarity"].map(_polarity_sign_value) if "question_polarity" in out.columns else float("nan")
+    out["signed_stereotype_preference_delta"] = out["polarity_sign"] * out["stereotype_preference_delta"]
+    out["signed_stereotyped_delta"] = out["polarity_sign"] * out["stereotyped_delta"]
+    out["signed_nonstereotyped_delta"] = out["polarity_sign"] * out["nonstereotyped_delta"]
     return out
 
 
@@ -314,11 +341,18 @@ def effect_size_label(delta: float, args: argparse.Namespace) -> str:
 
 
 def effect_label(row: pd.Series, args: argparse.Namespace) -> str:
+    """Audit 4.3 (closed 2026-05-27): the bias direction tests use the
+    polarity-signed metric. `bias_amplifying` and `bias_reducing_*` now mean
+    the same thing across both neg-polarity and nonneg-polarity questions:
+    the intervention shifted the model's preference toward the stereotype-
+    aligned answer (or away from it). Prior code branched on the unsigned
+    `mean_stereotype_preference_delta`, which inverts under polarity flip.
+    """
     q = row.get("q_value_fdr", np.nan)
     reliable = pd.notna(q) and float(q) < args.q_threshold
     threshold = args.small_effect_threshold
     identity_delta = abs(float(row.get("mean_identity_answer_delta", 0) or 0))
-    bias_delta = float(row.get("mean_stereotype_preference_delta", 0) or 0)
+    bias_delta = float(row.get("mean_signed_stereotype_preference_delta", 0) or 0)
     if str(row.get("context_condition", "")) == "disambig":
         if reliable and (row.get("mean_correct_margin_delta", 0) < -threshold or row.get("mean_correct_delta", 0) < -threshold or row.get("mean_accuracy_delta", 0) < 0):
             return "capability_degrading"
@@ -333,49 +367,73 @@ def effect_label(row: pd.Series, args: argparse.Namespace) -> str:
         return "bias_amplifying"
     if bias_delta < -threshold and row.get("mean_unknown_delta", 0) > 0:
         return "bias_reducing_uncertainty"
-    if bias_delta < -threshold and row.get("mean_nonstereotyped_delta", 0) > row.get("mean_unknown_delta", 0):
+    if bias_delta < -threshold and row.get("mean_signed_nonstereotyped_delta", 0) > row.get("mean_unknown_delta", 0):
         return "bias_reducing_substitution"
-    if row.get("mean_stereotyped_delta", 0) < 0 and row.get("mean_nonstereotyped_delta", 0) < 0 and row.get("mean_unknown_delta", 0) < 0:
+    if row.get("mean_signed_stereotyped_delta", 0) < 0 and row.get("mean_signed_nonstereotyped_delta", 0) < 0 and row.get("mean_unknown_delta", 0) < 0:
         return "general_answer_suppression"
     return "mixed_or_unclear"
 
 
 def summarize_effects(df: pd.DataFrame, group_cols: list[str], args: argparse.Namespace, value_col: str = "stereotype_preference_delta") -> pd.DataFrame:
+    """Aggregate effect-size deltas per group.
+
+    Audit 4.3 (closed 2026-05-27): the headline label, ranking, and beneficial/
+    harmful scores now use the polarity-signed bias metric
+    `signed_stereotype_preference_delta` so that positive = intervention made
+    the model more biased regardless of `question_polarity`. The unsigned
+    `mean_stereotype_preference_delta` is preserved for diagnostic comparison.
+    """
+    signed_value_col = "signed_stereotype_preference_delta" if "signed_stereotype_preference_delta" in df.columns else value_col
     rows = []
     rng = np.random.default_rng(0)
     for keys, group in tqdm(df.groupby(group_cols, dropna=False), desc=f"summarize {len(group_cols)} keys", leave=False):
         if not isinstance(keys, tuple):
             keys = (keys,)
         row = dict(zip(group_cols, keys))
-        by_example = group.groupby("bbq_uid", dropna=False).agg(
-            stereotype_preference_delta=(value_col, "mean"),
-            identity_answer_delta=("identity_answer_delta", "mean") if "identity_answer_delta" in group.columns else (value_col, "mean"),
-            identity_specific_bias_delta=("identity_specific_bias_delta", "mean") if "identity_specific_bias_delta" in group.columns else (value_col, "mean"),
-            unknown_delta=("unknown_delta", "mean"),
-            stereotyped_delta=("stereotyped_delta", "mean"),
-            nonstereotyped_delta=("nonstereotyped_delta", "mean"),
-            identity_substitution_delta=("identity_substitution_delta", "mean"),
-            substitution_delta=("substitution_delta", "mean") if "substitution_delta" in group.columns else ("identity_substitution_delta", "mean"),
-            correct_delta=("correct_delta", "mean"),
-            accuracy_delta=("accuracy_delta", "mean"),
-            correct_margin_delta=("correct_margin_delta", "mean"),
-            stereotype_error_delta=("stereotype_error_delta", "mean"),
-        ).reset_index()
-        vals = by_example["stereotype_preference_delta"].to_numpy(dtype=float)
-        ci_low, ci_high = bootstrap_ci(vals, args.bootstrap_samples, rng)
-        p_value = sign_flip_pvalue(vals, args.permutation_samples, rng)
+        agg_spec = {
+            "stereotype_preference_delta": (value_col, "mean"),
+            "signed_stereotype_preference_delta": (signed_value_col, "mean"),
+            "signed_stereotyped_delta": ("signed_stereotyped_delta", "mean") if "signed_stereotyped_delta" in group.columns else ("stereotyped_delta", "mean"),
+            "signed_nonstereotyped_delta": ("signed_nonstereotyped_delta", "mean") if "signed_nonstereotyped_delta" in group.columns else ("nonstereotyped_delta", "mean"),
+            "identity_answer_delta": ("identity_answer_delta", "mean") if "identity_answer_delta" in group.columns else (value_col, "mean"),
+            "identity_specific_bias_delta": ("identity_specific_bias_delta", "mean") if "identity_specific_bias_delta" in group.columns else (value_col, "mean"),
+            "unknown_delta": ("unknown_delta", "mean"),
+            "stereotyped_delta": ("stereotyped_delta", "mean"),
+            "nonstereotyped_delta": ("nonstereotyped_delta", "mean"),
+            "identity_substitution_delta": ("identity_substitution_delta", "mean"),
+            "substitution_delta": ("substitution_delta", "mean") if "substitution_delta" in group.columns else ("identity_substitution_delta", "mean"),
+            "correct_delta": ("correct_delta", "mean"),
+            "accuracy_delta": ("accuracy_delta", "mean"),
+            "correct_margin_delta": ("correct_margin_delta", "mean"),
+            "stereotype_error_delta": ("stereotype_error_delta", "mean"),
+        }
+        by_example = group.groupby("bbq_uid", dropna=False).agg(**agg_spec).reset_index()
+        # Significance and CI test the signed metric — that's the load-bearing
+        # "did the intervention reduce bias" question.
+        signed_vals = by_example["signed_stereotype_preference_delta"].to_numpy(dtype=float)
+        signed_vals_no_nan = signed_vals[np.isfinite(signed_vals)]
+        ci_low, ci_high = bootstrap_ci(signed_vals_no_nan, args.bootstrap_samples, rng) if len(signed_vals_no_nan) else (float("nan"), float("nan"))
+        p_value = sign_flip_pvalue(signed_vals_no_nan, args.permutation_samples, rng) if len(signed_vals_no_nan) else float("nan")
+        n_polarity_skipped = int(np.isnan(signed_vals).sum())
+        vals_unsigned = by_example["stereotype_preference_delta"].to_numpy(dtype=float)
         row.update({
             "n_examples": int(by_example["bbq_uid"].nunique()),
-            "mean_stereotype_preference_delta": float(np.nanmean(vals)) if len(vals) else float("nan"),
-            "median_stereotype_preference_delta": float(np.nanmedian(vals)) if len(vals) else float("nan"),
-            "std_stereotype_preference_delta": float(np.nanstd(vals, ddof=1)) if len(vals) > 1 else 0.0,
+            "n_polarity_skipped": n_polarity_skipped,
+            "mean_signed_stereotype_preference_delta": float(np.nanmean(signed_vals)) if len(signed_vals) else float("nan"),
+            "median_signed_stereotype_preference_delta": float(np.nanmedian(signed_vals)) if len(signed_vals) else float("nan"),
+            "std_signed_stereotype_preference_delta": float(np.nanstd(signed_vals_no_nan, ddof=1)) if len(signed_vals_no_nan) > 1 else 0.0,
+            "mean_stereotype_preference_delta": float(np.nanmean(vals_unsigned)) if len(vals_unsigned) else float("nan"),  # diagnostic, polarity-confounded
+            "median_stereotype_preference_delta": float(np.nanmedian(vals_unsigned)) if len(vals_unsigned) else float("nan"),
+            "std_stereotype_preference_delta": float(np.nanstd(vals_unsigned, ddof=1)) if len(vals_unsigned) > 1 else 0.0,
             "ci_low": ci_low,
             "ci_high": ci_high,
             "p_value_bootstrap_or_permutation": p_value,
             "mean_identity_answer_delta": float(by_example["identity_answer_delta"].mean()),
             "mean_identity_specific_bias_delta": float(by_example["identity_specific_bias_delta"].mean()),
             "mean_unknown_delta": float(by_example["unknown_delta"].mean()),
-            "mean_stereotyped_delta": float(by_example["stereotyped_delta"].mean()),
+            "mean_signed_stereotyped_delta": float(by_example["signed_stereotyped_delta"].mean()),
+            "mean_signed_nonstereotyped_delta": float(by_example["signed_nonstereotyped_delta"].mean()),
+            "mean_stereotyped_delta": float(by_example["stereotyped_delta"].mean()),  # diagnostic, polarity-confounded
             "mean_nonstereotyped_delta": float(by_example["nonstereotyped_delta"].mean()),
             "mean_identity_substitution_delta": float(by_example["identity_substitution_delta"].mean()),
             "mean_substitution_delta": float(by_example["substitution_delta"].mean()),
@@ -394,11 +452,15 @@ def summarize_effects(df: pd.DataFrame, group_cols: list[str], args: argparse.Na
     else:
         out["q_value_fdr"] = fdr_bh(out["p_value_bootstrap_or_permutation"])
     out["significant"] = out["q_value_fdr"] < args.q_threshold
-    out["effect_size_label"] = out["mean_stereotype_preference_delta"].map(lambda v: effect_size_label(v, args))
+    out["effect_size_label"] = out["mean_signed_stereotype_preference_delta"].map(lambda v: effect_size_label(v, args))
     out["effect_label"] = out.apply(lambda row: effect_label(row, args), axis=1)
-    out["beneficial_score"] = -out["mean_stereotype_preference_delta"].fillna(0) + out["mean_unknown_delta"].fillna(0) + np.maximum(0, out["mean_correct_margin_delta"].fillna(0))
-    out["harmful_score"] = out["mean_stereotype_preference_delta"].fillna(0) - out["mean_correct_margin_delta"].fillna(0)
-    out["substitution_score"] = out["mean_nonstereotyped_delta"].fillna(0) - out["mean_unknown_delta"].fillna(0)
+    # Audit 4.3: scores use signed metrics. beneficial_score is high when the
+    # intervention reduces bias (negative signed_stereotype_preference_delta),
+    # shifts the model toward "unknown" in ambiguous contexts, and preserves
+    # correctness. harmful_score is the inverse for the bias direction.
+    out["beneficial_score"] = -out["mean_signed_stereotype_preference_delta"].fillna(0) + out["mean_unknown_delta"].fillna(0) + np.maximum(0, out["mean_correct_margin_delta"].fillna(0))
+    out["harmful_score"] = out["mean_signed_stereotype_preference_delta"].fillna(0) - out["mean_correct_margin_delta"].fillna(0)
+    out["substitution_score"] = out["mean_signed_nonstereotyped_delta"].fillna(0) - out["mean_unknown_delta"].fillna(0)
     return out
 
 
@@ -435,10 +497,14 @@ def merge_metadata(effects: pd.DataFrame, triage: pd.DataFrame, token_summary: p
 
 
 def make_rankings(effects: pd.DataFrame) -> pd.DataFrame:
+    # Audit 4.3: rankings sort by the polarity-signed bias metric so
+    # "strongest_bias_reducing" and "strongest_bias_amplifying" mean the same
+    # thing across neg- and nonneg-polarity questions.
+    bias_col = "mean_signed_stereotype_preference_delta" if "mean_signed_stereotype_preference_delta" in effects.columns else "mean_stereotype_preference_delta"
     frames = []
     specs = [
-        ("strongest_bias_reducing_features", "mean_stereotype_preference_delta", True),
-        ("strongest_bias_amplifying_features", "mean_stereotype_preference_delta", False),
+        ("strongest_bias_reducing_features", bias_col, True),
+        ("strongest_bias_amplifying_features", bias_col, False),
         ("strongest_unknown_increasing_features", "mean_unknown_delta", False),
         ("strongest_substitution_effect_features", "mean_identity_substitution_delta", False),
         ("least_capability_degrading_features", "mean_accuracy_delta", False),
@@ -463,40 +529,44 @@ def save_fig(fig: plt.Figure, output_dir: Path, name: str) -> None:
 
 
 def plot_feature_bars(effects: pd.DataFrame, output_dir: Path, args: argparse.Namespace) -> None:
+    # Audit 4.3: bars show the polarity-signed bias metric (CI in
+    # summarize_effects is also on the signed metric).
+    bias_col = "mean_signed_stereotype_preference_delta" if "mean_signed_stereotype_preference_delta" in effects.columns else "mean_stereotype_preference_delta"
     data = effects[(effects["context_condition"].eq("ambig")) & (effects["n_examples"] >= args.min_examples)].copy()
-    data = data.sort_values("mean_stereotype_preference_delta", key=lambda s: s.abs(), ascending=False).head(args.top_n_features)
+    data = data.sort_values(bias_col, key=lambda s: s.abs(), ascending=False).head(args.top_n_features)
     if data.empty:
         return
     fig, ax = plt.subplots(figsize=(max(12, 0.45 * len(data)), 6))
     x = np.arange(len(data))
     colors = data["effect_label"].astype("category").cat.codes
-    ax.bar(x, data["mean_stereotype_preference_delta"], color=plt.cm.tab20(colors % 20))
-    ax.errorbar(x, data["mean_stereotype_preference_delta"], yerr=[data["mean_stereotype_preference_delta"] - data["ci_low"], data["ci_high"] - data["mean_stereotype_preference_delta"]], fmt="none", color="black", lw=1)
+    ax.bar(x, data[bias_col], color=plt.cm.tab20(colors % 20))
+    ax.errorbar(x, data[bias_col], yerr=[data[bias_col] - data["ci_low"], data["ci_high"] - data[bias_col]], fmt="none", color="black", lw=1)
     ax.axhline(0, color="black", lw=1)
     ax.set_xticks(x, [str(int(v)) for v in data["feature_id"]], rotation=60, ha="right")
     ax.set_ylabel(BIAS_LABEL)
-    ax.set_title("Feature-level ambiguous bias effects (top absolute effects)")
+    ax.set_title("Feature-level ambiguous bias effects (top absolute effects, polarity-signed)")
     save_fig(fig, output_dir, "feature_level_bias_effect_bars_by_axis_alpha")
 
 
 def plot_top_by_contrast(effects: pd.DataFrame, output_dir: Path, args: argparse.Namespace, kind: str) -> None:
+    bias_col = "mean_signed_stereotype_preference_delta" if "mean_signed_stereotype_preference_delta" in effects.columns else "mean_stereotype_preference_delta"
     data = effects[(effects["context_condition"].eq("ambig")) & (effects["n_examples"] >= args.min_examples)].copy()
     if data.empty:
         return
     pieces = []
     for _, group in data.groupby("mapped_contrast_name", dropna=False):
-        pieces.append(group.nsmallest(10, "mean_stereotype_preference_delta") if kind == "reducing" else group.nlargest(10, "mean_stereotype_preference_delta"))
+        pieces.append(group.nsmallest(10, bias_col) if kind == "reducing" else group.nlargest(10, bias_col))
     plot_df = pd.concat(pieces, ignore_index=True) if pieces else pd.DataFrame()
     if plot_df.empty:
         return
     plot_df["label"] = plot_df["mapped_contrast_name"].astype(str) + "\nF" + plot_df["feature_id"].astype(int).astype(str)
     fig, ax = plt.subplots(figsize=(12, max(5, 0.28 * len(plot_df))))
-    ax.barh(np.arange(len(plot_df)), plot_df["mean_stereotype_preference_delta"])
-    ax.errorbar(plot_df["mean_stereotype_preference_delta"], np.arange(len(plot_df)), xerr=[plot_df["mean_stereotype_preference_delta"] - plot_df["ci_low"], plot_df["ci_high"] - plot_df["mean_stereotype_preference_delta"]], fmt="none", color="black", lw=1)
+    ax.barh(np.arange(len(plot_df)), plot_df[bias_col])
+    ax.errorbar(plot_df[bias_col], np.arange(len(plot_df)), xerr=[plot_df[bias_col] - plot_df["ci_low"], plot_df["ci_high"] - plot_df[bias_col]], fmt="none", color="black", lw=1)
     ax.axvline(0, color="black", lw=1)
     ax.set_yticks(np.arange(len(plot_df)), plot_df["label"], fontsize=8)
     ax.set_xlabel(BIAS_LABEL)
-    ax.set_title(f"Top bias-{kind} features by contrast")
+    ax.set_title(f"Top bias-{kind} features by contrast (polarity-signed)")
     save_fig(fig, output_dir, f"top_bias_{kind}_features_by_contrast")
 
 
@@ -507,7 +577,8 @@ def plot_amp_suppression_scatter(effects: pd.DataFrame, output_dir: Path) -> Non
     data["alpha_abs"] = pd.to_numeric(data["alpha"], errors="coerce").abs()
     target_abs = 1.0 if (data["alpha_abs"] == 1.0).any() else data["alpha_abs"].dropna().min()
     sub = data[data["alpha_abs"].eq(target_abs)]
-    pivot = sub.pivot_table(index=["layer", "feature_id", "feature_role", "axis_mapped"], columns="steering_direction_label", values="mean_stereotype_preference_delta", aggfunc="mean").reset_index()
+    bias_col = "mean_signed_stereotype_preference_delta" if "mean_signed_stereotype_preference_delta" in sub.columns else "mean_stereotype_preference_delta"
+    pivot = sub.pivot_table(index=["layer", "feature_id", "feature_role", "axis_mapped"], columns="steering_direction_label", values=bias_col, aggfunc="mean").reset_index()
     if not {"feature_amplification", "feature_suppression"}.issubset(pivot.columns):
         return
     fig, ax = plt.subplots(figsize=(8, 7))
@@ -524,12 +595,13 @@ def plot_amp_suppression_scatter(effects: pd.DataFrame, output_dir: Path) -> Non
 
 
 def plot_dose_response(effects: pd.DataFrame, output_dir: Path, args: argparse.Namespace) -> None:
+    bias_col = "mean_signed_stereotype_preference_delta" if "mean_signed_stereotype_preference_delta" in effects.columns else "mean_stereotype_preference_delta"
     data = effects[effects["context_condition"].eq("ambig")].copy()
-    top = data.sort_values("mean_stereotype_preference_delta", key=lambda s: s.abs(), ascending=False)["feature_id"].drop_duplicates().head(min(12, args.top_n_features))
+    top = data.sort_values(bias_col, key=lambda s: s.abs(), ascending=False)["feature_id"].drop_duplicates().head(min(12, args.top_n_features))
     data = data[data["feature_id"].isin(top)]
     if data.empty:
         return
-    g = sns.relplot(data=data, x="alpha", y="mean_stereotype_preference_delta", hue="feature_id", col="mapped_contrast_name", kind="line", col_wrap=3, facet_kws={"sharey": False}) if sns else None
+    g = sns.relplot(data=data, x="alpha", y=bias_col, hue="feature_id", col="mapped_contrast_name", kind="line", col_wrap=3, facet_kws={"sharey": False}) if sns else None
     if g is not None:
         g.set_axis_labels("alpha", BIAS_LABEL)
         g.figure.suptitle("Feature effect dose response", y=1.02)
@@ -539,10 +611,16 @@ def plot_dose_response(effects: pd.DataFrame, output_dir: Path, args: argparse.N
 
 
 def plot_answer_role_shift(effects: pd.DataFrame, output_dir: Path, args: argparse.Namespace) -> None:
-    data = effects[effects["context_condition"].eq("ambig")].sort_values("mean_stereotype_preference_delta", key=lambda s: s.abs(), ascending=False).head(args.top_n_features)
+    bias_col = "mean_signed_stereotype_preference_delta" if "mean_signed_stereotype_preference_delta" in effects.columns else "mean_stereotype_preference_delta"
+    # Audit 4.3: also melt the signed stereotyped/nonstereotyped deltas so the
+    # bars show "did the intervention shift weight onto the bias-aligned vs
+    # anti-bias vs unknown answer" coherently across polarities.
+    signed_stereo = "mean_signed_stereotyped_delta" if "mean_signed_stereotyped_delta" in effects.columns else "mean_stereotyped_delta"
+    signed_nonstereo = "mean_signed_nonstereotyped_delta" if "mean_signed_nonstereotyped_delta" in effects.columns else "mean_nonstereotyped_delta"
+    data = effects[effects["context_condition"].eq("ambig")].sort_values(bias_col, key=lambda s: s.abs(), ascending=False).head(args.top_n_features)
     if data.empty:
         return
-    melt = data.melt(id_vars=["feature_id", "feature_role"], value_vars=["mean_stereotyped_delta", "mean_nonstereotyped_delta", "mean_unknown_delta"], var_name="answer_role", value_name="mean_delta")
+    melt = data.melt(id_vars=["feature_id", "feature_role"], value_vars=[signed_stereo, signed_nonstereo, "mean_unknown_delta"], var_name="answer_role", value_name="mean_delta")
     fig, ax = plt.subplots(figsize=(max(12, 0.5 * data["feature_id"].nunique()), 6))
     if sns:
         sns.barplot(data=melt, x="feature_id", y="mean_delta", hue="answer_role", ax=ax)
