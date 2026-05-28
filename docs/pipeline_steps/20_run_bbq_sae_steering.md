@@ -199,15 +199,29 @@ python scripts/run_bbq_sae_steering.py \
 
 **Remaining (RunPod-deferred + audit 2.4 still open):** Run the headline steering job with `--scoring_mode letter` on RunPod. Audit 2.4 (length bias of `answer_logprob` argmax / accuracy) is a separate, still-open analyzer-side fix; for confirmatory `answer_logprob` runs, the analyzer should length-normalize before computing `predicted_*` / `correct_*` argmax (or switch to letter for those metrics too).
 
-### 2.4 [MAJOR] — `answer_logprob` summed over different-length answers biases argmax metrics
+### 2.4 [MAJOR] — `answer_logprob` summed over different-length answers biases argmax metrics (FIX LANDED 2026-05-28)
 
-**What's wrong:** `score_answer_logprob` sums per-token logprobs over the answer span. BBQ options have different token lengths (`"Cannot be determined"` is usually the longest), so the raw summed logprob systematically penalizes the long unknown option. Within-example *deltas* (intervened − base) cancel because length is constant per example — so `stereotyped_delta`, `unknown_delta`, `bias_margin_delta` etc. are unbiased. But `predicted_base`, `predicted_intervened`, `correct_base`, `correct_intervened`, `prediction_changed`, and any `accuracy_delta` derived from them use `argmax` over the raw summed logprobs and **are** length-biased.
+**Status:** Closed in commit `8ef171c`. The headline default after audit 1.3 (`--scoring_mode letter`) already dissolves the length bias entirely (all answers are one token). This fix is the COMPLEMENT — for confirmatory runs under `--scoring_mode answer_logprob`, `argmax`-based metrics are now length-normalized.
 
-**Why it matters:** Baseline accuracy and any accuracy-change number — which are reported in the legacy aggregator (Step 22) and the feature-level analyzer (Step 23) — are systematically biased toward shorter options. The unknown option is disproportionately predicted as the model's least-likely choice.
+**What landed:**
+- **`answer_lengths(tokenizer, answers)`** returns per-answer token-span lengths under the same tokenization the `answer_logprob` scorer sums over (`' ' + answer`, no special tokens).
+- **`row_metrics` gains optional `base_lengths` / `inter_lengths` and `scoring_mode` kwargs.** When lengths are provided:
+  - `predicted_base` / `predicted_intervened` are computed on per-token mean logprobs (`base / lengths`), not raw sums.
+  - `correct_base` / `correct_intervened` / `prediction_changed` inherit the corrected argmax.
+  - New columns added to every row: `ans*_logprob_per_token_base` / `ans*_logprob_per_token_intervened` / `ans*_token_length` / `argmax_length_normalized` (bool).
+  - `scoring_mode` is stamped on every row regardless (`letter` / `answer_logprob` / `first_token`) so downstream analyzers can stratify or re-derive.
+- **`steering_output_row` and `control_output_row` gain matching kwargs** and pass them through `row_metrics`. The per-example loop computes `answer_lens_for_row` once per example under `answer_logprob` and reuses it across all `(alpha, position, mode, control)` rows. Single-token modes pass `None` and the prior behavior is preserved.
+- **Within-example deltas unchanged.** `stereotyped_delta`, `nonstereotyped_delta`, `unknown_delta`, `correct_delta`, `bias_margin_delta` already canceled length per the audit's analysis and are not normalized.
 
-**Targeted fix:**
-- For `argmax`/accuracy computations in `row_metrics`, length-normalize (mean per-token logprob over the answer span). Add `len_normalized_score` and use it for `predicted_base`/`predicted_intervened`/`correct_*`.
-- Better: switch the headline scoring to letter (issue 1.3); letters all have constant length and the bias dissolves entirely.
+**Validation (synthetic):**
+- `answer_lengths` returns the right token counts for `' The grandmother'` (3), `' The boy'` (2), `' Cannot be determined'` (5).
+- Pathological case (per-token logprob = -2 uniform): raw argmax picks `'The boy'` (shortest); length-normalized argmax is correctly tied.
+- Asymmetric case (per-token logprobs `[-2.0, -2.0, -1.6]`, correct = `'Cannot be determined'`): raw argmax → `'The boy'` (length-biased, `correct_base=False`); length-normalized → `'Cannot be determined'` (`correct_base=True`). This is the audit's exact failure mode reproduced and fixed.
+- Single-token modes: behavior unchanged; no per-token columns added; `argmax_length_normalized=False`.
+
+**Downstream:** the analyzer's schema is unchanged (same column names for `predicted_*` / `correct_*` / `accuracy_delta`). Under the new default `--scoring_mode letter` this fix is a no-op. Under `--scoring_mode answer_logprob` (confirmatory runs), accuracy and `prediction_changed` numbers will shift.
+
+**Original audit (preserved):** `score_answer_logprob` sums per-token logprobs over the answer span. BBQ options have different token lengths (`"Cannot be determined"` is usually the longest), so the raw summed logprob systematically penalizes the long unknown option. Within-example *deltas* (intervened − base) cancel because length is constant per example — so `stereotyped_delta`, `unknown_delta`, `bias_margin_delta` etc. are unbiased. But `predicted_base`, `predicted_intervened`, `correct_base`, `correct_intervened`, `prediction_changed`, and any `accuracy_delta` derived from them used `argmax` over the raw summed logprobs and were length-biased. Baseline accuracy and any accuracy-change number were systematically biased toward shorter options; the unknown option was disproportionately predicted as the model's least-likely choice.
 
 ### 3.1 cross-reference and 3.2 [MAJOR] — Steering magnitude is uniform and untethered to feature scale (PARTIAL: 3.1 path unblocked, scale tethering still STILL OPEN)
 

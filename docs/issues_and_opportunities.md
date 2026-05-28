@@ -224,13 +224,19 @@ These are mechanical extensions of the SVD / probe machinery rather than new inf
 
 **Original audit (preserved):** `run_bbq_sae_steering.py` implemented three controls — `sign_flip`, `random_direction_norm_matched`, `random_feature_matched` — but they were gated behind *not* `--disable_controls`, and the documented production command in `docs/bbq_steering_pipeline.md` passed `--disable_controls`. Without controls, a feature's effect cannot be claimed specific. A norm-matched random direction added at the same position may shift the bias margin just as much. The whole "feature X is causally implicated in bias" claim needs: effect(feature X) ≫ effect(random direction) ≫ effect(random feature set), at matched norm.
 
-### 2.4 [MAJOR] `answer_logprob` summed over different-length answers
+### 2.4 [MAJOR] `answer_logprob` summed over different-length answers (FIX LANDED 2026-05-28)
 
-`score_answer_logprob` sums per-token logprobs over the answer span. BBQ's three options have different token lengths; `"Cannot be determined"` is typically the longest, so summed logprob systematically penalizes the unknown option.
+**Status:** Closed in commit `8ef171c` (`scripts/run_bbq_sae_steering.py`). The complement to audit 1.3 (commit `2829417`, which switched the headline default to `--scoring_mode letter` and dissolves the bias entirely). This commit handles the `--scoring_mode answer_logprob` case used for confirmatory runs on top features.
 
-Within-example *deltas* (intervened − base) cancel the length bias because length is constant per example — so `stereotype_preference_delta` etc. are OK. But `predicted_base`, `correct_base`, `prediction_changed`, and `accuracy_delta` use `argmax` over **raw** summed logprobs, which *is* length-biased. Baseline accuracy and any accuracy-change metric are contaminated.
+**What landed:**
+- New `answer_lengths(tokenizer, answers)` returns per-answer token-span lengths under the same tokenization the `answer_logprob` scorer sums over.
+- `row_metrics` gains optional `base_lengths` / `inter_lengths` / `scoring_mode` kwargs. When lengths are provided, `predicted_*` / `correct_*` / `prediction_changed` are computed on per-token mean logprobs (`base / lengths`), not raw sums. New columns: `ans*_logprob_per_token_*`, `ans*_token_length`, `argmax_length_normalized` (bool), `scoring_mode`.
+- `steering_output_row` and `control_output_row` thread the lengths through; the per-example loop computes `answer_lens_for_row` once per example under `answer_logprob` and reuses it across all `(alpha, position, mode, control)` rows.
+- Within-example deltas (`stereotyped_delta`, `bias_margin_delta`, etc.) are not normalized — they already canceled length per the audit's analysis.
 
-What to do: length-normalize (mean per-token logprob) for any argmax/accuracy metric, or score the answer letter (1.3) which has constant length and dissolves the problem.
+**Validation (synthetic):** asymmetric case with per-token logprobs `[-2.0, -2.0, -1.6]` and correct = "Cannot be determined" — raw argmax wrongly picks "The boy" (shortest, length-biased); length-normalized argmax correctly picks "Cannot be determined." The audit's exact failure mode reproduced and fixed.
+
+**Original audit (preserved):** `score_answer_logprob` sums per-token logprobs over the answer span. BBQ's three options have different token lengths; `"Cannot be determined"` is typically the longest, so summed logprob systematically penalized the unknown option. Within-example deltas (intervened − base) canceled the length bias because length is constant per example — so `stereotype_preference_delta` etc. were OK. But `predicted_base`, `correct_base`, `prediction_changed`, and `accuracy_delta` used `argmax` over raw summed logprobs and were length-biased. Baseline accuracy and any accuracy-change metric were contaminated.
 
 ### 2.5 [MAJOR] Selection-induced bias ("winner's curse") in feature effect sizes (PARTIAL FIX LANDED 2026-05-27)
 
@@ -614,7 +620,7 @@ Ordered by what most threatens a defensible result.
 7. Held-out split for feature selection vs. effect estimation (2.5 — PARTIAL FIX LANDED 2026-05-27: identity-prompt selectivity half closed in commit `4481445`; BBQ-side rankings + held-out confirmation set still open).
 8. Null models for geometry probes and the shared-subspace spectrum (2.2).
 9. Make held-out (cross-family/cross-template) AUC the headline; demote in-sample AUC (2.1).
-10. Fix answer scoring: score the letter A/B/C, or length-normalize `answer_logprob` (1.3 — FIX LANDED 2026-05-28 commit `2829417`: `--scoring_mode letter` is the new default. 2.4 — still open analyzer-side fix; length-normalize for argmax/accuracy).
+10. Fix answer scoring: score the letter A/B/C, or length-normalize `answer_logprob` (1.3 — FIX LANDED 2026-05-28 commit `2829417`: `--scoring_mode letter` is the new default; 2.4 — FIX LANDED 2026-05-28 commit `8ef171c`: `row_metrics` length-normalizes argmax under `answer_logprob`; both close).
 11. Restrict headline steering to `exact` contrast mapping; stratify by mapping confidence (3.4 — FIX LANDED 2026-05-27, commit `56a5f7e`).
 12. Audit every contrast/alias identity ID against the dataset; make missing-ID skips loud (4.1).
 13. Reduce the inference grid: one test per feature, not per feature×alpha×position (2.6).
