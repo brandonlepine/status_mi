@@ -122,40 +122,29 @@ These are explicit positives that should survive any refactor (Section 6 of the 
 - Push the fix upstream: have Step 20 emit length-normalized scores (or score the letter A/B/C). Once Step 20 fixes this, this analyzer benefits automatically.
 - As a defensive measure here, recompute argmax on length-normalized scores when this script loads steering rows: divide each `ansK_logprob_*` by the token-length of `ansK` (cache token lengths in `bbq_prepared_examples.parquet`).
 
-### 2.5 [MAJOR] — Selection-induced bias (winner's curse) on feature rankings
+### 2.5 [MAJOR] — Selection-induced bias (winner's curse) on feature rankings (FIX LANDED 2026-05-28)
 
-**What's wrong:** `make_rankings` ranks the top-100 features by `mean_stereotype_preference_delta` and `final_intervention_candidates_table.html` sorts by `beneficial_score` — but the CIs and q-values reported alongside those rankings were computed on the *same* BBQ examples used to rank the features. Post-selection effect sizes and significance are biased upward; the top-ranked feature's "effect" is the maximum of many noisy estimates.
+**Status:** Closed in commit `b5150ec` (part 2/3 of the analyzer inference rework). The remaining 2.5 piece — a held-out confirmation *column* on the identity-prompt screen's `feature_selectivity.csv` — lives in Step 13 and is bundled with audit 2.1.
 
-**Why it matters:** "Feature 12345 reduces stereotype preference by Δ, q=0.04" with the CI and q computed on the data that selected the feature is a biased estimate and a misleading inference. A reviewer will catch this immediately.
+**What landed:** `assign_holdout_split` deterministically partitions BBQ examples into a **selection** and a **confirmation** set, keyed on `bbq_uid` (an example is in the same half for every feature) and salted by `--holdout_seed`, ~`--holdout_frac` (default 0.5) per axis. The headline `feature_inference` table **ranks features on the selection half** and **reports effect sizes / CIs / q-values from the disjoint confirmation half**: `selection_mean_signed_stereotype_preference_delta` + `n_selection` carry the ranking effect; the unprefixed `mean_*`/`ci_*`/`q_value_fdr` + `p_value_confirmation` + `n_confirmation` are the reported values. `make_rankings` and `final_intervention_candidates_table.html` consume this table. `--disable_holdout` reverts to the pooled estimate (diagnostics only). Synthetic winner's-curse demo: top-by-selection noise features shrink toward 0 on confirmation (mean |effect| 0.0027 → 0.0020).
 
-**Targeted fix:**
-- Split BBQ examples into a **selection set** (e.g. 50% stratified by axis × context_condition × question_polarity) and a **confirmation set**. Rank/select features on the selection set; report effect sizes, CIs, and q-values **only** from the confirmation set in `final_intervention_candidates_table.html`, `feature_effect_rankings.csv`, and the per-feature `feature_level_effects.csv`.
-- Add a `--selection_fraction` argument (default 0.5) and a `bbq_uid` → split assignment derived deterministically (`hashlib.sha1(bbq_uid) % 100 < 100 * selection_fraction`).
-- Report selection-set vs confirmation-set effects side by side so the magnitude of the winner's curse is visible.
+**Original audit (preserved):** `make_rankings` ranked the top-100 features and `final_intervention_candidates_table.html` sorted by `beneficial_score`, with CIs and q-values computed on the *same* examples used to rank — post-selection (winner's-curse) estimates biased upward. Targeted fix: selection/confirmation split, rank on selection, report on confirmation, with a deterministic `bbq_uid`→split assignment.
 
-### 2.6 [MAJOR] — Multiplicity is inflated by the alpha × position grid
+### 2.6 [MAJOR] — Multiplicity is inflated by the alpha × position grid (FIX LANDED 2026-05-28)
 
-**What's wrong:** The feature-level group cols include `feature_id, layer, alpha, intervention_position, feature_role, feature_contrast_name, mapped_contrast_name, axis_mapped, context_condition, question_polarity, target_identity_id, nontarget_identity_id, feature_estimate_type, steering_direction_label` — a fully crossed grid. A single feature is tested at 6 alphas × 3 positions × 2 contexts × 2 polarities × 2 direction labels = up to 144 highly-correlated hypothesis tests. FDR is applied **within** `(axis_mapped, context_condition, alpha, intervention_position)` strata, so it does not pool over the highly-correlated alpha and position dimensions — and treating the within-stratum tests as independent both inflates the count and mis-estimates FDR.
+**Status:** Closed in commit `6e132d3` (part 1/3).
 
-**Why it matters:** Reported q-values are too liberal where correlation is high (across alphas of the same feature/position) and too conservative for genuinely independent comparisons. Any claim of "N features survived FDR" depends sensitively on this choice.
+**What landed:** New headline `feature_inference` table whose **unit of inference is the feature** (× layer × `intervention_position` × `context_condition`) at a single pre-registered `--headline_alpha` (`resolve_headline_alpha` auto-infers it for the single-alpha ablate default and requires it for multi-alpha grids). Polarity and identity pairs are **pooled** (valid post-4.3 because the signed metric is comparable across polarities; also more powerful). FDR (BH) is applied **across features** within `(axis × context × position)` — the real family of hypotheses — not within the old `(axis, context, alpha, position)` strata that never pooled the correlated alpha tests. The per-`(alpha, position)` `feature_level_effects.csv` is kept only as a dose-response diagnostic. Option A (single pre-registered alpha) was implemented; Option B (monotone-slope statistic) was not needed given the ablate default has one alpha.
 
-**Targeted fix:**
-- Decide the **unit of inference** explicitly: it should be the *feature* (optionally feature × intervention_position), **not** feature × alpha. Summarize the dose-response into one statistic per feature:
-  - Option A (simple, pre-registerable): test the effect at a single pre-registered alpha (e.g. `|alpha| = 2`), once per feature.
-  - Option B (uses the grid): fit a sign-consistent monotone-slope statistic per (feature, position) — e.g. the Theil-Sen slope of `mean_stereotype_preference_delta` vs `alpha` — and permutation-test that one statistic per feature.
-- Keep the alpha grid in the dose-response *plots* (`dose_response_report`), but do not treat each alpha as a separate hypothesis test.
-- Apply FDR across features (and positions, if kept separate), not within-stratum.
+**Original audit (preserved):** the feature-level group cols were a fully crossed grid (feature × alpha × position × context × polarity × identity-pair × direction), up to ~144 correlated tests per feature, with FDR within `(axis, context, alpha, position)` strata that did not pool the correlated alpha/position dimensions.
 
-### 2.7 [MINOR] — `--smoke` caps bootstrap/permutation; `min_examples = 10` is underpowered
+### 2.7 [MINOR] — `--smoke` caps bootstrap/permutation; underpowered cells (FIX LANDED 2026-05-28)
 
-**What's wrong:** `--smoke` caps `--bootstrap_samples` and `--permutation_samples` at 500 (min p ≈ 1/501 ≈ 0.002), and lowers `--min_examples` to 10. A sign-flip permutation test on 10 paired deltas has only 2¹⁰ = 1024 distinct sign assignments; after FDR almost nothing can reach significance. The documented production command in `docs/bbq_steering_pipeline.md` passes `--smoke`, which means **no full-budget run of this analyzer has been executed**.
+**Status:** Closed in commit `6e132d3` (bundled with 2.6).
 
-**Why it matters:** Smoke-budget statistics are not publishable. Any conclusion drawn from the smoke-budget `feature_level_effects.csv` should be treated as preliminary.
+**What landed:** `--bootstrap_samples`/`--permutation_samples` defaults raised 1000 → **10,000**. New `--min_examples_inference` (default 30) drops underpowered units from `feature_inference` **before** FDR (so q-values reflect the tested set); under the 2.5 split the floor applies to **both** halves. `--smoke` still caps resamples at 500 for fast dev but now emits a loud "underpowered, do not cite" warning, and is dropped from the production command (see operational doc). BCa was considered and deferred — with the coarsened unit + held-out split + 10k percentile bootstrap, percentile and BCa converge.
 
-**Targeted fix:**
-- Drop `--smoke` from the production command. Use `--bootstrap_samples 10000 --permutation_samples 10000`.
-- Raise `--min_examples` to a value (≥30, ideally 50) where a permutation test on paired deltas has nontrivial power. If raising `min_examples` thins the table too aggressively, coarsen the grouping (per issue 2.6) so each unit has more examples.
-- Consider BCa instead of percentile bootstrap for small n.
+**Original audit (preserved):** `--smoke` capped resamples at 500 (min p ≈ 0.002) and lowered `--min_examples` to 10; a sign-flip test on 10 paired deltas has min p ≈ 1/1024, so after FDR almost nothing reaches significance. The production command passed `--smoke`, implying no full-budget run had been executed.
 
 ### 3.4 / 3.3 / 3.1 / 3.2 [BLOCKER/MAJOR, inherited] — Upstream interventions
 

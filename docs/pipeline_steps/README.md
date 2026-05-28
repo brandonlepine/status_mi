@@ -83,7 +83,7 @@ Severity tags are aggregated per script from `issues_and_opportunities.md`. **B*
 | 20 | `run_bbq_sae_steering.py` | 4 | **B** (2.3 — FIX LANDED, 3.1 — FIX LANDED) · M (1.3 — FIX LANDED, 2.4 — FIX LANDED, 3.2 — FIX LANDED, 3.3 — FIX LANDED, 3.4 — FIX LANDED, 5.5 — PARTIAL FIX LANDED) · m (3.5 — FIX LANDED) | [20_run_bbq_sae_steering.md](20_run_bbq_sae_steering.md) |
 | 21 | `build_bbq_sae_feature_cards.py` | 4 | m (downstream inheritance) | [21_build_bbq_sae_feature_cards.md](21_build_bbq_sae_feature_cards.md) |
 | 22 | `analyze_bbq_steering_results.py` | 4 | m (5.10) — marked legacy | [22_analyze_bbq_steering_results.md](22_analyze_bbq_steering_results.md) |
-| 23 | `analyze_bbq_feature_level_causal_effects.py` | 4 | **B** (4.3 — FIX LANDED) · M (2.4, 2.5, 2.6) · m (2.7) — strengths to keep | [23_analyze_bbq_feature_level_causal_effects.md](23_analyze_bbq_feature_level_causal_effects.md) |
+| 23 | `analyze_bbq_feature_level_causal_effects.py` | 4 | **B** (4.3 — FIX LANDED) · M (2.4 — FIX LANDED, 2.5 — FIX LANDED, 2.6 — FIX LANDED) · m (2.7 — FIX LANDED) | [23_analyze_bbq_feature_level_causal_effects.md](23_analyze_bbq_feature_level_causal_effects.md) |
 
 ---
 

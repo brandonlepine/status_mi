@@ -431,23 +431,29 @@ python scripts/analyze_bbq_feature_level_causal_effects.py \
   --token_level_dir /root/local_status_mi/results/bbq_steering/llama-3.1-8b/token_level_sae/ \
   --output_dir /root/local_status_mi/results/bbq_steering/llama-3.1-8b/feature_level_causal_analysis_full/ \
   --layers 24 \
-  --selected_alphas=-8,-4,-2,2,4,8 \
+  --selected_alphas 0 \
+  --headline_alpha 0 \
   --selected_positions final_prompt_token,target_identity_last_token,stereotype_language_last_token \
   --context_conditions ambig,disambig \
   --grouping_levels axis,contrast,identity,subgroup \
   --make_axis_reports \
   --make_identity_reports \
   --make_contrast_reports \
-  --require_complete_alpha_grid \
-  --min_examples 10 \
+  --min_examples 30 \
+  --min_examples_inference 30 \
   --min_examples_per_identity 10 \
   --min_examples_per_contrast 20 \
   --top_n_features 25 \
-  --bootstrap_samples 500 \
-  --permutation_samples 500 \
-  --smoke \
+  --bootstrap_samples 10000 \
+  --permutation_samples 10000 \
+  --holdout_frac 0.5 \
   --overwrite
 ```
+
+Audit 2.5 / 2.6 / 2.7 (closed 2026-05-28): the headline command changed.
+- **`--smoke` removed** and `--bootstrap_samples`/`--permutation_samples` raised to 10,000 (audit 2.7). `--smoke` now only caps resamples for fast dev runs and emits an "underpowered, do not cite" warning; never use it for headline numbers.
+- **`--selected_alphas 0 --headline_alpha 0`** (audit 2.6): the headline `steering_per_feature_matched_full/` run is `--intervention_modes ablate`, whose rows are stamped `alpha=0.0`. The analyzer selects those rows and tests one hypothesis per feature (× position × context) at that single amplitude — the unit of inference is the feature, not feature × alpha. (For a multi-alpha steer/clamp run, pass the dose you pre-registered, e.g. `--selected_alphas <grid> --headline_alpha 2`; the rest of the grid still feeds the dose-response plots.) `--require_complete_alpha_grid` is dropped because the ablate headline has a single alpha.
+- **Held-out confirmation is ON by default** (`--holdout_frac 0.5`, audit 2.5): features are ranked on a per-axis selection half and reported (effect size, CI, q) on the disjoint confirmation half. `--min_examples_inference 30` is the per-half power floor. The headline deliverables — `feature_inference.csv`, `feature_effect_rankings.csv`, `final_intervention_candidates_table.html` — come from this table; the per-`(alpha, position)` `feature_level_effects.csv` is a dose-response diagnostic only. Pass `--disable_holdout` only for a diagnostic pooled run.
 
 ## Current Local Results
 

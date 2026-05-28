@@ -238,9 +238,18 @@ These are mechanical extensions of the SVD / probe machinery rather than new inf
 
 **Original audit (preserved):** `score_answer_logprob` sums per-token logprobs over the answer span. BBQ's three options have different token lengths; `"Cannot be determined"` is typically the longest, so summed logprob systematically penalized the unknown option. Within-example deltas (intervened − base) canceled the length bias because length is constant per example — so `stereotype_preference_delta` etc. were OK. But `predicted_base`, `correct_base`, `prediction_changed`, and `accuracy_delta` used `argmax` over raw summed logprobs and were length-biased. Baseline accuracy and any accuracy-change metric were contaminated.
 
-### 2.5 [MAJOR] Selection-induced bias ("winner's curse") in feature effect sizes (PARTIAL FIX LANDED 2026-05-27)
+### 2.5 [MAJOR] Selection-induced bias ("winner's curse") in feature effect sizes (FIX LANDED 2026-05-28 — BBQ half; identity-screen holdout column remains)
 
-**Status:** Identity-prompt selectivity half closed in commit `4481445` (`scripts/analyze_identity_sae_features.py`). The BBQ half (`analyze_bbq_feature_level_causal_effects.py`) and the held-out confirmation-set work are still open.
+**Status:** Identity-prompt selectivity prefilter closed in commit `4481445`. The BBQ winner's-curse half (`analyze_bbq_feature_level_causal_effects.py`) closed in commit `b5150ec` 2026-05-28 (part 2/3 of the analyzer inference rework, alongside 2.6/2.7). The remaining piece is the smaller enhancement of adding a held-out confirmation **column** to the identity-prompt screen's `feature_selectivity.csv`, which is bundled with audit 2.1's held-out reconstruction math (tracked under 2.1, not here).
+
+**What landed (BBQ half, commit `b5150ec`):**
+- `assign_holdout_split()` deterministically partitions BBQ examples into a **selection** and a **confirmation** set, keyed on `bbq_uid` (an example is in the same half for every feature, so the halves are disjoint example sets) and salted by `--holdout_seed`; ~`--holdout_frac` (default 0.5) per axis, with the realized per-axis balance logged.
+- The headline `feature_inference` table (the feature-level unit from 2.6) now **ranks features on the selection half** and **reports effect sizes, CIs, and q-values from the disjoint confirmation half**. `selection_mean_signed_stereotype_preference_delta` + `n_selection` carry the ranking effect; the unprefixed `mean_*`/`ci_*`/`q_value_fdr` + `p_value_confirmation` + `n_confirmation` are the reported confirmation values. `make_rankings` and `final_intervention_candidates_table.html` consume this table.
+- Held-out is ON by default; `--disable_holdout` reverts to the pooled (winner's-curse-prone) estimate for diagnostics. The `--min_examples_inference` floor (2.7) applies to **both** halves before FDR.
+
+**Validation (synthetic, part of the 17/17 part-2 suite):** the split is deterministic / ~50/50 / seed-varying / one-half-per-uid; selection and confirmation effects are computed on disjoint data; a **pure-noise winner's-curse demo** shows the top-by-selection units shrinking toward 0 on confirmation (mean |effect| 0.0027 → 0.0020); rankings order by the selection effect. ⚠️ **NEEDS RUNPOD:** full analyzer pass on real steering output, and a check that each axis has enough examples for a 50/50 split at `--min_examples_inference`.
+
+**Original audit (preserved):** Identity-prompt selectivity half closed in commit `4481445` (`scripts/analyze_identity_sae_features.py`). The BBQ half (`analyze_bbq_feature_level_causal_effects.py`) and the held-out confirmation-set work were open at audit time.
 
 **What landed (identity-prompt selectivity half):**
 - The `|diff_mean|` prefilter is gone in both `feature_selectivity_for_contrast` (was 5·top_n) and `identity_selectivity` (was 3·top_n). Cohen's d and AUC are now computed analytically for every feature, then the top `top_n` is selected by `|d|`.
@@ -257,19 +266,35 @@ Why it matters: the top features' effect sizes and significance are over-stated.
 What to do (remaining):
 - Split BBQ examples into a **selection set** and a **confirmation set**. Rank/select features on the selection set; report effect sizes, CIs, and q-values **only** from the confirmation set. (BBQ is large enough; even a 50/50 split per axis works.) Same plumbing should be applied to the identity-prompt screen to add a holdout-set confirmation column to `feature_selectivity.csv`, bundled with audit 2.1's held-out reconstruction math.
 
-### 2.6 [MAJOR] Multiplicity is inflated by the alpha × position grid
+### 2.6 [MAJOR] Multiplicity is inflated by the alpha × position grid (FIX LANDED 2026-05-28)
 
-`analyze_bbq_feature_level_causal_effects.py` produces one significance test per `(feature, layer, alpha, position, role, contrast, axis, context, polarity, …)` group. A single feature is tested at 6 alphas × 3 positions = 18 highly-correlated tests. FDR (`fdr_bh`) is applied within `(axis, context, alpha, position)` strata, so it does not even pool those 18 — and treating correlated tests as independent both inflates the count and mis-estimates FDR.
+**Status:** Closed in commit `6e132d3` (`scripts/analyze_bbq_feature_level_causal_effects.py`, part 1/3 of the analyzer inference rework).
 
-What to do:
-- Decide the **unit of inference** up front: it should be the *feature* (optionally feature × position), not feature × alpha. Summarize the dose-response across alphas into one statistic per feature (e.g. sign-consistent monotone slope, or the effect at a single pre-registered alpha), test that once, FDR across features.
-- Keep the alpha grid for the dose-response *plots*, but not as 6 separate hypothesis tests.
+**What landed:**
+- New headline `feature_inference` table whose **unit of inference is the feature** (× layer × `intervention_position` × `context_condition`), tested at a single pre-registered `--headline_alpha`. `resolve_headline_alpha` infers the alpha when only one is present (the audit-3.1 `ablate` default has just `alpha=0.0`) and **requires** `--headline_alpha` for a multi-alpha steer/clamp grid — the rest of the grid feeds the dose-response *plots*, not separate tests.
+- Question **polarity is pooled** into the unit (valid because audit 4.3 made the signed metric comparable across polarities; also raises power), as are identity pairs. The remaining grouping columns (axis, role, contrast, estimate-type, direction) are feature-constant under matched-axis steering and do not fragment a feature.
+- **FDR (BH) is computed across FEATURES** within `(axis × context × position)` — the actual family of hypotheses — instead of within `(axis, context, alpha, position)` strata that never pooled the correlated alpha tests.
+- The per-`(alpha, position)` `feature_level_effects` table is retained only as a dose-response diagnostic; its q-values are no longer the headline significance. Rankings + the final-candidates report consume `feature_inference`.
 
-### 2.7 [MINOR] Underpowered cells and small permutation/bootstrap budgets
+**Validation (synthetic, part of the 13/13 part-1 suite):** single-alpha auto-inference + multi-alpha enforcement; exactly one tested unit per feature with the two polarities pooled; FDR computed within axis strata; controls excluded. ⚠️ **NEEDS RUNPOD:** full analyzer pass on real steering output.
 
-`min_examples = 10` (and `--smoke` lowers nothing below that). A sign-flip permutation test on 10 paired deltas has only 2¹⁰ = 1024 distinct sign assignments — minimum p ≈ 1/1024 — and after FDR almost nothing can reach significance. The documented `analyze_bbq_feature_level_causal_effects.py` command also passes `--smoke`, which caps bootstrap/permutation at 500 (min p ≈ 0.002) — and the fact that the *production* command still says `--smoke` suggests no full-budget run has been done.
+**Original audit (preserved):** `analyze_bbq_feature_level_causal_effects.py` produced one significance test per `(feature, layer, alpha, position, role, contrast, axis, context, polarity, …)` group. A single feature was tested at 6 alphas × 3 positions = 18 highly-correlated tests. FDR (`fdr_bh`) was applied within `(axis, context, alpha, position)` strata, so it did not even pool those 18 — and treating correlated tests as independent both inflates the count and mis-estimates FDR. What to do: decide the unit of inference up front (the feature, optionally feature × position), summarize the dose-response into one statistic per feature, test once, FDR across features; keep the alpha grid for dose-response plots only.
 
-What to do: for final results, drop `--smoke`; use ≥10,000 bootstrap and ≥10,000 permutation samples; raise per-cell minimums (or coarsen grouping, per 2.6) so each tested unit has enough examples for the test to have power. Consider BCa instead of percentile bootstrap for small n.
+### 2.7 [MINOR] Underpowered cells and small permutation/bootstrap budgets (FIX LANDED 2026-05-28)
+
+**Status:** Closed in commit `6e132d3` (`scripts/analyze_bbq_feature_level_causal_effects.py`, bundled with the 2.6 part-1 change).
+
+**What landed:**
+- `--bootstrap_samples` / `--permutation_samples` defaults raised 1000 → **10,000**.
+- New `--min_examples_inference` (default 30) is a per-unit power floor on the headline `feature_inference` table; underpowered units are dropped **before** FDR so q-values reflect the actual tested set, not the pre-filter superset. Under the 2.5 held-out split the floor applies to **both** halves (so ≥60 examples/unit total at the default).
+- `--smoke` still caps resamples at 500 for fast dev runs but now emits a loud startup WARNING that the run's CIs/q-values are underpowered and must not be cited; the production command drops it (see operational doc).
+- The coarser unit of inference from 2.6 (feature, not feature × alpha × polarity × identity-pair) directly raises per-unit n, which is the other half of the power fix.
+
+BCa bootstrap was considered (audit's "consider") and not adopted — with the coarsened unit + held-out split + 10k percentile bootstrap, n per unit is large enough that percentile and BCa converge; recorded as optional future work.
+
+**Validation (synthetic):** the `--min_examples_inference` filter empties the table when the floor exceeds cell size (part-1 suite) and drops units when either held-out half is too small (part-2 suite).
+
+**Original audit (preserved):** `min_examples = 10` (and `--smoke` lowers nothing below that). A sign-flip permutation test on 10 paired deltas has only 2¹⁰ = 1024 distinct sign assignments — minimum p ≈ 1/1024 — and after FDR almost nothing can reach significance. The documented command also passed `--smoke`, which caps bootstrap/permutation at 500 (min p ≈ 0.002) — and the fact that the production command still said `--smoke` suggested no full-budget run had been done. What to do: drop `--smoke`; use ≥10,000 bootstrap/permutation samples; raise per-cell minimums (or coarsen grouping, per 2.6); consider BCa for small n.
 
 ### 2.8 [MINOR] Probe dimensionality reduction leaks across CV folds (VERIFIER LANDED 2026-05-27; RunPod verification run pending)
 
@@ -645,14 +670,14 @@ Ordered by what most threatens a defensible result.
 
 **Tier 2 — required for the numbers to be honest**
 
-7. Held-out split for feature selection vs. effect estimation (2.5 — PARTIAL FIX LANDED 2026-05-27: identity-prompt selectivity half closed in commit `4481445`; BBQ-side rankings + held-out confirmation set still open).
+7. Held-out split for feature selection vs. effect estimation (2.5 — FIX LANDED 2026-05-28: BBQ winner's-curse half closed in commit `b5150ec` — rank on selection, report CIs/q on a disjoint per-axis confirmation half; identity-prompt selectivity prefilter closed earlier in `4481445`; only the identity-screen held-out *column* remains, bundled with 2.1).
 8. Null models for geometry probes and the shared-subspace spectrum (2.2).
 9. Make held-out (cross-family/cross-template) AUC the headline; demote in-sample AUC (2.1).
 10. Fix answer scoring: score the letter A/B/C, or length-normalize `answer_logprob` (1.3 — FIX LANDED 2026-05-28 commit `2829417`: `--scoring_mode letter` is the new default; 2.4 — FIX LANDED 2026-05-28 commit `8ef171c`: `row_metrics` length-normalizes argmax under `answer_logprob`; both close).
 11. Restrict headline steering to `exact` contrast mapping; stratify by mapping confidence (3.4 — FIX LANDED 2026-05-27, commit `56a5f7e`).
 12. Audit every contrast/alias identity ID against the dataset; make missing-ID skips loud (4.1).
-13. Reduce the inference grid: one test per feature, not per feature×alpha×position (2.6).
-14. Drop `--smoke`; raise bootstrap/permutation budgets and per-cell minimums (2.7).
+13. Reduce the inference grid: one test per feature, not per feature×alpha×position (2.6 — FIX LANDED 2026-05-28, commit `6e132d3`: feature-level `feature_inference` table at a single `--headline_alpha`, polarity pooled, FDR across features).
+14. Drop `--smoke`; raise bootstrap/permutation budgets and per-cell minimums (2.7 — FIX LANDED 2026-05-28, commit `6e132d3`: defaults 10k bootstrap/permutation, `--min_examples_inference` floor before FDR, `--smoke` now warns).
 
 **Tier 3 — correctness, clarity, strengthening**
 
