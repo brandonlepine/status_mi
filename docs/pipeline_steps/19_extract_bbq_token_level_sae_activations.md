@@ -71,13 +71,21 @@ The synthetic test that landed with commit `afb3ee3` confirmed the helpers' math
 - **Multi-token identity labels.** The first token of a span was confirmed to flag correctly; all spanned tokens flipping together was not verified.
 - **End-to-end run against real BBQ activations.** The row-dict additions and `_mean_where` summary helper were not exercised in a real `extract_bbq_token_level_sae_activations.py` job.
 
-**Recommended pre-RunPod check (~30 lines, one-off):**
-On the first RunPod run, sample ~50 prepared BBQ rows and assert:
-1. `find_section_spans` returns non-empty `context` / `question` / `ans*` for every row (count and log failures; if >5% fail, the prompt-format assumption is broken).
-2. For every token row with `is_target_identity_token = True`, exactly one of the three `is_target_identity_token_in_*` flags is True (count and log violations).
-3. Bin `intervention_section` distribution per position name and print the table — if `target_identity_last_context_token` lands in `context` for the synthetic but is silently falling back to `final` on the production prompts, this is where it shows.
+**Recommended pre-RunPod check:** `scripts/audit_intervention_sections.py` was written for exactly this. It samples ~50 prepared BBQ rows, runs `find_section_spans` / `positions_for` / `position_section_for` against the real Llama tokenizer, and exits non-zero on threshold violations. Four checks:
 
-The check is straightforward to write as `scripts/audit_intervention_sections.py` if it doesn't get done inline at the first RunPod run.
+1. `find_section_spans` returns non-empty `context` / `question` / `ans*` for every row (default threshold: ≤5% failures).
+2. For every token with legacy `is_target_identity_token = True`, ≥1 of the three `is_target_identity_token_in_*` flags is True — orphan and boundary-straddle counts reported (default threshold: ≤5% orphans).
+3. For each of the six section-explicit position names, the `intervention_section` distribution across the sampled rows (default threshold: ≤20% silent fallback to `final`).
+4. The (position × section) cross-tab so the operator can eyeball drift.
+
+```bash
+python scripts/audit_intervention_sections.py \
+    --prepared_data /workspace/status_mi/results/bbq_steering/llama-3.1-8b/prepared/bbq_prepared_examples.parquet \
+    --tokenizer_path /workspace/status_mi/models/llama-3.1-8b \
+    --n_examples 50
+```
+
+Run this **before** any steering job that depends on the section-explicit position names. If it exits non-zero, do not cite the new positions in headline causal claims until the failures are diagnosed.
 
 ### 4.6 [MINOR] — Top-k SAE truncation (in the encoding upstream) may bias activation summaries
 
