@@ -49,6 +49,18 @@ Verify that the per-layer SAE checkpoint and the extracted activation `.npy` for
 
 **Audit 4.6 gate (FIX LANDED 2026-05-27 in commit `c6dbcfe`):** the validator now reports `reconstruction_l0_p50`, `reconstruction_l0_p95`, `reconstruction_l0_p99` alongside `reconstruction_mean_l0` and `reconstruction_max_l0`, and the row fails if `reconstruction_max_l0 > --top_k_save_threshold` (default `64`, matching [Step 5](05_encode_identity_saes.md)'s `--top_k_save`). When max L0 exceeds the cap, real activations are silently truncated to zero downstream (`sparse_long` drops everything outside the top-k), which biases `mean_a` / `freq_a` and inflates apparent contrast selectivity. The validator now flags this automatically as `recon_l0_clipping_risk = True` — either raise `--top_k_save` in step 5 (and re-encode), or pass `--top_k_save_threshold=<higher>` to acknowledge the choice.
 
+**Audit 4.6 complement — saved-artifact audit (commit `8b1381b`+, 2026-05-28):** the validator's gate uses a FRESH encoder pass on sampled raw activations. The actual SAVED `feature_indices_top{K}.npy` / `feature_values_top{K}.npy` files (which drove triage and seeded the BBQ feature pool) are audited by `scripts/audit_identity_sae_l0.py`. It reads the saved values per layer and counts rows "at the cap" — rows with all `top_k` saved values positive, i.e. the true L0 was `≥ top_k` and lower-magnitude features were truncated. Run both:
+
+```bash
+# 1. The fresh-encoder gate (this validator) catches "the SAE in principle has L0 > 64".
+python scripts/validate_sae_hook_alignment.py --layers 0,8,16,24,32
+
+# 2. The saved-artifact audit catches "your existing encoded files actually hit the cap".
+python scripts/audit_identity_sae_l0.py --layers 0,8,16,24,32
+```
+
+If either fails on a layer: re-encode that layer with a larger `--top_k_save` (use `reconstruction_p99_l0 × 2` as a starting point), then regenerate [Step 13](13_analyze_identity_sae_features.md) and [Step 17](17_triage_sae_identity_features.md) before consuming the feature pool downstream.
+
 ## Rebuild checklist
 - [x] Add `--check_reconstruction` and implement encode → decode → FVU/cosine/L0 on a sampled subset. (Done.)
 - [x] Reuse `load_sae` / `encode_full` / `decode_full` from [Step 5](05_encode_identity_saes.md). (Done.)

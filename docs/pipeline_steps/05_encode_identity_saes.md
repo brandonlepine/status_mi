@@ -101,16 +101,25 @@ recon      = recon_norm * scale_out
 - Re-encode every layer with this script (`--overwrite`). All existing `feature_*.npy` / `feature_stats.csv` / every downstream Stage-3 and Stage-4 analysis CSV are obsolete.
 - Run [Step 6](06_validate_sae_hook_alignment.md) and confirm `reconstruction_fvu <= 0.15` and `reconstruction_cosine_mean >= 0.95` before consuming any new artifact downstream.
 
-### 4.6 [MINOR] — Top-64 SAE truncation may clip true activations
+### 4.6 [MINOR] — Top-64 SAE truncation may clip true activations (PARTIAL FIX LANDED 2026-05-27 / 2026-05-28)
 
-**What's wrong:** The 32× expansion LlamaScope SAE has roughly 131k features (`32 × 4096`). `--top_k_save 64` keeps only the 64 highest-activating features per row; everything else is dropped. If the SAE's true L0 (number of active features per token) at layer 24 exceeds 64 on some prompts, those real activations are clipped to exact zero in the sparse representation.
+**Status:** Two detection paths now exist; remediation (re-encode with larger `--top_k_save`) requires RunPod.
 
-**Why it matters:** Mid-ranked features that are *active but not top-64* contribute zero downstream. Per-feature aggregates (`mean_a`, `freq_a`, `cohens_d`, `auc`) are biased downward for those features, and contrast selectivity for top-ranked features is slightly inflated relative to the full-rank picture. If L0 ≈ 30–50 it does not matter; if L0 ≈ 80–200 (which JumpReLU SAEs at this width can reach), the bias is meaningful.
+**What landed:**
+- **Fresh-encoder gate (commit `c6dbcfe`, 2026-05-27):** [Step 6](06_validate_sae_hook_alignment.md)'s validator re-encodes a sample of raw activations, reports `reconstruction_l0_p50` / `p95` / `p99` / `mean` / `max`, and fails when `max_l0 > --top_k_save_threshold`. This is the un-truncated truth, the right number to size `--top_k_save` against.
+- **Saved-artifact gate (commit `8b1381b`+, 2026-05-28):** `scripts/audit_identity_sae_l0.py` reads the SAVED `feature_indices_top{K}.npy` / `feature_values_top{K}.npy` files and counts rows "at the cap" (all `top_k` saved values positive → truncation occurred). Tells you whether the EXISTING saved encodings — and the triaged feature pool derived from them — are biased, without paying for a re-encode.
 
-**Targeted fix:**
-- Measure the empirical L0 distribution after fixing 1.4 (the right activation function matters here). Add a one-liner to `feature_stats.csv` or a separate diagnostic: distribution of `(acts > 0).sum(dim=1)`.
-- If L0 is comfortably under ~50, document and keep `top_k_save=64`.
-- If L0 is higher, raise `top_k_save` to ~2× the 99th percentile L0 and re-encode. Storage cost is linear in `top_k_save`.
+```bash
+python scripts/audit_identity_sae_l0.py \
+    --sae_encoded_dir /workspace/status_mi/results/sae_identity/llama-3.1-8b/final_token \
+    --layers 0,8,16,24,32
+```
+
+**Decision rule:**
+- If [Step 6](06_validate_sae_hook_alignment.md) reports `max_l0 < 50` AND `audit_identity_sae_l0.py` reports 0% at-cap rows → keep `--top_k_save 64`.
+- If either gate flags a problem → re-encode with `--top_k_save ≈ 2 × p99_l0` from Step 6, then re-run [Step 13](13_analyze_identity_sae_features.md) and [Step 17](17_triage_sae_identity_features.md). The feature pool that drove BBQ steering must be rebuilt from the corrected encodings.
+
+**Why it matters (preserved):** The 32× expansion LlamaScope SAE has roughly 131k features (`32 × 4096`). `--top_k_save 64` keeps only the 64 highest-activating features per row; everything else is dropped. Mid-ranked features that are *active but not top-64* contribute zero downstream — per-feature aggregates (`mean_a`, `freq_a`, `cohens_d`, `auc`) are biased downward for those features, and contrast selectivity for top-ranked features is slightly inflated relative to the full-rank picture. If L0 ≈ 30–50 it does not matter; if L0 ≈ 80–200 (which JumpReLU SAEs at this width can reach), the bias is meaningful.
 
 ### 1.1 [BLOCKER] — Measurement locus (FIX LANDED in this script 2026-05-27)
 
@@ -146,7 +155,7 @@ Downstream feature analysis ([Step 13](13_analyze_identity_sae_features.md), [St
 - [ ] Re-download SAEs on RunPod via [Step 3](03_download_openmoss_saes.md) so `hyperparameters.json` is on disk per layer.
 - [ ] Re-encode every layer (`--overwrite`). Delete prior `feature_*.npy`, `feature_stats.csv`, and every downstream analysis CSV.
 - [ ] Run [Step 6](06_validate_sae_hook_alignment.md) and confirm `reconstruction_fvu` ≤ `--reconstruction_fvu_threshold` (default 0.15) before consuming any new artifact downstream.
-- [ ] Measure empirical L0 with the corrected encoder; raise `--top_k_save` if 99th-percentile L0 exceeds ~50 (issue 4.6).
+- [x] Measure empirical L0 with the corrected encoder; raise `--top_k_save` if 99th-percentile L0 exceeds ~50 (issue 4.6). *(Detection landed 2026-05-27 in commit `c6dbcfe` — [Step 6](06_validate_sae_hook_alignment.md) validator gate on `max_l0`; complement landed 2026-05-28 — `scripts/audit_identity_sae_l0.py` audits the saved top-k files. Remediation pending the RunPod re-encode.)*
 - [x] Align `--activation_mode` choices with [Step 4](04_extract_identity_activations.md)'s `--token_mode` and drop the `NotImplementedError`. (Done.)
 - [ ] Re-run every downstream Stage-3 and Stage-4 analysis after re-encoding.
 

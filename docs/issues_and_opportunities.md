@@ -406,16 +406,29 @@ The 4.1 audit explicitly bundled "audit every value against the identity CSV (4.
 
 `create_dataset.py` decides whether a template×identity pair is realized purely by "is the required form column non-empty", ignoring the `works_is_adj` / `works_group` / … flags in the identity CSV. In practice forms are empty roughly when the flag is 0, so output is mostly correct, but the flags are unused. Either use them as the source of truth or delete them to avoid the impression of a constraint that is not enforced.
 
-### 4.6 [MINOR] Top-64 SAE truncation may clip true activations (PARTIAL FIX LANDED 2026-05-27)
+### 4.6 [MINOR] Top-64 SAE truncation may clip true activations (PARTIAL FIX LANDED 2026-05-27 / 2026-05-28)
 
-**Status:** Detection landed in commit `c6dbcfe` (`scripts/validate_sae_hook_alignment.py`). The empirical answer — does the LlamaScope SAE actually need more than 64 active features per prompt? — still requires the RunPod run with real SAE weights and real activations.
+**Status:** Two detection paths landed across commits `c6dbcfe` (fresh-encoder gate) and `8b1381b`+ (saved-artifact audit). Remediation — re-encode with larger `--top_k_save` if either flags a problem, then regenerate `analyze_identity_sae_features` + triage — still requires the RunPod run.
 
-**What landed:**
-- The step-6 validator now reports `reconstruction_l0_p50`, `reconstruction_l0_p95`, `reconstruction_l0_p99` alongside the existing `reconstruction_mean_l0` and `reconstruction_max_l0`.
-- New `--top_k_save_threshold` CLI flag (default `64`, matching step 5's `--top_k_save`). The validator computes `recon_l0_clipping_risk = (max_l0 > top_k_save_threshold)`, records it on the row, and fails recon when True (unless `--allow_mismatch`).
-- Converts 4.6 from a manual "remember to eyeball the CSV" check into an automatic gate: if the SAE's true L0 exceeds 64 on any prompt, the validator raises before any downstream consumer sees the encoding.
+**What landed (two complementary gates):**
 
-**Remaining (RunPod):** Run the validator against the (audit-1.4-corrected) re-encoded SAEs. If `recon_l0_clipping_risk = True`, raise `--top_k_save` in step 5 (and re-encode), or pass `--top_k_save_threshold=<higher>` after a deliberate justification.
+1. **Fresh-encoder gate, step 6** (commit `c6dbcfe`, 2026-05-27). `scripts/validate_sae_hook_alignment.py` re-encodes a sample of raw activations through the corrected JumpReLU, reports `reconstruction_l0_p50` / `p95` / `p99` / `mean` / `max`, and fails when `max_l0 > --top_k_save_threshold` (default 64). This is the un-truncated truth — the right number to size `--top_k_save` against. Catches "the SAE in principle has L0 > 64."
+
+2. **Saved-artifact audit** (commit `8b1381b`+, 2026-05-28). `scripts/audit_identity_sae_l0.py` reads the SAVED `feature_indices_top{K}.npy` / `feature_values_top{K}.npy` and counts rows "at the cap" (all `top_k` saved values positive → truncation occurred). Tells the operator whether the EXISTING encoded files — and the triaged feature pool derived from them — are biased, without paying for a re-encode. Catches "your existing files actually hit the cap."
+
+```bash
+python scripts/validate_sae_hook_alignment.py --layers 0,8,16,24,32  # gate 1
+python scripts/audit_identity_sae_l0.py       --layers 0,8,16,24,32  # gate 2
+```
+
+**Consequence chain (what to regenerate if either gate fails):**
+
+1. Re-encode the affected layer(s) with `scripts/encode_identity_saes.py --top_k_save <N>`, where `N > max_l0` from gate 1 with headroom (~2× p99).
+2. Re-run `scripts/analyze_identity_sae_features.py` against the regenerated encodings.
+3. Re-run `scripts/triage_sae_identity_features.py` to rebuild `intervention_candidate_features_triaged.csv` — this is the feature pool that drives every BBQ steering result.
+4. Step 19 (`extract_bbq_token_level_sae_activations.py`) reads the regenerated pool; the dense `encode_selected_features` it does is per-feature unchanged, but it now sees the corrected set.
+
+**Still open (audit's optional "missed candidates" diagnostic):** the audit also suggested encoding the FULL SAE feature dimension on a stratified BBQ subsample and reporting which features have non-trivial BBQ activation but were filtered out by the identity-side triage. Requires the full SAE encoder (not just the kept-feature columns) and is recorded as future work; the gates above cover the immediate consequence (was the identity-side pool itself truncation-biased?), not the broader "are there BBQ-relevant features the identity-side triage missed even at the correct L0?" question.
 
 **Original audit (preserved):** `encode_identity_saes.py` keeps only the top-64 features per row (`--top_k_save 64`); everything else is treated as exact zero downstream (`sparse_long` drops non-positive). The SAE is a 32× expansion (~131k features). If the SAE's true L0 at layer 24 exceeds 64 on some prompts, real activations are clipped to zero, which biases `mean_a` / `freq_a` downward for mid-ranked features and slightly inflates apparent contrast selectivity. If empirical max L0 is comfortably under ~50, 64 is fine — otherwise raise `top_k_save`.
 

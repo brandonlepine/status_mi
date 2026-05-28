@@ -87,13 +87,33 @@ python scripts/audit_intervention_sections.py \
 
 Run this **before** any steering job that depends on the section-explicit position names. If it exits non-zero, do not cite the new positions in headline causal claims until the failures are diagnosed.
 
-### 4.6 [MINOR] — Top-k SAE truncation (in the encoding upstream) may bias activation summaries
+### 4.6 [MINOR] — Top-k SAE truncation (in the encoding upstream) may bias activation summaries (PARTIAL FIX LANDED 2026-05-27 / 2026-05-28)
 
-**What's wrong (inherited from `encode_identity_saes.py`):** The identity-side encoding only retains the top-64 feature indices per row; this script does its *own* dense `encode_selected_features` on a pre-filtered feature subset, so it is **not** subject to top-64 truncation here. However, the feature pool itself was selected (via triage) using metrics computed on the truncated identity-side encodings. If the SAE's true L0 at layer 24 exceeds 64 on some identity prompts, mid-ranked features that genuinely fire on identity were not in the kept set and never reach this script.
+**Status:** Two detection paths now exist. The substantive remediation — re-encoding with a larger `--top_k_save` if either path flags a problem — still requires the RunPod run.
 
-**Why it matters:** The "kept-for-intervention" feature list could be missing features that are causally relevant but never broke the top-64 at the period token on templated prompts. Those features will never appear in BBQ feature cards or the causal analysis.
+**What landed:**
+- **Upstream side (commit `c6dbcfe`, 2026-05-27):** [Step 6](06_validate_sae_hook_alignment.md)'s `validate_sae_hook_alignment.py` re-encodes a sample of raw activations through the corrected JumpReLU, reports `reconstruction_l0_p50` / `p95` / `p99` / `mean` / `max`, and fails the validation row when `reconstruction_max_l0 > --top_k_save_threshold` (default 64). This is the un-truncated truth and is the right number to size `--top_k_save` against.
+- **Saved-artifact side (commit `8b1381b`+, 2026-05-28):** `scripts/audit_identity_sae_l0.py` reads the SAVED `feature_indices_top{K}.npy` / `feature_values_top{K}.npy` files per layer and counts rows "at the cap" — rows where all `top_k` saved values are positive, meaning the true L0 was `≥ top_k` and any lower-magnitude active features were truncated. This is what tells the operator whether the EXISTING saved artifacts (and the triaged feature pool derived from them) are biased — without paying for a re-encode.
 
-**Targeted fix:** Verify SAE L0 at layer 24 on identity prompts (see issue 1.4 / Step 5). If it is comfortably under 50, leave the upstream `--top_k_save 64`. If not, raise `--top_k_save` upstream and re-run triage. Independently, optionally have this script also encode the *full* feature dimension on a stratified subsample of BBQ prompts and report which features have non-zero BBQ activation but were not in the kept set — a "missed candidates" diagnostic.
+```bash
+# Audit the SAVED files for hidden truncation.
+python scripts/audit_identity_sae_l0.py \
+    --sae_encoded_dir /workspace/status_mi/results/sae_identity/llama-3.1-8b/final_token \
+    --layers 0,8,16,24,32
+# Exits 0 if no layer has >1% of rows at the cap; exits 1 with a corrective
+# action otherwise (re-encode with larger --top_k_save, then re-run
+# analyze_identity_sae_features + triage_sae_identity_features).
+```
+
+**Consequence chain** (what to regenerate if either audit fails):
+1. Re-encode the affected layer(s) with `scripts/encode_identity_saes.py --top_k_save <N>`, where `N > max_l0` reported by Step 6 (with headroom).
+2. Re-run `scripts/analyze_identity_sae_features.py` against the regenerated encodings.
+3. Re-run `scripts/triage_sae_identity_features.py` to rebuild `intervention_candidate_features_triaged.csv`.
+4. Re-run THIS script (Step 19) — the dense `encode_selected_features` it does is on a pre-filtered subset, so the recomputed feature pool is what makes the downstream BBQ analysis fair.
+
+**Why it matters in this file (preserved):** Even though `encode_selected_features` runs a fresh forward and computes the **dense** per-token activation for the chosen features (so per-token values are not truncated *here*), the **set of prompts** examined per feature is determined by the upstream top-64 sparse encoding, and the FEATURE POOL itself was selected (via triage) using metrics computed on the same truncated encodings. If the SAE's true L0 at layer 24 exceeds 64 on some identity prompts, mid-ranked features that genuinely fire on identity were not in the kept set and never reach this script.
+
+**Still open (audit's optional "missed candidates" diagnostic):** the audit also suggested encoding the FULL feature dimension on a stratified BBQ subsample and reporting which features have non-trivial BBQ activation but were filtered out by the identity-side triage. This is a separate, more ambitious diagnostic (it requires the full SAE encoder, not just the kept-feature columns) and is recorded as future work.
 
 ## Rebuild checklist
 - [ ] Verify SAE preprocessing/activation function before trusting any activation in `bbq_token_level_sae_summary.csv` (cross-cutting fix from issue 1.4 — applies to every SAE-touching script).
