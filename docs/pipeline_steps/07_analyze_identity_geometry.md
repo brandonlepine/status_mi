@@ -19,6 +19,8 @@ First-pass characterization of identity geometry from the final-token residual s
 - `results/geometry/.../contrasts/contrast_scores.csv` (in-sample), `contrast_family_holdout_scores.csv`
 - `results/geometry/.../contrasts/contrast_projection_scores_layer_XX.csv` (only for `PROJECTION_LAYERS = {0, 8, 16, 24, 32}`)
 - `results/geometry/.../contrasts/contrast_directions_layer_XX.npz` — per-layer .npz of unit-norm difference-of-means contrast directions, keyed by `"layer{LL}_{identity_a}_vs_{identity_b}"` → float32 `(d_model,)`. Consumed by [Step 20](20_run_bbq_sae_steering.md)'s `direction_baseline` intervention mode for the audit-5.5 head-to-head SAE-vs-linear-direction comparison. Added 2026-05-27 in commit `8f84e5e`.
+- `results/geometry/.../contrasts/contrast_probe_directions_layer_XX.npz` — per-layer .npz of unit-norm **logistic probe** directions (one binary L2-regularized `LogisticRegression` per contrast, in raw `d_model` space). Same key schema as the DoM file. Consumed by [Step 20](20_run_bbq_sae_steering.md)'s `probe_baseline` intervention mode — audit-5.5 option (c). Added 2026-05-28 in commit `7cdb164`.
+- `results/geometry/.../contrasts/contrast_probe_scores.csv` — per `(layer, contrast)` row with `auc_in_sample`, `cohens_d_in_sample`, `heldout_family_auc_mean` (mean over family hold-out folds), `probe_C`, `probe_penalty`. Diagnostic CSV for sanity-checking the probes themselves before they're used as a steering baseline.
 - `results/geometry/.../run_config.json`
 
 ## Key implementation details

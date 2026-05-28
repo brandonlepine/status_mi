@@ -447,19 +447,33 @@ The alternative consistent choice (re-encode residualized activations through th
 
 **Original audit (preserved):** `analyze_identity_sae_features.py` computed contrast directions from `family_residualized` activations, but the SAE features (`long_df`) were encoded by `encode_identity_saes.py` from **raw** activations. `decoder_alignment` then took the cosine between a raw-space decoder row and a residualized-space direction, and `combined_score` mixed a residualized-direction cosine with a raw-SAE-activation Cohen's d. The two lived in slightly different spaces.
 
-### 5.5 [MAJOR] Missing baseline: does the SAE beat a difference-of-means direction? (PARTIAL FIX LANDED 2026-05-27)
+### 5.5 [MAJOR] Missing baseline: does the SAE beat a difference-of-means direction? (PARTIAL FIX LANDED 2026-05-27 / 2026-05-28)
 
-**Status:** Code path closed across commits `8f84e5e` (Step 7 persists contrast directions) + `a11cbb8` (Step 20 adds the `direction_baseline` intervention mode + loader + dispatch). The RunPod head-to-head run is the remainder. The logistic-probe baseline (option c) is deferred — it needs a separate probe-direction artifact that the geometry pipeline doesn't currently emit.
+**Status:** Code path for all three audit baselines is closed across four commits — `8f84e5e` (Step 7 persists DoM directions) + `a11cbb8` (Step 20 adds `direction_baseline`) + `7cdb164` (Step 7 persists logistic-probe directions — audit option (c)) + `8c392d7` (Step 20 adds `probe_baseline`). The RunPod three-way head-to-head run is the remainder.
 
 **What landed:**
-- [Step 7](pipeline_steps/07_analyze_identity_geometry.md) (`analyze_identity_geometry.py:run_contrasts`) persists the unit-norm difference-of-means direction per `(layer, identity_a, identity_b)` to `contrasts/contrast_directions_layer_{LL}.npz`. The directions were already computed but were thrown away after the projection scores.
-- [Step 20](pipeline_steps/20_run_bbq_sae_steering.md) (`run_bbq_sae_steering.py`) has a new intervention mode `direction_baseline` that does `h += alpha * vec` at the chosen positions where `vec` is the DoM direction looked up by `(fs.layer, fs.contrast_name)`. Same hook plumbing as `add_vector`; the mode string differs so output rows can be stratified.
-- New CLI `--direction_baselines_path` (single .npz or directory of layer-level .npz). Bundle-mode feature sets are skipped with a logged warning (the baseline is per-contrast). The output `intervention_mode` column distinguishes `direction_baseline` from SAE-feature modes so the analyzer can answer "for each (layer, contrast), does the SAE feature ablation produce a stronger bias-reducing effect than the linear direction at the same positions?"
-- Synthetic validation: loader round-trips multi-layer .npz, returns unit-norm vectors, returns None for missing/bundle FeatureSets. End-to-end hook math produces `h += alpha * baseline_vec` exactly.
+- [Step 7](pipeline_steps/07_analyze_identity_geometry.md) (`analyze_identity_geometry.py`) now persists:
+  - `contrasts/contrast_directions_layer_{LL}.npz` — unit-norm diff-of-means direction per `(layer, identity_a, identity_b)`. Already computed in `run_contrasts`; previously thrown away.
+  - `contrasts/contrast_probe_directions_layer_{LL}.npz` — unit-norm weight vector from a binary L2-regularized `LogisticRegression` fit per contrast in **raw `d_model` space**, by the new `run_contrast_probes` function (audit 5.5 option (c)). This is deliberately separate from the existing axis/identity-within-axis probes, which run in PCA-reduced 256-D space — useful for measuring decodability, but the weight vector lives in PCA coordinates and cannot steer.
+  - `contrasts/contrast_probe_scores.csv` — diagnostic per `(layer, contrast)` row with in-sample AUC / Cohen's d / held-out-family AUC, so the probe quality is sanity-checkable before it's used as a steering baseline.
+  - New CLI: `--skip_contrast_probes` (default off), `--contrast_probe_C` (default 1.0).
+- [Step 20](pipeline_steps/20_run_bbq_sae_steering.md) (`run_bbq_sae_steering.py`) has two new baseline intervention modes:
+  - `direction_baseline` — `h += alpha * vec` where `vec` is the DoM direction.
+  - `probe_baseline` — `h += alpha * vec` where `vec` is the logistic-probe direction.
+  Both share `add_vector`'s hook plumbing; the mode string differs so output rows can be stratified.
+- Two parallel CLI flags: `--direction_baselines_path` and `--probe_baselines_path`. Each accepts either a single `.npz` or a directory; when given a directory, the loader globs the matching filename pattern so the two sources stay disjoint. The single helper `_baseline_vector_for_mode` picks the right vector per mode. Missing-vector errors mention the specific `--*-path` flag.
+- Bundle-mode feature sets (empty `contrast_name`) are skipped with a logged warning — the baselines are defined per-contrast.
 
-**Remaining (RunPod head-to-head + logistic-probe option):**
-- Run `--intervention_modes ablate,direction_baseline` against the (audit-1.4 re-encoded) feature pool. Output rows are pre-stratified by `intervention_mode`, so the analyzer just groups by it. If SAE features do not beat the DoM direction, the paper should be reframed around directions instead — the framing note flags this as load-bearing for the SAE story.
-- (Optional) The logistic-probe direction (audit option c) would require fitting per-contrast probes in the geometry pipeline and persisting their weight vectors; one more `.npz` and one more value of `--direction_baselines_path` would extend the same plumbing.
+**Validation:** synthetic 60-prompt × `d_model=64` toy with a known separator + noise: the probe recovers the true direction at cosine 0.988, AUC = 1.000, Cohen's d ≈ 16, held-out family AUC = 1.000. End-to-end hook math: `direction_baseline` adds the DoM vec and `probe_baseline` adds the probe vec at the chosen positions with max diff = 0.00 from expected. Loader correctly disambiguates DoM vs probe by glob pattern.
+
+**Remaining (RunPod):** Run the three-way command against the (audit-1.4 re-encoded) feature pool:
+```
+python scripts/run_bbq_sae_steering.py \
+    --intervention_modes ablate,direction_baseline,probe_baseline \
+    --direction_baselines_path .../geometry/.../contrasts \
+    --probe_baselines_path    .../geometry/.../contrasts
+```
+Output rows are pre-stratified by `intervention_mode`, so the analyzer just groups by it. If SAE features do not beat **both** linear baselines on the same prompts/positions, the paper should be reframed around directions — the audit's framing note flags this as load-bearing for the SAE story.
 
 **Original audit (preserved):** Throughout, the difference-of-means contrast direction is computed *and* SAE features are computed, but they are never put in head-to-head competition as *interventions*. The key scientific question for an SAE-based paper is "does decomposing into SAE features buy anything over a single linear direction?" The audit's prescription: steer with (a) individual SAE feature interventions, (b) the raw difference-of-means contrast direction, (c) a logistic-probe direction; compare causal effect on BBQ. If SAE features do not localize or do not beat the linear direction, that is still publishable (and honest) — but the comparison must be run.
 
@@ -535,7 +549,7 @@ Ordered by what most threatens a defensible result.
 
 1. **Verify SAE preprocessing** (1.4): confirm LlamaScope normalization + activation function; add an encode→decode reconstruction-quality check to `validate_sae_hook_alignment.py`. If wrong, every SAE number is wrong.
 2. **Fix the feature intervention** (3.1) — **FIX LANDED 2026-05-27.** Canonical torch primitives (`ablate_features`, `clamp_features`, `steer_features`, `patched_residual_with_intervention`) live in `scripts/encode_identity_saes.py` alongside `encode_full` / `decode_full`. `scripts/run_bbq_sae_steering.py` dispatches them via `--intervention_modes` (default: `ablate`). Commits `11d4a4d` (primitives) + `84c87b5` (hook + dispatch). RunPod headline run with `--intervention_modes ablate` pending.
-3. **Re-enable steering controls** (2.3) and add the difference-of-means direction as a control/baseline (5.5 — PARTIAL FIX LANDED 2026-05-27, commits `8f84e5e` (Step 7 persists contrast directions) + `a11cbb8` (Step 20 adds `direction_baseline` mode); RunPod head-to-head pending). 2.3 (sign-flip, random-direction-norm-matched, random-feature-matched controls) still open.
+3. **Re-enable steering controls** (2.3) and add the difference-of-means direction as a control/baseline (5.5 — PARTIAL FIX LANDED 2026-05-27/28, commits `8f84e5e` + `a11cbb8` + `7cdb164` + `8c392d7`: BOTH DoM and logistic-probe baseline modes wired through Step 7 + Step 20; RunPod three-way head-to-head pending). 2.3 (sign-flip, random-direction-norm-matched, random-feature-matched controls) still open.
 4. **Polarity-sign the bias metric** (4.3 — FIX LANDED 2026-05-27, commit `a03760f`): signed_stereotype_preference_delta + signed_stereotyped/nonstereotyped_delta computed in `enrich_results`; `effect_label`, `beneficial_score`, `harmful_score`, all rankings, and all plots now use the signed metric. Polarity-confounded `mean_stereotype_preference_delta` preserved alongside as a diagnostic.
 5. **Validate the measurement locus** (1.1): compare final-token vs identity-span-pooled geometry; pick and justify one.
 6. **Characterize baseline behavior** (1.2): answer-option mass and standard BBQ score for Llama-3.1-8B-Base in this format.
