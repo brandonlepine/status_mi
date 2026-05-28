@@ -224,6 +224,16 @@ The same problem now applies to the new `--intervention_modes clamp` and `--inte
 
 **Original audit (preserved):** `positions_for` called `find_spans(prompt, [target_identity_label, ans{target_answer_idx}])`, which returned **all** regex matches anywhere in the prompt, then returned `max(pos)` for the `*_last_token` variants. The identity label often appears in the context, the question, and the answer option `B. the Black man` — and the *last* occurrence is the answer-choice list. So `target_identity_last_token` was frequently intervening on the identity inside the answer option, not the identity in the context. `stereotype_language_last_token` had the same problem (question content words also recur in context/answers). The downstream Step 23 README treated these positions as answering different causal questions, but only if they landed where the names imply.
 
+#### ⚠️ Pre-RunPod validation caveats (3.3 fix)
+
+The synthetic test that landed with commit `afb3ee3` confirmed the helpers on **one** prompt using a **whitespace-splitting fake tokenizer**. Production behavior with the real Llama tokenizer + the real BBQ prompt format was **not** validated locally. The same gaps the [Step 19 doc](19_extract_bbq_token_level_sae_activations.md#-pre-runpod-validation-caveats-33-fix) lists apply here, plus one steering-specific concern:
+
+**Steering-specific gap:**
+- **Silent fallback to `final_prompt_token`.** When a section-explicit position has no in-section match (e.g. because `find_section_spans` couldn't locate the section in the prompt — see step 19 caveats), `positions_for` returns `[final_pos]` and `intervention_section` ends up `"final"`. If the prompt-format mismatch is systematic (e.g. caused by `--few_shot_pool`), **every** `target_identity_last_context_token` job will silently degrade into a `final_prompt_token` intervention — the causal claim "the feature acts at the context identity mention" then rests on rows that actually intervened at the period token. Operators must check the `intervention_section` distribution before reading the results.
+
+**Recommended pre-RunPod check** (see [Step 19 doc](19_extract_bbq_token_level_sae_activations.md#-pre-runpod-validation-caveats-33-fix) for the full list; the steering-specific item is:)
+4. After the first steering job, group output rows by `(intervention_position, intervention_section)` and print the table. For each section-explicit position, the corresponding section should dominate; if `"final"` is a non-trivial fraction, the section lookup is failing and the fix is upstream in `find_section_spans` or the prompt format. Until that table is clean, no headline causal claim should reference the new positions.
+
 ### 3.4 [MAJOR] — BBQ→SAE contrast mapping silently uses axis-fallback (FIX LANDED 2026-05-27)
 
 **Status:** Closed in commit `56a5f7e`.

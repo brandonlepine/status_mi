@@ -55,6 +55,30 @@ token_level_sae/
 
 **Original audit (preserved):** `find_all_spans` collected every regex match of the identity label and answer-option text in the prompt, with no section filtering. The identity label often appears in the context, the question, and the answer-choice list (`B. the Black man`) simultaneously. Tokens were flagged `is_target_identity_token` if they overlapped *any* of these matches. The same logic was reused verbatim in `run_bbq_sae_steering.py:positions_for`, where it determined where the steering hook was applied — so the bug compounded.
 
+#### ⚠️ Pre-RunPod validation caveats (3.3 fix)
+
+The synthetic test that landed with commit `afb3ee3` confirmed the helpers' math on **one** carefully-constructed prompt using a **whitespace-splitting fake tokenizer**. This is enough to verify the geometric logic but does not exercise the cases that are most likely to break in production. Before trusting numbers from these new columns:
+
+**Was tested:**
+- `overlap_in_section` on one audit-pathological prompt (Black/White man context + answer options).
+- 4 position-name variants on the same prompt, plus no-match fallback to `final_prompt_token`.
+- Round-trip of section spans through `find_section_spans`.
+
+**Was NOT tested (likely failure modes):**
+- **Real Llama tokenizer offsets.** BPE produces leading-space-included offsets and may split multi-word identity labels (`"Black man"`) across tokens differently than whitespace splitting suggests. A token whose char offsets straddle a section boundary could flip the section assignment.
+- **Real BBQ prompt format with few-shot prefix.** `find_section_spans` uses `prompt.find(str(row['context']))` — exact, case-sensitive substring match. If `prepare_bbq_for_steering.py`'s `--few_shot_pool` prepends a prefix, normalizes whitespace, or the prompt template changes, the lookup returns `-1` and **all the new `is_*_in_section` flags silently become `False`**.
+- **First-match-wins in `prompt.find`.** If a section's text appears as a substring of another section (e.g. quoted dialogue in the context that repeats the question), `find_section_spans` will pick the wrong span.
+- **Multi-token identity labels.** The first token of a span was confirmed to flag correctly; all spanned tokens flipping together was not verified.
+- **End-to-end run against real BBQ activations.** The row-dict additions and `_mean_where` summary helper were not exercised in a real `extract_bbq_token_level_sae_activations.py` job.
+
+**Recommended pre-RunPod check (~30 lines, one-off):**
+On the first RunPod run, sample ~50 prepared BBQ rows and assert:
+1. `find_section_spans` returns non-empty `context` / `question` / `ans*` for every row (count and log failures; if >5% fail, the prompt-format assumption is broken).
+2. For every token row with `is_target_identity_token = True`, exactly one of the three `is_target_identity_token_in_*` flags is True (count and log violations).
+3. Bin `intervention_section` distribution per position name and print the table — if `target_identity_last_context_token` lands in `context` for the synthetic but is silently falling back to `final` on the production prompts, this is where it shows.
+
+The check is straightforward to write as `scripts/audit_intervention_sections.py` if it doesn't get done inline at the first RunPod run.
+
 ### 4.6 [MINOR] — Top-k SAE truncation (in the encoding upstream) may bias activation summaries
 
 **What's wrong (inherited from `encode_identity_saes.py`):** The identity-side encoding only retains the top-64 feature indices per row; this script does its *own* dense `encode_selected_features` on a pre-filtered feature subset, so it is **not** subject to top-64 truncation here. However, the feature pool itself was selected (via triage) using metrics computed on the truncated identity-side encodings. If the SAE's true L0 at layer 24 exceeds 64 on some identity prompts, mid-ranked features that genuinely fire on identity were not in the kept set and never reach this script.
