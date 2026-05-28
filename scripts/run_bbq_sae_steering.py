@@ -104,7 +104,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--feature_set_modes", default="per_feature,per_contrast_topk,role_bundle")
     parser.add_argument("--require_per_feature", action="store_true", help="Fail unless per_feature is included in --feature_set_modes.")
     parser.add_argument("--top_k_per_contrast", default="5,10,20,50")
-    parser.add_argument("--scoring_mode", default="answer_logprob", choices=["answer_logprob", "first_token"])
+    parser.add_argument(
+        "--scoring_mode",
+        default="letter",
+        choices=["letter", "answer_logprob", "first_token"],
+        help=(
+            "Audit 1.3: 'letter' (default) scores the answer LETTERS ' A', ' B', "
+            "' C' (single tokens, mutually distinct, matched to the prompt format "
+            "which ends in 'Answer:'). This is the right default — first-token "
+            "scoring of the answer TEXT was degenerate because BBQ answers are "
+            "noun phrases and many share a leading word ('The grandmother', 'The "
+            "boy', 'Cannot be determined'), so the metric could not distinguish "
+            "the options. 'answer_logprob' sums per-token logprobs over the full "
+            "answer span; valid but length-biased on argmax/accuracy (audit 2.4). "
+            "'first_token' is preserved as a legacy comparison mode but should "
+            "not be the headline."
+        ),
+    )
     parser.add_argument("--intervention_positions", default="final_prompt_token,target_identity_last_token,nontarget_identity_last_token,stereotype_language_last_token")
     parser.add_argument(
         "--intervention_modes",
@@ -626,6 +642,39 @@ def first_token_ids(tokenizer, answers: list[str]) -> list[int]:
     return ids
 
 
+# Audit 1.3: cache the letter token IDs once per tokenizer. The prompt format
+# is `... A. {ans0} B. {ans1} C. {ans2} Answer:` so the natural continuation
+# is the letter; scoring the letter logits directly answers "which option
+# does the model want next" without the first-token-of-noun-phrase degeneracy
+# (e.g. 'The grandmother' / 'The boy' share their first token).
+_ANSWER_LETTER_CACHE: dict[int, tuple[int, int, int]] = {}
+
+
+def answer_letter_ids(tokenizer) -> tuple[int, int, int]:
+    """Return the single-token IDs for ' A', ' B', ' C'. Raises if any letter
+    tokenizes to multiple tokens (would mean a non-standard tokenizer; the
+    `letter` scoring mode requires single-token letters)."""
+    key = id(tokenizer)
+    cached = _ANSWER_LETTER_CACHE.get(key)
+    if cached is not None:
+        return cached
+    ids: list[int] = []
+    for letter in (" A", " B", " C"):
+        toks = tokenizer(letter, add_special_tokens=False)["input_ids"]
+        if len(toks) != 1:
+            raise ValueError(
+                f"Audit 1.3: --scoring_mode letter requires {letter!r} to tokenize "
+                f"to a single token; got {len(toks)} tokens {toks}. This tokenizer "
+                f"({type(tokenizer).__name__}) does not match the BPE-with-leading-"
+                f"space convention the letter mode assumes. Use --scoring_mode "
+                f"answer_logprob instead."
+            )
+        ids.append(int(toks[0]))
+    out = (ids[0], ids[1], ids[2])
+    _ANSWER_LETTER_CACHE[key] = out
+    return out
+
+
 def install_hook(model, layer: int, vector: torch.Tensor, positions: list[int], alpha: float, mode: str):
     if layer <= 0:
         raise ValueError("Steering hooks require layer >= 1 because LkR maps to post-block k.")
@@ -914,6 +963,52 @@ def score_first_token_batch(
             for batch_idx, answers in enumerate(answers_by_prompt):
                 token_ids = first_token_ids(tokenizer, answers)
                 rows.append([float(log_probs[batch_idx, token_id]) for token_id in token_ids])
+            return np.asarray(rows, dtype=np.float32)
+    finally:
+        if handle is not None:
+            handle.remove()
+
+
+def score_letter(model, tokenizer, prompt: str, answers: list[str], max_length: int, hook_fn: Callable[[], object] | None = None) -> np.ndarray:
+    """Audit 1.3: score the answer LETTERS ' A', ' B', ' C' at the final
+    prompt position. The `answers` argument is unused (kept for signature
+    compatibility with score_first_token / score_answer_logprob); the prompt
+    format is what guarantees the natural continuation is the letter."""
+    encoded = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_length).to(model.device)
+    letter_ids = answer_letter_ids(tokenizer)
+    handle = hook_fn() if hook_fn else None
+    try:
+        with torch.inference_mode():
+            logits = model(**encoded, use_cache=False).logits[0, -1]
+            log_probs = F.log_softmax(logits.float(), dim=-1)
+            return np.array([float(log_probs[token_id]) for token_id in letter_ids], dtype=np.float32)
+    finally:
+        if handle is not None:
+            handle.remove()
+
+
+def score_letter_batch(
+    model,
+    tokenizer,
+    prompts: list[str],
+    answers_by_prompt: list[list[str]],
+    max_length: int,
+    hook_fn: Callable[[], object] | None = None,
+) -> np.ndarray:
+    """Audit 1.3: batched analog of score_letter. answers_by_prompt is unused
+    (same compatibility note as score_letter)."""
+    encoded = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=max_length).to(model.device)
+    letter_ids = answer_letter_ids(tokenizer)
+    handle = hook_fn() if hook_fn else None
+    try:
+        with torch.inference_mode():
+            outputs = model(**encoded, use_cache=False)
+            final_positions = encoded["attention_mask"].sum(dim=1) - 1
+            logits = outputs.logits[torch.arange(len(prompts), device=model.device), final_positions]
+            log_probs = F.log_softmax(logits.float(), dim=-1)
+            rows = []
+            for batch_idx in range(len(prompts)):
+                rows.append([float(log_probs[batch_idx, token_id]) for token_id in letter_ids])
             return np.asarray(rows, dtype=np.float32)
     finally:
         if handle is not None:
@@ -1440,13 +1535,17 @@ def run_first_token_batched_feature_set(
     probe_vector: torch.Tensor | None = None,
 ) -> tuple[int, int]:
     n_done = 0
+    # Audit 1.3: dispatch the batched scorer by mode. 'letter' (the new default)
+    # scores the answer letters ' A'/' B'/' C'; 'first_token' (legacy) scores
+    # the first token of the answer text.
+    score_batch_fn = score_letter_batch if args.scoring_mode == "letter" else score_first_token_batch
     batch_size = max(1, int(args.batch_size))
     for batch_start in range(0, len(fs_prepared), batch_size):
         batch_df = fs_prepared.iloc[batch_start:batch_start + batch_size].copy()
         row_series = [pd.Series(row._asdict()) for row in batch_df.itertuples(index=False)]
         prompts = [str(row["prompt"]) for row in row_series]
         answers_batch = [[str(row.get(f"ans{i}", "")) for i in range(3)] for row in row_series]
-        base_scores = score_first_token_batch(model, tokenizer, prompts, answers_batch, 512)
+        base_scores = score_batch_fn(model, tokenizer, prompts, answers_batch, 512)
         for pos_name in positions:
             positions_by_example = [positions_for(tokenizer, prompt, row, 512, pos_name) for prompt, row in zip(prompts, row_series)]
             for mode in intervention_modes:
@@ -1480,7 +1579,7 @@ def run_first_token_batched_feature_set(
                         probe_vector=probe_vector,
                     )
                     start = time.perf_counter()
-                    inter_scores = score_first_token_batch(
+                    inter_scores = score_batch_fn(
                         model, tokenizer, prompts, answers_batch, 512, hook_fn=hook_fn,
                     )
                     runtime = (time.perf_counter() - start) / max(1, len(pending_indices))
@@ -1575,7 +1674,7 @@ def run_first_token_batched_feature_set(
                     pending_answers = [answers_batch[batch_idx] for batch_idx, _ in pending]
                     pending_base = [base_scores[batch_idx] for batch_idx, _ in pending]
                     start_ctrl = time.perf_counter()
-                    inter_ctrl = score_first_token_batch(
+                    inter_ctrl = score_batch_fn(
                         model, tokenizer, pending_prompts, pending_answers, 512,
                         hook_fn=lambda s=spec, pp=pending_positions: install_batched_control_hook(
                             model, fs, sae, s, pp,
@@ -1744,7 +1843,13 @@ def main() -> None:
     model = AutoModelForCausalLM.from_pretrained(args.model_path, torch_dtype=dtype, device_map="auto")
     model.eval()
     hidden_dim = model.config.hidden_size
-    score_fn = score_answer_logprob if args.scoring_mode == "answer_logprob" else score_first_token
+    # Audit 1.3: per-example scoring function dispatch.
+    if args.scoring_mode == "answer_logprob":
+        score_fn = score_answer_logprob
+    elif args.scoring_mode == "letter":
+        score_fn = score_letter
+    else:  # "first_token" — legacy comparison mode
+        score_fn = score_first_token
     part_rows: list[dict[str, object]] = []
     part_idx = len(list((args.output_dir / "results_parts").glob("part_*")))
     sae_cache = {}
@@ -1850,11 +1955,10 @@ def main() -> None:
                         "contrast %r): no matching probe direction in --probe_baselines_path.",
                         fs.set_id, fs.layer, fs.contrast_name,
                     )
-            # Audit 2.3: the batched first-token path now runs controls too,
-            # so the gating decision is just scoring_mode (first_token = fast
-            # batched path; answer_logprob = slow per-example loop). The
-            # --disable_controls flag remains as a smoke-test-only escape.
-            if args.scoring_mode == "first_token":
+            # Audit 1.3 + 2.3: both single-token scoring modes (letter, first_token)
+            # use the fast batched path; answer_logprob uses the slow per-example
+            # loop. Controls run in both paths after audit 2.3 (commit 42b5837).
+            if args.scoring_mode in ("letter", "first_token"):
                 part_idx, added = run_first_token_batched_feature_set(
                     model,
                     tokenizer,
