@@ -900,6 +900,11 @@ def run_contrasts(
     holdout_rows = []
     projection_rows = []
     axis_lookup = metadata.groupby("identity_id")["axis"].first().to_dict()
+    # Audit 5.5: persist the unit-norm difference-of-means direction per
+    # (layer, contrast) so the BBQ steering runner can use it as a linear
+    # baseline against SAE features (the audit's "does decomposing into SAE
+    # features buy anything over a single direction" head-to-head).
+    directions_for_save: dict[str, np.ndarray] = {}
 
     for identity_a, identity_b in CONTRASTS:
         if identity_a not in identity_set or identity_b not in identity_set:
@@ -914,6 +919,7 @@ def run_contrasts(
         if cd is None:
             continue
         direction = cd.direction
+        directions_for_save[f"layer{layer:02d}_{identity_a}_vs_{identity_b}"] = direction.astype(np.float32)
 
         scores = x_centered @ direction
         metrics = evaluate_projection(scores, mask_a, mask_b)
@@ -977,6 +983,14 @@ def run_contrasts(
         pd.concat(projection_rows, ignore_index=True).to_csv(
             subdirs["contrasts"] / f"contrast_projection_scores_layer_{layer:02d}.csv",
             index=False,
+        )
+    # Audit 5.5: save contrast directions for the BBQ linear-baseline run.
+    # One .npz per layer so multi-layer runs append cleanly; the BBQ steering
+    # runner merges across layers by reading every layer's file.
+    if directions_for_save:
+        np.savez(
+            subdirs["contrasts"] / f"contrast_directions_layer_{layer:02d}.npz",
+            **directions_for_save,
         )
     return score_rows, holdout_rows
 
