@@ -208,6 +208,18 @@ def normalize_token_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def entropy(values: Iterable[float]) -> float:
+    """Shannon entropy of a non-negative weight vector treated as a categorical
+    distribution (L1-normalized internally). Normalized by log(n) so the
+    output is in [0, 1].
+
+    Audit 5.2 contract: callers must pass counts or another properly motivated
+    probability mass (e.g., firing counts per identity), NOT raw activation
+    magnitudes. Treating activation magnitudes as probabilities is not
+    motivated by any probability model and was the source of audit 5.2's
+    objection to `identity_entropy` and `token_entropy`. The firing-count
+    interpretation is: 'given the feature fired somewhere, what is the
+    probability it fired in identity / token i.'
+    """
     arr = np.asarray(list(values), dtype=float)
     arr = arr[np.isfinite(arr)]
     arr = arr[arr > 0]
@@ -219,6 +231,10 @@ def entropy(values: Iterable[float]) -> float:
 
 
 def categorical_entropy(values: pd.Series) -> float:
+    """Shannon entropy of the value-count distribution of a categorical
+    series. Implements the audit-5.2-recommended categorical probability
+    model: counts per category form a multinomial; Shannon entropy is
+    normalized by log(n_distinct)."""
     counts = values.dropna().astype(str).value_counts()
     return entropy(counts.to_numpy(dtype=float))
 
@@ -349,6 +365,19 @@ def aggregate_identity(identity_df: pd.DataFrame) -> pd.DataFrame:
         second = sorted_group.iloc[1] if len(sorted_group) > 1 else top
         positives = sorted_group[value_col].to_numpy()
         positive_sum = float(positives[positives > 0].sum())
+        # Audit 5.2: identity_entropy uses firing counts as the categorical
+        # probability mass. Count per identity = freq_identity * n_identity
+        # (number of identity-i prompts on which the feature fired). The prior
+        # implementation passed per-identity mean activation magnitudes to
+        # entropy(); activation magnitudes are not motivated probabilities.
+        # Fall back to old behavior only if firing columns are missing.
+        if "freq_identity" in sorted_group.columns and "n_identity" in sorted_group.columns:
+            firing_counts = (
+                pd.to_numeric(sorted_group["freq_identity"], errors="coerce").fillna(0.0)
+                * pd.to_numeric(sorted_group["n_identity"], errors="coerce").fillna(0)
+            ).clip(lower=0.0).to_numpy()
+        else:
+            firing_counts = np.where(positives > 0, positives, 0.0)  # legacy fallback
         top_axis = str(top.get("axis", ""))
         top_axis_fraction = float((sorted_group.head(10)["axis"].astype(str).eq(top_axis)).mean()) if top_axis else 0.0
         rows.append({
@@ -364,7 +393,7 @@ def aggregate_identity(identity_df: pd.DataFrame) -> pd.DataFrame:
             "top_axis_fraction": top_axis_fraction,
             "same_axis_selectivity_score": top_axis_fraction,
             "axis_entropy": categorical_entropy(sorted_group.loc[sorted_group[value_col] > 0, "axis"]) if "axis" in sorted_group.columns else 0.0,
-            "identity_entropy": entropy(positives),
+            "identity_entropy": entropy(firing_counts),
             "top_identities_by_activation": ";".join(
                 f"{row.identity_id}:{getattr(row, 'canonical_label', '')}:{getattr(row, value_col):.4g}"
                 for row in sorted_group.head(8).itertuples(index=False)
@@ -435,11 +464,22 @@ def aggregate_token_metrics(token_df: pd.DataFrame) -> pd.DataFrame:
                 "identity_id": str(max_row.get("identity_id", "")),
             })
         prompt_df = pd.DataFrame(prompt_rows)
+        # Audit 5.2: token_entropy uses firing counts (number of token-rows
+        # with activation > 0 per token_norm), not summed activation
+        # magnitudes. The categorical probability is "given the feature fired
+        # on some token, what is the probability the token was T."
+        token_norms = group.assign(token_norm=group["token_str"].map(token_string_norm))
         top_tokens = (
-            group.assign(token_norm=group["token_str"].map(token_string_norm))
-            .groupby("token_norm")["token_feature_activation"].sum()
+            token_norms.groupby("token_norm")["token_feature_activation"].sum()
             .sort_values(ascending=False)
             .head(30)
+        )
+        token_firing_counts = (
+            token_norms[token_norms["token_feature_activation"] > 0]
+            .groupby("token_norm").size()
+            .reindex(top_tokens.index)
+            .fillna(0)
+            .to_numpy(dtype=float)
         )
         top_token_strings = ";".join(top_tokens.index.astype(str))
         top_tokens_with_span = (
@@ -483,7 +523,7 @@ def aggregate_token_metrics(token_df: pd.DataFrame) -> pd.DataFrame:
             "fraction_top_prompts_single_family": float(prompt_df["family"].value_counts(normalize=True).iloc[0]) if not prompt_df.empty else 0.0,
             "family_entropy": family_entropy,
             "template_entropy": template_entropy,
-            "token_entropy": entropy(top_tokens.to_numpy(dtype=float)),
+            "token_entropy": entropy(token_firing_counts),
             "cross_axis_activation_score": categorical_entropy(prompt_df["axis"]) if "axis" in prompt_df.columns else 0.0,
             "feature_localization_type": localization_type,
         })
@@ -501,18 +541,26 @@ def aggregate_feature_top_tokens(top_tokens_df: pd.DataFrame) -> pd.DataFrame:
         df["token_feature_activation"] = 1.0
     rows = []
     for (layer, feature_id), group in df.groupby(["layer", "feature_id"], sort=True):
+        token_norms = group.assign(token_norm=group["token_str"].map(token_string_norm))
         top_tokens = (
-            group.assign(token_norm=group["token_str"].map(token_string_norm))
-            .groupby("token_norm")["token_feature_activation"].sum()
+            token_norms.groupby("token_norm")["token_feature_activation"].sum()
             .sort_values(ascending=False)
             .head(30)
+        )
+        # Audit 5.2: token_entropy uses firing counts, not activation sums.
+        token_firing_counts = (
+            token_norms[token_norms["token_feature_activation"] > 0]
+            .groupby("token_norm").size()
+            .reindex(top_tokens.index)
+            .fillna(0)
+            .to_numpy(dtype=float)
         )
         rows.append({
             "layer": int(layer),
             "feature_id": int(feature_id),
             "top_token_strings": ";".join(top_tokens.index.astype(str)),
             "fraction_top_tokens_template_words": float(sum(token in TEMPLATE_WORDS for token in top_tokens.index[:20]) / max(1, min(20, len(top_tokens)))),
-            "token_entropy": entropy(top_tokens.to_numpy(dtype=float)),
+            "token_entropy": entropy(token_firing_counts),
         })
     return pd.DataFrame(rows)
 
