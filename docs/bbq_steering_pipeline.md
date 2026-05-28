@@ -375,12 +375,14 @@ nohup python scripts/run_bbq_sae_steering.py \
   --require_per_feature \
   --intervention_positions final_prompt_token,target_identity_last_token,stereotype_language_last_token \
   --scoring_mode first_token \
-  --disable_controls \
+  --controls_subsample_frac 0.20 \
   --batch_size 16 \
   --save_every_examples 100 \
   --resume \
   > /root/local_status_mi/run_logs/steering_per_feature_matched_full_2026-05-01.log 2>&1 &
 ```
+
+Audit 2.3 (closed 2026-05-28): `--disable_controls` removed from the production command and replaced with `--controls_subsample_frac 0.20`. Specificity controls now run alongside the headline in the batched first-token path (no per-example fallback needed) on a deterministic stratified 20% subsample of `(example, feature_set)` pairs. For the audit-3.1 default `--intervention_modes ablate`, the natural control `random_feature_ablate` (ablate K random features) runs automatically; pass `--intervention_modes ablate,add_vector,direction_baseline,probe_baseline` to get the direction-shaped controls too. To skip controls for smoke tests only, pass `--disable_controls` (the runner emits a startup WARNING if it's set on a non-smoke-sized run).
 
 Monitor:
 

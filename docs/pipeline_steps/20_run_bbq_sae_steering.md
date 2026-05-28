@@ -75,11 +75,22 @@ The steering "direction" is **always unit-norm**, so the `alpha` grid is the mag
 - `job_id = sha1("|".join([bbq_uid, layer, set_id, alpha, position, mode, scoring_mode]))[:16]`.
 - `completed_jobs.jsonl` holds one `{job_id, completed_at}` JSON object per finished job. `--resume` rebuilds the `done` set and skips matching jobs. Malformed lines are backed up to `completed_jobs.jsonl.malformed` and dropped.
 
-### Controls (gated behind not `--disable_controls`)
-At `final_prompt_token` only, for each `(example, feature_set, alpha)`:
+### Controls (audit 2.3 fix landed 2026-05-28)
+Controls run by default and are now plumbed into BOTH scoring paths (slow per-example AND fast batched first-token). `--disable_controls` is smoke-test-only — the runner emits a startup WARNING if it's set on a non-smoke-sized run. `build_control_specs(fs, intervention_modes, ...)` picks the right controls per headline-mode family:
+
+**Direction-addition headlines** (`add_vector`, `ablate_projection`, `direction_baseline`, `probe_baseline`), at each `(example, feature_set, alpha)`:
 - `sign_flip`: flip the sign of every feature in the set, rebuild `vec`, hook, score. Tests "is the effect *direction*-specific."
 - `random_direction_norm_matched`: `randn(hidden_dim) / ||·||`, scored at the same alpha. Tests "is the effect specific to *this* direction vs. any norm-matched direction."
 - `random_feature_matched`: average decoder rows of the same cardinality as the feature set, randomly selected. Tests "is the effect specific to *these* SAE features vs. a random matched set of SAE features."
+
+**Feature-intervention headlines** (`ablate`, `clamp`, `steer`):
+- `random_feature_ablate`: ablate K random feature IDs (disjoint from the headline set), at α=0. Tests "is the effect specific to *these* features vs. ablating any K random SAE features." This is the audit-3.1-compatible specificity test for the new default `--intervention_modes ablate`.
+
+**Cost / position knobs:**
+- `--controls_subsample_frac` (default `1.0`; production `0.20`): deterministic per `(bbq_uid, fs.set_id)` SHA1 hash → resume-stable. Cuts control cost ~5× at 0.20.
+- `--controls_positions` (default `final_prompt_token`, matching prior behavior): pass `same_as_headline` to run controls at every position the headline runs at.
+
+Output rows share the schema of headline rows (same columns, plus `control_type` differentiator); analyzers can `groupby("control_type")` to stratify. Random feature IDs / vectors are deterministic per `(seed_input, control_name)` where `seed_input = (layer, set_id, alpha, position, modes)` — re-running the same job produces identical controls.
 
 ## Issues & Opportunities
 
@@ -148,21 +159,30 @@ python scripts/run_bbq_sae_steering.py \
 
 **Original audit (preserved):** Throughout the project, the difference-of-means contrast direction was computed *and* SAE features were computed, but they were never put in head-to-head competition as *interventions*. The key scientific question for an SAE-based paper is "does decomposing into SAE features buy anything over a single linear direction?" — and there was no path to answer it.
 
-### 2.3 [BLOCKER] — Steering controls are disabled in the production run
+### 2.3 [BLOCKER] — Steering controls are disabled in the production run (FIX LANDED 2026-05-28)
 
-**What's wrong:** The script implements three controls (`sign_flip`, `random_direction_norm_matched`, `random_feature_matched`) but they are gated behind `not args.disable_controls`. The documented production command in `docs/bbq_steering_pipeline.md` explicitly passes `--disable_controls`, so the production results in `steering_per_feature_matched_full/` carry **no** specificity controls.
+**Status:** Closed in commit `42b5837`. The production command in [`docs/bbq_steering_pipeline.md`](../bbq_steering_pipeline.md) no longer passes `--disable_controls`; controls now run alongside the headline in the fast batched first-token path on a deterministic subsample.
 
-**Why it matters:** Without controls, "feature X is causally implicated in BBQ bias" cannot be distinguished from "any norm-matched steering vector at this position would shift the logits about this much." Specifically:
-- `sign_flip` shows the effect depends on the sign of the direction, not just its magnitude.
-- `random_direction_norm_matched` shows the effect is not purely from injecting *any* unit vector at this position.
-- `random_feature_matched` shows the effect is specific to *these* SAE features and not a property of decoder rows in general.
+**What landed:**
+- **Controls in the batched first-token path.** Previously, controls only ran in the slow per-example `answer_logprob` path, so `--scoring_mode first_token --disable_controls` (the production command) silently shipped zero controls. The batched path now iterates `build_control_specs()` after the headline scoring and emits control rows with the same job_id scheme.
+- **Audit-3.1-compatible control: `random_feature_ablate`.** The three existing controls are direction-addition-shaped (h += α·vec); none of them tests the right specificity question under the audit-3.1 default `--intervention_modes ablate`. The new control ablates **K random features** (matched to the headline feature set size), via `install_feature_intervention_hook` with `mode="ablate"`. Output rows stamp `control_type = "random_feature_ablate"`.
+- **Mode-coupled control selection.** `build_control_specs(fs, intervention_modes, ...)`:
+  - Direction-addition headlines (`add_vector`, `ablate_projection`, `direction_baseline`, `probe_baseline`) → `sign_flip`, `random_direction_norm_matched`, `random_feature_matched`.
+  - Feature-intervention headlines (`ablate`, `clamp`, `steer`) → `random_feature_ablate`.
+  - Mixed headlines get both families.
+- **Cost knob: `--controls_subsample_frac`** (default `1.0`). Deterministic per `(bbq_uid, fs.set_id)` via SHA1 hash, so resume is stable. Production uses `0.20` to keep the specificity claim defensible while cutting control cost ~5×.
+- **Position knob: `--controls_positions`** (default `final_prompt_token`, matching the prior behavior). Pass `same_as_headline` to run controls at every position the headline runs at — answers the per-position specificity question at 5× the cost.
+- **`--disable_controls` reframed** as smoke-test-only. The runner emits a startup WARNING when it's set on a non-smoke-sized run (`--max_examples > 50` or `--max_feature_sets > 5`).
+- **The audit's fourth-control ask** (raw diff-of-means contrast direction) was already closed 2026-05-27 in audit 5.5 via the `direction_baseline` intervention mode (commit `a11cbb8`). Probe-direction baseline added shortly after (commit `8c392d7`).
 
-The whole "feature X is causally implicated" claim requires effect(X) ≫ effect(random direction) ≫ effect(random feature set), at matched norm.
+**Validation (synthetic):**
+- `--controls_subsample_frac=0.20` selects 19.91% of 10k synthetic pairs.
+- `ablate` headline → `{random_feature_ablate}` only.
+- `add_vector` / `direction_baseline` / `probe_baseline` headlines → the three direction-shaped controls.
+- Mixed headlines → both families.
+- Same `seed_input` → same control feature IDs (resume-stable).
 
-**Targeted fix:**
-- Re-enable controls for the final run by removing `--disable_controls` from the production command.
-- If cost is the bottleneck: run controls on a stratified subsample of `(example, feature)` pairs rather than dropping them. Cost dominates with per-example, per-alpha controls; batching `random_feature_matched` across feature sets (since the vector is independent of the kept feature set) can amortize cost.
-- Add a fourth control: the **raw difference-of-means contrast direction** from the geometry pipeline. ✅ **Closed 2026-05-27 (audit 5.5)** — the new `direction_baseline` mode loads pre-computed contrast directions from Step 7's `contrast_directions_layer_*.npz` via `--direction_baselines_path` and steers identically. Run `--intervention_modes ablate,direction_baseline` for the head-to-head. If SAE features do not beat the DoM direction, the SAE is not adding causal value over a linear probe and the paper should be reframed around directions.
+**Original audit (preserved):** The script implemented three controls but they were gated behind `not args.disable_controls`. The documented production command explicitly passed `--disable_controls`, so the production results in `steering_per_feature_matched_full/` carried no specificity controls. Without controls, "feature X is causally implicated in BBQ bias" cannot be distinguished from "any norm-matched steering vector at this position would shift the logits about this much." `sign_flip` shows the effect depends on the sign of the direction, not just its magnitude; `random_direction_norm_matched` shows the effect is not purely from injecting *any* unit vector at this position; `random_feature_matched` shows the effect is specific to *these* SAE features and not a property of decoder rows in general. The whole "feature X is causally implicated" claim requires effect(X) ≫ effect(random direction) ≫ effect(random feature set), at matched norm.
 
 ### 1.3 [MAJOR] — First-token answer scoring is degenerate for BBQ answers
 

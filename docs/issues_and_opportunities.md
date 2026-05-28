@@ -202,15 +202,25 @@ The geometry probes (`crossval_probe`) report accuracy/macro-F1 but never a **la
 
 These are mechanical extensions of the SVD / probe machinery rather than new infrastructure. The two main halves of 2.2 (probes + SVD) are now landed; the BBQ analyzer's sign-flip permutation test is the third leg of the discipline.
 
-### 2.3 [BLOCKER] Steering controls are disabled in the production run
+### 2.3 [BLOCKER] Steering controls are disabled in the production run (FIX LANDED 2026-05-28)
 
-`run_bbq_sae_steering.py` implements three controls — `sign_flip`, `random_direction_norm_matched`, `random_feature_matched` — but they are gated behind *not* `--disable_controls`, and the documented production command in `docs/bbq_steering_pipeline.md` passes `--disable_controls`.
+**Status:** Closed in commit `42b5837` (`scripts/run_bbq_sae_steering.py`) and the operational doc update in `docs/bbq_steering_pipeline.md`. The audit's fourth-control ask (diff-of-means contrast direction) was already closed 2026-05-27 in audit 5.5 via `direction_baseline` (commit `a11cbb8`) + later `probe_baseline` (commit `8c392d7`).
 
-Without these controls you cannot claim a feature's effect is **specific**. A norm-matched random direction added at the same position may shift the bias margin just as much (steering vectors of any kind perturb logits). The whole "feature X is causally implicated in bias" claim needs: effect(feature X) ≫ effect(random direction) and ≫ effect(random feature set), at matched norm.
+**What landed:**
+- **Controls in the batched first-token path.** Previously controls only ran in the slow per-example `answer_logprob` path; the production command (`--scoring_mode first_token --disable_controls`) silently shipped zero controls. The batched path now iterates `build_control_specs()` after the headline scoring and emits control rows with the same `job_id` scheme so resume is stable.
+- **Audit-3.1-compatible control: `random_feature_ablate`.** The three existing controls are direction-addition-shaped; under the audit-3.1 default `--intervention_modes ablate`, the natural specificity control is "ablate K random features (matched to the headline feature set size)." Stamped on output rows as `control_type = "random_feature_ablate"`.
+- **Mode-coupled control selection** via `build_control_specs(fs, intervention_modes, ...)`:
+  - Direction-addition headlines → `sign_flip`, `random_direction_norm_matched`, `random_feature_matched`.
+  - Feature-intervention headlines → `random_feature_ablate`.
+  - Mixed headlines → both families.
+- **`--controls_subsample_frac`** (default `1.0`, production `0.20`): deterministic per `(bbq_uid, fs.set_id)` SHA1 hash → resume-stable. Cuts control cost ~5× at `0.20`.
+- **`--controls_positions`** (default `final_prompt_token`, matching prior behavior): pass `same_as_headline` to run controls at every position the headline runs at.
+- **`--disable_controls` reframed** as smoke-test-only. The runner emits a startup WARNING if it's set on a run sized like production (`--max_examples > 50` or `--max_feature_sets > 5`).
+- **`docs/bbq_steering_pipeline.md`** production command updated: `--disable_controls` removed, replaced with `--controls_subsample_frac 0.20`.
 
-What to do:
-- Re-enable controls for the final run. If cost is the issue, run controls on a stratified subsample of examples × features rather than dropping them.
-- Add one more control: the **raw difference-of-means contrast direction** from the geometry pipeline, steered identically. If SAE features do not beat the difference-of-means direction, the SAE is not adding causal value over a linear probe — that comparison must be in the paper (see 5.5).
+**Validation (synthetic):** `--controls_subsample_frac=0.20` selects 19.91% of 10k synthetic pairs (SHA1-deterministic); `ablate` headline yields only `{random_feature_ablate}`; `add_vector` / `direction_baseline` / `probe_baseline` yield the three direction-shaped controls; mixed headlines yield both families; same `seed_input` → same random feature IDs (resume-stable).
+
+**Original audit (preserved):** `run_bbq_sae_steering.py` implemented three controls — `sign_flip`, `random_direction_norm_matched`, `random_feature_matched` — but they were gated behind *not* `--disable_controls`, and the documented production command in `docs/bbq_steering_pipeline.md` passed `--disable_controls`. Without controls, a feature's effect cannot be claimed specific. A norm-matched random direction added at the same position may shift the bias margin just as much. The whole "feature X is causally implicated in bias" claim needs: effect(feature X) ≫ effect(random direction) ≫ effect(random feature set), at matched norm.
 
 ### 2.4 [MAJOR] `answer_logprob` summed over different-length answers
 
@@ -579,7 +589,7 @@ Stated so the audit is balanced and these are not lost in a refactor:
 - **Variance decomposition (η²)** by metadata factor is a clean, honest way to show how much variance identity explains relative to surface form.
 - **The bias taxonomy** in `analyze_bbq_feature_level_causal_effects.py` distinguishing `bias_reducing_uncertainty` (mass moves to "unknown") from `bias_reducing_substitution` (mass moves to the other identity) is conceptually sharp — a steering result that just swaps one stereotype for another is not debiasing, and the code knows that.
 - **`individual_feature` vs `feature_bundle_membership`** is tracked explicitly; the analyzer warns when only bundle rows exist.
-- **Controls exist** in the steering code (sign-flip, random direction, random feature) — they just need to be turned on (2.3).
+- **Controls are now on by default** (2.3 closed 2026-05-28). The batched first-token path runs them too; `--controls_subsample_frac` amortizes cost; `random_feature_ablate` is the audit-3.1-compatible specificity control.
 - **Engineering hygiene**: resume/checkpointing everywhere, `run_config.json` / `*_config.json` for every run, the dedicated `validate_sae_hook_alignment.py`, explicit HF `hidden_states[k]` convention notes, axis-matching to prevent wrong-axis contamination. This is well above typical research-code standard and makes the fixes above tractable.
 
 ---
@@ -592,7 +602,7 @@ Ordered by what most threatens a defensible result.
 
 1. **Verify SAE preprocessing** (1.4): confirm LlamaScope normalization + activation function; add an encode→decode reconstruction-quality check to `validate_sae_hook_alignment.py`. If wrong, every SAE number is wrong.
 2. **Fix the feature intervention** (3.1) — **FIX LANDED 2026-05-27.** Canonical torch primitives (`ablate_features`, `clamp_features`, `steer_features`, `patched_residual_with_intervention`) live in `scripts/encode_identity_saes.py` alongside `encode_full` / `decode_full`. `scripts/run_bbq_sae_steering.py` dispatches them via `--intervention_modes` (default: `ablate`). Commits `11d4a4d` (primitives) + `84c87b5` (hook + dispatch). RunPod headline run with `--intervention_modes ablate` pending.
-3. **Re-enable steering controls** (2.3) and add the difference-of-means direction as a control/baseline (5.5 — PARTIAL FIX LANDED 2026-05-27/28, commits `8f84e5e` + `a11cbb8` + `7cdb164` + `8c392d7`: BOTH DoM and logistic-probe baseline modes wired through Step 7 + Step 20; RunPod three-way head-to-head pending). 2.3 (sign-flip, random-direction-norm-matched, random-feature-matched controls) still open.
+3. **Re-enable steering controls** (2.3 — FIX LANDED 2026-05-28, commit `42b5837`: controls plumbed into the fast batched first-token path; new `random_feature_ablate` for the audit-3.1 ablate headline; `--controls_subsample_frac` cost knob; `--disable_controls` reframed smoke-test-only; production command updated). Diff-of-means + probe direction baselines already done in 5.5.
 4. **Polarity-sign the bias metric** (4.3 — FIX LANDED 2026-05-27, commit `a03760f`): signed_stereotype_preference_delta + signed_stereotyped/nonstereotyped_delta computed in `enrich_results`; `effect_label`, `beneficial_score`, `harmful_score`, all rankings, and all plots now use the signed metric. Polarity-confounded `mean_stereotype_preference_delta` preserved alongside as a diagnostic.
 5. **Validate the measurement locus** (1.1): compare final-token vs identity-span-pooled geometry; pick and justify one.
 6. **Characterize baseline behavior** (1.2): answer-option mass and standard BBQ score for Llama-3.1-8B-Base in this format.
