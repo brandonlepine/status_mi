@@ -135,9 +135,11 @@ Important output columns:
 
 - `bbq_uid`
 - `layer`
-- `alpha`
+- `alpha` (for `clamp` under audit-3.2 per-feature scaling, this is the clamp *multiplier*, not a raw value)
 - `intervention_mode`
 - `intervention_position`
+- `feature_scale_stat` (audit 3.2: the `feature_stats.csv` column scaling clamp/steer amplitude, or `none` for ablate/uniform rows)
+- `feature_scale_value` (audit 3.2: the single-feature scale; NaN for bundles/ablate. clamp target = `alpha × feature_scale_value`; steer increment = `alpha × sign × feature_scale_value`)
 - `feature_set_mode`
 - `feature_set_id`
 - `feature_id`
@@ -385,6 +387,22 @@ nohup python scripts/run_bbq_sae_steering.py \
 Audit 2.3 (closed 2026-05-28): `--disable_controls` removed from the production command and replaced with `--controls_subsample_frac 0.20`. Specificity controls now run alongside the headline in the batched first-token path (no per-example fallback needed) on a deterministic stratified 20% subsample of `(example, feature_set)` pairs. For the audit-3.1 default `--intervention_modes ablate`, the natural control `random_feature_ablate` (ablate K random features) runs automatically; pass `--intervention_modes ablate,add_vector,direction_baseline,probe_baseline` to get the direction-shaped controls too. To skip controls for smoke tests only, pass `--disable_controls` (the runner emits a startup WARNING if it's set on a non-smoke-sized run).
 
 Audit 1.3 (closed 2026-05-28): `--scoring_mode` switched from `first_token` to `letter`. The new `letter` mode scores the answer LETTERS ` A`/` B`/` C` at the final prompt position — single tokens, mutually distinct, matched to the prompt format (`A. {ans0} B. {ans1} C. {ans2} Answer:` makes the letter the natural continuation). Removes the first-token-of-noun-phrase degeneracy where two of three options had identical first-token logprobs ("The grandmother" vs "The boy" → identical "The" logprobs). The legacy `first_token` mode is preserved as a comparison option but should not be the headline; `answer_logprob` remains available as a confirmatory mode (its argmax/accuracy use is still length-biased — audit 2.4 — and headline rankings should not rely on it).
+
+Audit 3.2 (closed 2026-05-28): per-feature amplitude scaling for the `clamp` and `steer` intervention modes. **The headline production command above is unchanged** — it uses the default `--intervention_modes ablate`, which sets the latent to exactly 0 and is unaffected by 3.2. The new flags matter only when you run an *amplification* pass (`clamp`/`steer`):
+
+```bash
+# Per-feature amplification headline: clamp each feature to {1,2,4}x its OWN p95.
+python scripts/run_bbq_sae_steering.py \
+  ... (same flags as above) ... \
+  --intervention_modes clamp \
+  --feature_scale_stat p95 \
+  --feature_stats_dir /root/local_status_mi/results/sae_identity/llama-3.1-8b/final_token \
+  --clamp_multipliers 1.0,2.0,4.0
+```
+
+Under `--feature_scale_stat p95` (the default), the clamp target is `clamp_multiplier × p95[f]` and the steer increment is `alpha × sign × p95[f]`, so the grid value means "how many p95s of this feature's own activation" for every feature — comparable across features. The chosen multiplier is recorded in the output `alpha` column, and `feature_scale_stat` / `feature_scale_value` columns are added (none removed). `--feature_scale_stat none` reproduces the pre-3.2 uniform behavior (clamp needs scalar `--clamp_value`; steer adds raw `--alphas`).
+
+**Run the gate first.** Before any clamp/steer headline, run `scripts/audit_feature_scale.py --triage_csv <triage> --feature_stats_dir <encode_out> --layers 24 --feature_scale_stat p95`. It exits non-zero if too many kept features are absent from `feature_stats.csv` (→ scale 0) or have a non-positive stat (→ clamp degenerates to ablate, steer to a no-op) — silent-failure modes that would otherwise produce a clean-looking but zero-amplitude run.
 
 Monitor:
 
