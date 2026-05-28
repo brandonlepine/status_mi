@@ -328,9 +328,9 @@ What to do: use `find_section_spans` (already implemented) to restrict identity-
 
 ## 4. Data construction and conceptual coverage
 
-### 4.1 [MAJOR] Contrast lists reference identities that do not exist (FIX LANDED 2026-05-27 for geometry/subspace/SAE/plots; BBQ side still pending)
+### 4.1 [MAJOR] Contrast lists reference identities that do not exist (FIX LANDED 2026-05-27/28 — both halves closed)
 
-**Status:** Four commits closed the geometry/subspace/SAE/plot side. `prepare_bbq_for_steering.py:MANUAL_ALIASES` is separate and still has the same class of problem — it's tracked here as remaining work.
+**Status:** Geometry / subspace / SAE / plot side closed across four commits 2026-05-27. BBQ side closed in commit `26998ec` 2026-05-28 alongside audit 4.4.
 
 **What landed:**
 - `1e242c9` — new `scripts/contrast_registry.py` is the single source of truth. 21 canonical contrasts as 4-tuples (`contrast_name, identity_a, identity_b, axis`). Two typos fixed: `ses_low_income → ses_low`, `ses_high_socioeconomic_status → ses_high`. All 21 entries validate against `data/bbq_identity_normalized_forms.csv`. Module also exposes `KEY_CONTRAST_NAMES`, `SELECTED_CROSS_AXIS_ORDERINGS`, `load_validated_contrasts(...)`, `write_contrasts_skipped(...)`, `get_contrast_pairs(...)`, `filter_to_key_contrasts(...)`. **No startup assertion** — partial-axis runs work.
@@ -342,7 +342,10 @@ What to do: use `find_section_spans` (already implemented) to restrict identity-
 
 **Original audit (preserved):** The `CONTRASTS` / `DEFAULT_CONTRASTS` lists across six scripts included `ses_low_income` and `ses_high_socioeconomic_status`. The identity-forms CSV had no such IDs. Every analysis did `if identity_a not in identity_set: continue` — so the typo contrasts were dropped with no error, and the SES axis quietly had fewer contrasts than the code implied. `prepare_bbq_for_steering.py:MANUAL_ALIASES` similarly maps to non-existent IDs.
 
-**Remaining work — BBQ side:** `prepare_bbq_for_steering.py:MANUAL_ALIASES` still maps to non-existent IDs (`ses_low_income`, `age_old`, `age_nonold`, `nationality_asia_pacific`, `nationality_african`, `nationality_european`, plus a possible `sexuality_*` / `appearance_obese` audit). There is also no `age` axis in the dataset at all, so any BBQ Age handling via these aliases is dead. Fold these into the BBQ prepare-side fix (separate commit; conceptually distinct from the geometry contrast registry).
+**BBQ side closed (2026-05-28, commit `26998ec` — bundled with audit 4.4):**
+- Broken `MANUAL_ALIASES` targets repointed: `ses_low_income → ses_low` (canonical low-SES bucket) for "low ses" / "low socioeconomic status" / "low income" / "lowses"; `ses_low_income → ses_poor` for "poor" (own identity exists); `ses_high_socioeconomic_status → ses_high` for "high socioeconomic status" / "highses".
+- Aliases removed for identities that don't exist at all: `age_old` / `age_nonold` / `non old` (no age axis), `nationality_asia_pacific` / `nationality_african` / `nationality_european` (aggregate continents). BBQ rows that previously matched these now fall to `mapped_contrast_confidence=unmapped` and are filtered at Step 20 under the audit-3.4 default.
+- New `validate_manual_aliases()` raises `ValueError` at startup on any missing target; future regression cannot slip through silently.
 
 ### 4.2 [MAJOR] Intersectional BBQ categories are flattened to a single axis (FIX LANDED 2026-05-28)
 
@@ -375,9 +378,17 @@ What to do: use `find_section_spans` (already implemented) to restrict identity-
 
 **Original audit (preserved):** BBQ has negative-polarity questions ("Who was bad at X?") and non-negative ones ("Who was good at X?"). `stereotyped_groups` is fixed (it is the group the *negative* stereotype targets). For a **negative** question, choosing the stereotyped group is the *bias-consistent* answer; for a **non-negative** question, choosing the stereotyped group is the *anti*-bias answer. `analyze_bbq_feature_level_causal_effects.py` defined `stereotype_preference_delta = Δ[log p(stereotyped) − log p(unknown)]` with no polarity sign. The grouping keys included `question_polarity`, so individual rows were separable — but `effect_label` (`bias_amplifying` if `bias_delta > threshold`), `beneficial_score`, `harmful_score`, and `make_rankings` did not condition on polarity. A feature that raised `log p(stereotyped group)` was labeled "bias-amplifying" even on non-negative items where that is the unbiased direction. `final_intervention_candidates_table.html` was sorted by a polarity-confounded `beneficial_score`.
 
-### 4.4 [MINOR] `MANUAL_ALIASES` has dozens of duplicate `"nondisabled"` keys
+### 4.4 [MINOR] `MANUAL_ALIASES` has dozens of duplicate `"nondisabled"` keys (FIX LANDED 2026-05-28)
 
-`prepare_bbq_for_steering.py:MANUAL_ALIASES` literally repeats `"nondisabled": "disability_nondisabled"` ~30 times (a copy-paste artifact; the dict dedups so it is harmless at runtime). It is a signal the file was not reviewed. Clean it up and add a unit test that the alias table maps only to existing identity IDs (ties into 4.1).
+**Status:** Closed in commit `26998ec`, paired with the BBQ side of audit 4.1 (`MANUAL_ALIASES` had targets that didn't exist in the identity-forms CSV — the audit explicitly bundled the two items).
+
+**What landed:**
+- `MANUAL_ALIASES` rewritten from 91 literal entries (56 distinct — the runtime dict was silently deduplicating ~35 `"nondisabled": "disability_nondisabled"` repeats plus a couple of `"non disabled"` duplicates) to 49 literal entries, all distinct, grouped by axis with comments.
+- Broken targets repointed to canonical identities: `ses_low_income → ses_low` (for "low ses", "low socioeconomic status", "low income", "lowses"), `ses_low_income → ses_poor` (for "poor"), `ses_high_socioeconomic_status → ses_high` (for "high socioeconomic status", "highses").
+- Aliases pointing at identities that don't exist at all were removed: `age_old` / `age_nonold` / `non old` (no age axis), `nationality_asia_pacific` / `nationality_african` / `nationality_european` (aggregate continents, not per-country IDs). BBQ rows that previously mentioned these now fall to `mapped_contrast_confidence=unmapped` and are filtered at Step 20 under the audit-3.4 default.
+- New `validate_manual_aliases(identity_meta, logger)` is called at every startup. **Raises `ValueError`** on any missing target with a per-target `ERROR`-level log line listing the aliases that point at it — so a future regression (either re-introduced duplicates or a typo'd target) can't slip through silently. `bbq_prepare_summary.csv` records `manual_aliases_n_total` / `manual_aliases_n_distinct_targets` / `manual_aliases_n_missing_targets` for durable record-keeping.
+
+The 4.1 audit explicitly bundled "audit every value against the identity CSV (4.1)" into the 4.4 fix; both items close together. The "unit test" the audit recommended is implemented as the runtime invariant in `validate_manual_aliases()` rather than a separate test file.
 
 ### 4.5 [MINOR] `works_*` template-compatibility flags are dead metadata
 

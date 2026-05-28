@@ -22,7 +22,7 @@ Convert raw BBQ JSONL benchmark rows into a steering-ready dataset by (a) normal
 
 ## Key implementation details
 - **AXIS_MAP** identity-maps single-axis categories (e.g. `ses` → `socioeconomic_status`). The intersectional categories `race_x_gender` and `race_x_ses` are NOT in `AXIS_MAP` — they're handled separately by `--intersectional_handling` (default `drop`; see audit 4.2 below, closed 2026-05-28 in commit `b189aef`).
-- **Identity alias table** is the union of (i) every non-empty surface form column for each identity row, (ii) each entry in the semicolon-delimited `aliases` column, (iii) the hardcoded `MANUAL_ALIASES` dict. Matching uses `norm_text` (lowercase, underscores/hyphens to spaces, alphanumerics only). If exact lookup fails, the script tries (a) whitespace-stripped matching, then (b) decomposing compound labels like `F-Black` via `identity_components` and looking each piece up individually.
+- **Identity alias table** is the union of (i) every non-empty surface form column for each identity row, (ii) each entry in the semicolon-delimited `aliases` column, (iii) the hardcoded `MANUAL_ALIASES` dict (49 entries grouped by axis as of audit 4.4 / 4.1 BBQ fix in commit `26998ec`; every target is validated against the identity-forms CSV at startup via `validate_manual_aliases`, which raises `ValueError` on any missing target). Matching uses `norm_text` (lowercase, underscores/hyphens to spaces, alphanumerics only). If exact lookup fails, the script tries (a) whitespace-stripped matching, then (b) decomposing compound labels like `F-Black` via `identity_components` and looking each piece up individually.
 - **Role assignment** (`find_answer_indices`): an answer is `is_unknown` if it normalizes to a member of `UNKNOWN_ALIASES` (`"cannot be determined"`, `"not answerable"`, etc.). It is `is_stereo` if its mapped `identity_id`, normalized label, or any component identity is in the BBQ row's `stereotyped_groups`. Target = first stereotyped non-unknown; nontarget = first non-stereotyped non-unknown.
 - **Contrast mapping** (`map_contrast`) tries exact identity-pair match against the triage's contrast registry first (returns confidence `exact`), then any contrast on the same axis that touches either identity (`fallback_axis`), then any same-axis contrast at all (still `fallback_axis`), then `""/unmapped`. Note: `confidence == "alias"` is never produced by this code — the column is defined as `exact | fallback_axis | unmapped` despite downstream readers expecting four values.
 - **Prompt format** (`prompt_for`):
@@ -74,13 +74,17 @@ Convert raw BBQ JSONL benchmark rows into a steering-ready dataset by (a) normal
 
 **Original audit (preserved):** `map_contrast` falls back from exact-pair matching to "any same-axis contrast that touches either identity", labeling the result `fallback_axis`. A BBQ item about `race_arab vs race_white` could therefore be associated with features selected for `race_black vs race_white`. The prior `run_bbq_sae_steering.py` default kept confidence ∈ `{exact, alias, fallback_axis}` and `analyze_bbq_feature_level_causal_effects.py` treated `mapped_contrast_name` as the relevant contrast — feature-to-example specificity broken, data looked clean. "Feature X is implicated in bias for *this* identity contrast" is the main causal claim, and the fallback path broke that specificity.
 
-### 4.1 [MAJOR] — Contrast lists reference identities that do not exist — silently skipped
+### 4.1 [MAJOR] — Contrast lists reference identities that do not exist — silently skipped (BBQ SIDE FIX LANDED 2026-05-28)
 
-**What's wrong:** `MANUAL_ALIASES` maps to multiple identity IDs that do not exist in `bbq_identity_normalized_forms.csv`: `ses_low_income`, `ses_high_socioeconomic_status`, `age_old`, `age_nonold`, `nationality_asia_pacific`, `nationality_african`, `nationality_european`. Audit `sexuality_*` and `appearance_obese` as well. There is also **no `age` axis** in the identity CSV at all, so any Age-axis BBQ row that resolves to `age_old`/`age_nonold` will receive an ID that fails the triage contrast registry lookup and silently maps to `unmapped`.
+**Status:** BBQ side closed alongside audit 4.4 in commit `26998ec`. Geometry side (the `CONTRASTS` literal across the geometry scripts) was closed earlier in commit `1e242c9`.
 
-**Why it matters:** BBQ rows whose stereotyped answer was the only way an axis got into the run will be silently dropped from the contrast-mapped set, leaving paper claims like "we cover N contrasts" out of sync with what actually ran. The Age category in particular is dead unless the identity CSV is extended.
+**What landed (BBQ side):**
+- Broken `MANUAL_ALIASES` targets repointed to canonical identity IDs that exist in `bbq_identity_normalized_forms.csv`: `ses_low_income → ses_low` (for "low ses" / "low socioeconomic status" / "low income" / "lowses"), `ses_low_income → ses_poor` (for "poor", which has its own identity), `ses_high_socioeconomic_status → ses_high` (for "high socioeconomic status" / "highses").
+- Aliases pointing at identities that simply don't exist were removed entirely: `age_old` / `age_nonold` / `non old` (no age axis in the dataset), `nationality_asia_pacific` / `nationality_african` / `nationality_european` (aggregate continents, not per-country IDs). BBQ rows that previously mentioned these now fall to `mapped_contrast_confidence=unmapped` and are filtered at Step 20 under the audit-3.4 default (`--mapping_confidence_filter exact`).
+- New `validate_manual_aliases(identity_meta, logger)` called immediately after `load_identity_aliases()` in `main()`. **Raises `ValueError`** on any missing target, with a per-target `ERROR`-level log line listing the aliases that point at it. Silent drops were the original bug; raising loudly means a future regression (a new alias pointing at a typo'd identity_id) can't slip through.
+- `bbq_prepare_summary.csv` now records `manual_aliases_n_total`, `manual_aliases_n_distinct_targets`, and `manual_aliases_n_missing_targets` so the durability of the alias table is visible without parsing source.
 
-**Targeted fix:** Add a startup-time validation step: load `aliases | identity_meta` and assert every value in `MANUAL_ALIASES` exists as `identity_id` in `identity_meta`. Fail (or log `ERROR`-level warning per missing ID and count them at the end) if not. Decide whether to (a) add the missing identities to `bbq_identity_normalized_forms.csv` with proper surface forms or (b) remove the orphan aliases entirely.
+**Original audit (preserved):** `MANUAL_ALIASES` previously mapped to multiple identity IDs that did not exist in `bbq_identity_normalized_forms.csv` — `ses_low_income`, `ses_high_socioeconomic_status`, `age_old`, `age_nonold`, `nationality_asia_pacific`, `nationality_african`, `nationality_european`. There was also no `age` axis in the identity CSV at all, so any Age-axis BBQ row that resolved to `age_old`/`age_nonold` received an ID that failed the triage contrast registry lookup and silently mapped to `unmapped`. Paper claims like "we cover N contrasts" were out of sync with what actually ran.
 
 ### 4.2 [MAJOR] — Intersectional BBQ categories are flattened to a single axis (FIX LANDED 2026-05-28)
 
@@ -102,13 +106,14 @@ Convert raw BBQ JSONL benchmark rows into a steering-ready dataset by (a) normal
 
 **Original audit (preserved):** `AXIS_MAP` collapsed `race_x_gender` and `race_x_ses` to `race_ethnicity`. `identity_components` splits compound labels like `F-Black` and `lowSES-Hispanic`, and `choose_identity_for_role` picks a single component as the target identity. The intersectional structure was discarded before steering ever ran. Intersectionality is central to the marginalized-identities literature this paper claims to address; flattening Race×Gender to "race" loses the most interesting BBQ cases and can mislabel the stereotype-target answer when the BBQ stereotype actually targets the compound identity.
 
-### 4.4 [MINOR] — `MANUAL_ALIASES` has dozens of duplicate `"nondisabled"` keys
+### 4.4 [MINOR] — `MANUAL_ALIASES` has dozens of duplicate `"nondisabled"` keys (FIX LANDED 2026-05-28)
 
-**What's wrong:** Lines ~47–85 of the script literally repeat `"nondisabled": "disability_nondisabled"` ~30 times — a copy-paste artifact. The dict deduplicates so it is harmless at runtime, but the file is clearly unreviewed.
+**Status:** Closed in commit `26998ec` (paired with the BBQ side of audit 4.1; see above).
 
-**Why it matters:** Signals to a reviewer that the alias table was not audited (which is also the substance of 4.1).
-
-**Targeted fix:** Delete the duplicates. Add a unit test (or an inline assertion) that `len(MANUAL_ALIASES) == len(set(MANUAL_ALIASES))`. While there, audit every value against the identity CSV (4.1).
+**What landed:**
+- `MANUAL_ALIASES` rewritten from 91 literal entries (56 distinct — the runtime dict was silently deduplicating ~35 duplicate `"nondisabled": "disability_nondisabled"` lines, plus a couple of `"non disabled"` duplicates) to 49 literal entries, all distinct, grouped by axis with comments.
+- The "unit test" the audit recommended is implemented as the runtime invariant in `validate_manual_aliases()` — described in the 4.1 section above — rather than a separate test file. That validator runs at every `prepare_bbq_for_steering.py` startup, so any future regression of either kind (re-introduced duplicate keys or a broken target) raises immediately rather than slipping through.
+- Original audit (preserved): Lines 47-85 of the prior script literally repeated `"nondisabled": "disability_nondisabled"` ~30 times — a copy-paste artifact. The dict deduplicated at runtime, but the file was clearly unreviewed.
 
 ### 4.3 [BLOCKER, heads-up for downstream] — `question_polarity` is preserved but never used as a bias-polarity sign
 
@@ -119,8 +124,8 @@ Convert raw BBQ JSONL benchmark rows into a steering-ready dataset by (a) normal
 **Targeted fix:** Add a `bias_polarity_sign` column to `bbq_prepared_examples.parquet`: `+1` for `neg`, `-1` for `nonneg`, `0`/`NaN` otherwise. Document in the column dictionary that downstream `stereotype_preference_delta` must be multiplied by `bias_polarity_sign` to obtain a polarity-correct "bias-direction" quantity.
 
 ## Rebuild checklist
-- [ ] Validate every value in `MANUAL_ALIASES` against `bbq_identity_normalized_forms.csv` at startup; promote missing-ID skips from silent drops to `ERROR`-level log lines that are counted in `bbq_prepare_summary.csv`.
-- [ ] Remove the duplicate `"nondisabled"` entries and either delete or fix the entries that point to non-existent IDs (`ses_low_income`, `ses_high_socioeconomic_status`, `age_old`, `age_nonold`, `nationality_asia_pacific`, `nationality_african`, `nationality_european`).
+- [x] Validate every value in `MANUAL_ALIASES` against `bbq_identity_normalized_forms.csv` at startup; promote missing-ID skips from silent drops to `ERROR`-level log lines that are counted in `bbq_prepare_summary.csv`. *(Done 2026-05-28: commit `26998ec` — `validate_manual_aliases()` raises `ValueError` on any missing target with per-target ERROR log lines; `manual_aliases_n_total` / `manual_aliases_n_distinct_targets` / `manual_aliases_n_missing_targets` recorded in `bbq_prepare_summary.csv`.)*
+- [x] Remove the duplicate `"nondisabled"` entries and either delete or fix the entries that point to non-existent IDs. *(Done 2026-05-28: commit `26998ec` — 91→49 literal entries (all distinct); ses_low_income / ses_high_socioeconomic_status repointed; age_* and continent-aggregate nationality aliases removed.)*
 - [x] Decide intersectional policy. (4.2 FIX LANDED 2026-05-28 in commit `b189aef`: path (b) — `--intersectional_handling drop` is the new default, `axis_flatten` opt-in preserves legacy behavior; `is_intersectional` column added. Path (a) — compound contrasts as first-class objects — recorded as future work in the 4.2 section above.)
 - [ ] Add `bias_polarity_sign` column derived from `question_polarity` so downstream can sign the bias delta.
 - [ ] Add `bbq_prepare_confidence_breakdown.csv` listing per `(category_raw, axis_mapped)` the count of rows at each `mapped_contrast_confidence` level.

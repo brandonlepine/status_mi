@@ -77,7 +77,7 @@ Severity tags are aggregated per script from `issues_and_opportunities.md`. **B*
 | 16 | `plot_identity_sae_features.py` | 3 | m (5.10 — FIX LANDED) | [16_plot_identity_sae_features.md](16_plot_identity_sae_features.md) |
 | 17 | `triage_sae_identity_features.py` | 3 | M (5.2 — PARTIAL FIX LANDED: code + pre-reg done, taxonomy validations RunPod-deferred) | [17_triage_sae_identity_features.md](17_triage_sae_identity_features.md) |
 | 18a | `build_few_shot_pool.py` (prereq) | 4 | enabler (1.2 partial fix) | [18a_build_few_shot_pool.md](18a_build_few_shot_pool.md) |
-| 18 | `prepare_bbq_for_steering.py` | 4 | M (1.2 — partial fix, 3.4 — FIX LANDED, 4.1, 4.2 — FIX LANDED) · m (4.4) | [18_prepare_bbq_for_steering.md](18_prepare_bbq_for_steering.md) |
+| 18 | `prepare_bbq_for_steering.py` | 4 | M (1.2 — partial fix, 3.4 — FIX LANDED, 4.1 — FIX LANDED, 4.2 — FIX LANDED) · m (4.4 — FIX LANDED) | [18_prepare_bbq_for_steering.md](18_prepare_bbq_for_steering.md) |
 | 18b | `diagnose_bbq_baseline.py` (diagnostic) | 4 | enabler (1.2, also touches 1.3, 2.4, 4.3) | [18b_diagnose_bbq_baseline.md](18b_diagnose_bbq_baseline.md) |
 | 19 | `extract_bbq_token_level_sae_activations.py` | 4 | M (3.3) · m (4.6 — PARTIAL FIX LANDED) | [19_extract_bbq_token_level_sae_activations.md](19_extract_bbq_token_level_sae_activations.md) |
 | 20 | `run_bbq_sae_steering.py` | 4 | **B** (2.3, 3.1 — FIX LANDED) · M (1.3, 2.4, 3.2, 3.3, 3.4 — FIX LANDED, 5.5 — PARTIAL FIX LANDED) · m (3.5) | [20_run_bbq_sae_steering.md](20_run_bbq_sae_steering.md) |
