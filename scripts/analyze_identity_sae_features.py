@@ -505,6 +505,138 @@ def reconstruction_rows(
     return rows
 
 
+def reconstruction_holdout_rows(
+    long_df: pd.DataFrame,
+    metadata: pd.DataFrame,
+    decoder: np.ndarray,
+    x: np.ndarray,
+    contrast: pd.Series,
+    global_mean: np.ndarray,
+    k_values: list[int],
+    layer: int,
+    n_features: int,
+    combined_score_weights: dict[str, float],
+) -> list[dict[str, object]]:
+    """Audit 2.1 + 2.5: leave-one-family-out HELD-OUT direction reconstruction.
+
+    The in-sample `reconstruction_rows` derives the contrast direction AND the
+    feature ranking from the same prompts the AUC/Cohen's d are evaluated on —
+    optimistic on two counts (2.1 in-sample direction, 2.5 in-sample feature
+    selection). Here, for each held-out prompt `family`, BOTH the direction and
+    the per-feature selection scores (selectivity Cohen's d, decoder alignment,
+    combined_score) are recomputed on the TRAIN rows (all other families) and
+    the reconstructed direction is evaluated only on the held-out family. Mirrors
+    the family-holdout in `analyze_identity_geometry.py` (commit `e15e62f`) and
+    extends it with held-out feature *selection*.
+
+    Returns per-fold rows; the caller aggregates them into a summary. Empty when
+    `metadata` has no `family` column (the held-out story is undefined then).
+    """
+    if "family" not in metadata.columns:
+        return []
+    decoder_normed = decoder / np.maximum(np.linalg.norm(decoder, axis=1, keepdims=True), 1e-12)
+    decoder_norms = np.maximum(np.linalg.norm(decoder, axis=1), 1e-12)
+    mask_a_all = metadata["identity_id"].eq(contrast.identity_a).to_numpy()
+    mask_b_all = metadata["identity_id"].eq(contrast.identity_b).to_numpy()
+    families = sorted(metadata["family"].astype(str).unique())
+    rng = np.random.default_rng(layer + len(contrast.contrast_name))
+    rows: list[dict[str, object]] = []
+    for fam in families:
+        heldout = metadata["family"].astype(str).eq(fam).to_numpy()
+        train_a = mask_a_all & ~heldout
+        train_b = mask_b_all & ~heldout
+        eval_a = mask_a_all & heldout
+        eval_b = mask_b_all & heldout
+        if min(int(train_a.sum()), int(train_b.sum()), int(eval_a.sum()), int(eval_b.sum())) == 0:
+            continue
+        # Direction derived on TRAIN rows only (closes 2.1 in-sample direction).
+        train_direction = (x[train_a].mean(axis=0) - x[train_b].mean(axis=0)).astype(np.float32)
+        if not np.any(train_direction):
+            continue
+        # Held-out evaluation of the full train direction (the reconstruction target).
+        full_scores = (x - global_mean) @ train_direction
+        full_metrics = _evaluate_projection_canonical(full_scores, eval_a, eval_b)
+        full_auc, full_d = full_metrics["auc"], full_metrics["cohens_d"]
+        # Feature selection scores recomputed on TRAIN rows (closes 2.5 in-sample
+        # selection): per-feature Cohen's d, decoder alignment with the train
+        # direction, and the combined score — exactly the rankings used in-sample,
+        # but never seeing the held-out family.
+        stats_a = summarize_feature_groups(long_df, train_a, n_features, "a")
+        stats_b = summarize_feature_groups(long_df, train_b, n_features, "b")
+        df = stats_a.merge(stats_b, on="feature_id", how="outer").fillna(0)
+        df["diff_mean"] = df["mean_a"] - df["mean_b"]
+        cohens_d_arr, _auc_arr = compute_cohens_d_and_auc_for_all_features(
+            long_df, train_a, train_b, df, prefix_a="a", prefix_b="b"
+        )
+        df["cohens_d"] = cohens_d_arr
+        df["cosine_with_direction"] = (decoder @ train_direction) / decoder_norms
+        df["combined_score"] = (
+            combined_score_weights["cohens_d"] * zscore(df["cohens_d"].abs())
+            + combined_score_weights["decoder_cosine"] * zscore(df["cosine_with_direction"].abs())
+        )
+        selection_sources = {
+            "decoder_alignment": df.sort_values("cosine_with_direction", key=lambda s: s.abs(), ascending=False)["feature_id"].to_numpy(),
+            "selectivity": df.sort_values("cohens_d", key=lambda s: s.abs(), ascending=False)["feature_id"].to_numpy(),
+            "combined_score": df.sort_values("combined_score", ascending=False)["feature_id"].to_numpy(),
+            "random_baseline": rng.permutation(n_features),
+        }
+        for method, ordered_features in selection_sources.items():
+            for k in k_values:
+                selected = ordered_features[: min(k, len(ordered_features))].astype(int)
+                recon, cosine, fraction = reconstruct_direction(decoder_normed, train_direction, selected)
+                if recon is None:
+                    auc, d_value = float("nan"), float("nan")
+                else:
+                    recon_scores = (x - global_mean) @ recon
+                    m = _evaluate_projection_canonical(recon_scores, eval_a, eval_b)
+                    auc, d_value = m["auc"], m["cohens_d"]
+                rows.append({
+                    "layer": layer,
+                    "contrast_name": contrast.contrast_name,
+                    "axis": contrast.axis,
+                    "identity_a": contrast.identity_a,
+                    "identity_b": contrast.identity_b,
+                    "heldout_family": fam,
+                    "selection_method": method,
+                    "k": k,
+                    "cosine_with_full_direction": cosine,
+                    "auc_holdout": auc,
+                    "cohens_d_holdout": d_value,
+                    "fraction_norm_captured": fraction,
+                    "n_features": len(selected),
+                    "full_direction_auc_holdout": full_auc,
+                    "full_direction_cohens_d_holdout": full_d,
+                    "n_eval_a": int(eval_a.sum()),
+                    "n_eval_b": int(eval_b.sum()),
+                    "n_train_a": int(train_a.sum()),
+                    "n_train_b": int(train_b.sum()),
+                })
+    return rows
+
+
+def summarize_reconstruction_holdout(rows: list[dict[str, object]]) -> pd.DataFrame:
+    """Aggregate the per-fold held-out reconstruction rows into one headline row
+    per (layer, contrast, selection_method, k): mean/sd/min/max across folds.
+    Mirrors `analyze_identity_geometry.py`'s `contrast_holdout_summary.csv`."""
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    keys = ["layer", "contrast_name", "axis", "identity_a", "identity_b", "selection_method", "k"]
+    summary = df.groupby(keys, dropna=False).agg(
+        auc_holdout_mean=("auc_holdout", "mean"),
+        auc_holdout_sd=("auc_holdout", "std"),
+        auc_holdout_min=("auc_holdout", "min"),
+        auc_holdout_max=("auc_holdout", "max"),
+        cohens_d_holdout_mean=("cohens_d_holdout", "mean"),
+        cohens_d_holdout_sd=("cohens_d_holdout", "std"),
+        full_direction_auc_holdout_mean=("full_direction_auc_holdout", "mean"),
+        full_direction_cohens_d_holdout_mean=("full_direction_cohens_d_holdout", "mean"),
+        fraction_norm_captured_mean=("fraction_norm_captured", "mean"),
+        n_folds=("heldout_family", "nunique"),
+    ).reset_index()
+    return summary
+
+
 def intervention_candidates(joined: pd.DataFrame, contrast: pd.Series, layer: int, top_n: int) -> pd.DataFrame:
     candidates = joined.sort_values("combined_score", ascending=False).head(top_n).copy()
     rows = []
@@ -620,6 +752,8 @@ def main() -> None:
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }, indent=2) + "\n")
 
+    holdout_accum: list[dict[str, object]] = []  # audit 2.1/2.5: held-out reconstruction folds
+    family_warned = False
     for layer in tqdm(parse_int_list(args.layers), desc="layers"):
         layer_start = time.perf_counter()
         layer_dir = args.sae_encoded_dir / f"layer_{layer:02d}"
@@ -661,9 +795,37 @@ def main() -> None:
             append_csv(args.output_dir / "feature_selectivity_alignment_joined.csv", joined.to_dict("records"))
             recon = reconstruction_rows(joined, alignment, np.asarray(decoder, dtype=np.float32), x, metadata, contrast, direction, global_mean, k_values, layer)
             append_csv(args.output_dir / "direction_reconstruction.csv", recon)
+            # Audit 2.1 + 2.5: held-out (leave-one-family-out) reconstruction —
+            # direction AND feature selection re-derived on train rows, evaluated
+            # on the held-out family. This is the headline (unbiased) reconstruction
+            # number; direction_reconstruction.csv above is the in-sample diagnostic.
+            holdout = reconstruction_holdout_rows(
+                long_df, metadata, np.asarray(decoder, dtype=np.float32), x, contrast,
+                global_mean, k_values, layer, n_features, combined_score_weights,
+            )
+            if holdout:
+                append_csv(args.output_dir / "direction_reconstruction_holdout.csv", holdout)
+                holdout_accum.extend(holdout)
+            elif "family" not in metadata.columns and not family_warned:
+                print(
+                    "WARNING (audit 2.1/2.5): metadata.csv has no 'family' column; "
+                    "skipping held-out reconstruction. direction_reconstruction.csv "
+                    "remains in-sample only and must not be cited as a held-out result."
+                )
+                family_warned = True
             candidates = intervention_candidates(joined, contrast, layer, args.top_n_features)
             append_csv(args.output_dir / "intervention_candidate_features.csv", candidates.to_dict("records"))
         print(f"Layer {layer:02d}: complete in {elapsed(layer_start)}")
+
+    # Audit 2.1/2.5: headline held-out reconstruction summary (mean/sd across folds).
+    holdout_summary = summarize_reconstruction_holdout(holdout_accum)
+    if not holdout_summary.empty:
+        holdout_summary.to_csv(args.output_dir / "direction_reconstruction_holdout_summary.csv", index=False)
+        print(
+            f"Held-out reconstruction summary: {len(holdout_summary)} "
+            f"(contrast × method × k) rows across "
+            f"{holdout_summary['n_folds'].max()} max family folds."
+        )
 
     print(f"\nSAE feature analysis complete in {elapsed(start_all)}")
     print(f"Outputs: {args.output_dir}")
