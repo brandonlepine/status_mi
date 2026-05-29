@@ -42,20 +42,23 @@ The bridge from "geometric contrast directions" to "individual SAE features." Fo
 
 > **Upstream callout — issue 1.4 (FIX LANDED; regenerate inputs).** The encoder fix in [Step 5](05_encode_identity_saes.md#14-blocker--sae-preprocessing-convention-fix-landed-2026-05-26) landed in commit `4b8851a` (JumpReLU at θ=0.7539, dataset-wise input normalization, `b_dec` decode-only). Every existing `feature_*_selectivity.csv`, `decoder_direction_alignment.csv`, `direction_reconstruction.csv`, and `intervention_candidate_features.csv` was produced by the broken encoder and must be regenerated: re-run [Step 5](05_encode_identity_saes.md) with `--overwrite`, [Step 6](06_validate_sae_hook_alignment.md) to confirm `reconstruction_fvu <= 0.15`, then this script. The script logic below is unchanged; only its inputs were wrong.
 
-### 2.1 [MAJOR] — Headline reconstruction AUC / Cohen's d are in-sample (PARTIAL FIX LANDED 2026-05-27; held-out math bundled with 2.5)
+### 2.1 [MAJOR] — Headline reconstruction AUC / Cohen's d are in-sample (FIX LANDED 2026-05-27/28)
 
-**Status:** Commit `51aa571` renamed the affected columns in `direction_reconstruction.csv` so the in-sample status is explicit. The held-out reconstruction math is scope-deferred to the 2.5 winner's-curse fix because both require held-out feature SELECTION (re-ranking by Cohen's d on non-held-out rows), not just held-out direction estimation. Bundling them avoids re-touching the selection code twice.
+**Status:** Commit `51aa571` renamed the in-sample columns; commit `304ddb6` (2026-05-28) added the held-out reconstruction. Both the contrast direction (2.1) and the feature selection (2.5) are now re-derived per held-out fold.
 
 **What landed:**
-- `direction_reconstruction.csv` columns renamed: `auc → auc_in_sample`, `cohens_d → cohens_d_in_sample`, `full_direction_auc → full_direction_auc_in_sample`, `full_direction_cohens_d → full_direction_cohens_d_in_sample`. Inline comment in `reconstruction_rows` documents the scope split.
+- `direction_reconstruction.csv` columns renamed `*_in_sample` (commit `51aa571`); retained as the in-sample diagnostic.
+- New `reconstruction_holdout_rows` (commit `304ddb6`): for each held-out prompt `family` `f`, re-derive the contrast direction on non-`f` rows, re-rank features by Cohen's d / decoder alignment / combined score using the non-`f` direction, reconstruct using the new top-`k`, and evaluate on `f`. `summarize_reconstruction_holdout` aggregates to one row per (layer, contrast, method, k). Writes `direction_reconstruction_holdout.csv` (per fold) + `direction_reconstruction_holdout_summary.csv` (headline). The `random_baseline` method gets the held-out treatment for free. If `metadata.csv` lacks a `family` column the pass is skipped with a one-time warning.
 
-**Remaining work (folded into 2.5):**
-- For each held-out template family `f`: re-derive the contrast direction on non-`f` rows, re-rank features by Cohen's d / decoder alignment / combined score using the non-`f` direction, reconstruct using the new top-`k`, evaluate on `f`. Write `direction_reconstruction_holdout.csv` and a per-(contrast, method, k) summary.
-- The `random_baseline` selection method is direction-independent and gets the held-out treatment for free (just re-run the reconstruction on held-out rows).
+**Validation (synthetic, 15/15, decoder = identity):** with a true A/B signal held-out selectivity/combined AUC ≈ 0.99 and beats the random baseline; **with pure noise the held-out AUC collapses to ≈ 0.54 (chance)** — the in-sample optimism is removed; folds == families and each is evaluated only on its held-out rows.
+
+### 2.5b held-out feature selection (identity screen)
+
+The held-out reconstruction above re-selects features per fold on train rows, which closes the identity-screen half of audit 2.5 (held-out feature *selection*). The per-feature Cohen's d in `feature_selectivity.csv` remains an in-sample descriptive screen statistic by design; the held-out generalization evidence lives in `direction_reconstruction_holdout_summary.csv`.
 
 ### 2.5 [MAJOR] — Selection-induced bias ("winner's curse") in feature effect sizes (FIX LANDED 2026-05-27)
 
-**Status:** Closed in commit `4481445`. The `|diff_mean|` prefilter (5×top_n in `feature_selectivity_for_contrast`, 3×top_n in `identity_selectivity`) is gone — Cohen's d and AUC are now computed for every feature in closed form, then the ranking selects top `top_n`. The held-out-confirmation half (audit's option b) is still open and bundled with the 2.1 holdout decomposition.
+**Status:** Closed across commits `4481445` (prefilter removed) and `304ddb6` (held-out feature selection). The `|diff_mean|` prefilter (5×top_n in `feature_selectivity_for_contrast`, 3×top_n in `identity_selectivity`) is gone — Cohen's d and AUC are now computed for every feature in closed form, then the ranking selects top `top_n`. The held-out-confirmation half is closed via the leave-one-family-out reconstruction (see 2.1 above and the 2.5b note below).
 
 **What landed:**
 - New helper `compute_cohens_d_and_auc_for_all_features(long_df, mask_a, mask_b, df_groups, prefix_a, prefix_b)` computes both metrics for every row of `df_groups` (i.e. every feature) without a screening prefilter.
@@ -70,7 +73,7 @@ The bridge from "geometric contrast directions" to "individual SAE features." Fo
 
 **Validation:** Synthetic sparse data covering all four AUC buckets — vectorized helpers match the per-feature reference loop (`sklearn.roc_auc_score` + `common.cohens_d`) to ~1e-16. Hidden low-variance high-d features (e.g. `diff_mean = 0.005` with tiny pooled SD) now surface at the top of the ranking; under the old prefilter they were silently discarded.
 
-**Remaining (folded into 2.1 / 2.5 held-out work):** Split prompts into a selection set and a confirmation set per contrast; report selected features' effect sizes on the held-out half, not the screening half. This is the proper winner's-curse correction and shares its plumbing with the held-out reconstruction math (audit 2.1).
+**Held-out selection (closed 2026-05-28, commit `304ddb6`):** the leave-one-family-out `reconstruction_holdout_rows` re-ranks features on the train rows of each fold and evaluates the reconstruction on the held-out family — the proper winner's-curse correction for feature selection, sharing the held-out reconstruction plumbing (audit 2.1). See the 2.1 section above. The per-feature Cohen's d in `feature_selectivity.csv` stays an in-sample descriptive screen statistic; the held-out evidence is `direction_reconstruction_holdout_summary.csv`.
 
 **Original audit (preserved):** `feature_selectivity_for_contrast` filtered to the top `5 · top_n` features by `|diff_mean|`, then computed Cohen's d and AUC only on that surviving subset, then re-ranked and kept the top `top_n` by `|d|`. Because `diff_mean` and `d` are highly correlated, the reported `d`/`auc` were conditioned on having survived a selection screen and inflated. Every downstream "this feature has Cohen's d = X" number — in `feature_selectivity.csv`, in the `combined_score` derived from it, in the triage thresholds keyed off `|d|`, and in the steering pool — was a post-selection estimate without a confirmation set.
 

@@ -616,7 +616,11 @@ def plot_residualization_comparison(
             for label, group in plot_df.groupby("canonical_label", sort=True):
                 ax.hist(group["projection_score"], bins=35, density=True, alpha=0.45, label=label)
             ax.legend(frameon=False)
-        ax.set_title(f"{residualization}\nAUC={metrics['auc']:.3f}, d={metrics['cohens_d']:.2f}")
+        # Audit 2.1: these AUC/d are in-sample by design — they describe the
+        # projection distribution being plotted (same prompts used to fit the
+        # direction). Label them so they are not mistaken for held-out numbers
+        # (the held-out headline lives in contrast_holdout_summary.csv).
+        ax.set_title(f"{residualization}\nAUC={metrics['auc']:.3f}, d={metrics['cohens_d']:.2f} (in-sample)")
         ax.set_xlabel("Projection score")
         ax.set_ylabel("Density")
     fig.suptitle(f"{contrast_name}: endpoint projection distributions at layer {layer:02d}", y=1.04)

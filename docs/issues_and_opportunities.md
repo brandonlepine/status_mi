@@ -151,9 +151,9 @@ Per-layer constants must be loaded from each layer's `hyperparameters.json` — 
 
 ## 2. Statistical rigor (numbers that will not survive review as-is)
 
-### 2.1 [MAJOR] Headline contrast AUC / Cohen's d are in-sample (FIX LANDED 2026-05-27 across geometry + subspace; SAE features partial)
+### 2.1 [MAJOR] Headline contrast AUC / Cohen's d are in-sample (FIX LANDED 2026-05-27/28 — geometry + subspace + SAE features all closed)
 
-**Status:** Two commits closed the headline metric switch. The SAE-features held-out reconstruction is intentionally bundled with 2.5 winner's curse.
+**Status:** Geometry + subspace held-out metrics landed 2026-05-27 (commits `e15e62f` / `51aa571`). The remaining SAE-features held-out reconstruction landed 2026-05-28 in commit `304ddb6`, and the in-sample plot-title label tweak in the same commit. All headline AUC / Cohen's d are now held-out.
 
 - `e15e62f` — `analyze_identity_geometry.py` + `analyze_identity_geometry_diagnostics.py`: `auc_all`/`cohens_d_all` renamed `_in_sample`; new `contrast_holdout_summary.csv` and `contrast_family_holdout_residualized_summary.csv` aggregate the family-holdout rows into headline mean/sd/min/max per (layer, contrast). `plot_identity_geometry.py:plot_contrasts` makes held-out the headline plot (`contrast_auc_by_layer.png`) and demotes in-sample to `_in_sample`-suffixed diagnostic plots.
 - `51aa571` — `analyze_shared_social_subspace.py`: in-sample decomposition columns renamed `_in_sample`. New `decomposition_rows_holdout` does leave-one-family-out: re-derives every contrast direction on non-`f` rows, re-SVDs a held-out basis, decomposes each direction onto that basis, evaluates shared / residual / full components on the `f` rows. Writes `decomposition_metrics_holdout.csv` (per fold) and `decomposition_metrics_holdout_summary.csv` (mean / sd / n_folds per contrast × k × component). `aggregate_axis_sharedness` and `plot_axis_summary` updated to read the renamed in-sample columns and mark their plots `DIAGNOSTIC`.
@@ -163,9 +163,10 @@ Per-layer constants must be loaded from each layer's `hyperparameters.json` — 
 
 `analyze_identity_geometry.py:run_contrasts` and `analyze_identity_geometry_diagnostics.py:run_contrasts` compute the contrast direction from `mean(A) − mean(B)`, then evaluate AUC/Cohen's d of the projection **on the same A and B prompts**. `analyze_shared_social_subspace.py:evaluate_component` and `analyze_identity_sae_features.py` do the same. In-sample separation is optimistically biased — a difference-of-means direction is *defined* to separate the two means.
 
-**Remaining work:**
-- Hold-out reconstruction for `analyze_identity_sae_features.py:reconstruction_rows`, folded into the 2.5 fix.
-- The followups plotting script (`plot_identity_directional_followups.py`) shows in-sample AUC per residualization in projection-histogram titles; those are genuinely in-sample by design (they describe the projection distribution being plotted), but the title text should explicitly say `in-sample` to avoid confusion. Small label-only tweak.
+**SAE-features held-out reconstruction (commit `304ddb6`, 2026-05-28):**
+- New `reconstruction_holdout_rows` in `analyze_identity_sae_features.py` does leave-one-family-out: for each held-out prompt `family` it recomputes the contrast direction AND the per-feature selection ranking (selectivity Cohen's d, decoder alignment, combined_score) on the train rows, then evaluates the reconstructed direction's AUC / Cohen's d only on the held-out family. `summarize_reconstruction_holdout` aggregates to one headline row per (layer, contrast, selection_method, k). Writes `direction_reconstruction_holdout.csv` (per fold) + `direction_reconstruction_holdout_summary.csv` (headline); `direction_reconstruction.csv` is retained as the in-sample diagnostic. This is also the identity-screen half of audit 2.5 (held-out feature *selection*).
+- `plot_identity_directional_followups.py` projection-histogram titles now say `(in-sample)` so they are not mistaken for held-out numbers.
+- Validation (synthetic, 15/15, decoder = identity): held-out AUC ~0.99 with a true signal and ~0.54 (chance) on pure noise — the in-sample optimism is removed; folds == families, each evaluated only on the held-out family; random baseline beaten by selectivity. ⚠️ **NEEDS RUNPOD:** full pass; confirm every contrast has ≥2 usable families so the LOFO summary is non-trivial.
 
 ### 2.2 [BLOCKER] No null model for the central claims (FIX LANDED 2026-05-27; both probe + SVD halves complete)
 
@@ -238,9 +239,9 @@ These are mechanical extensions of the SVD / probe machinery rather than new inf
 
 **Original audit (preserved):** `score_answer_logprob` sums per-token logprobs over the answer span. BBQ's three options have different token lengths; `"Cannot be determined"` is typically the longest, so summed logprob systematically penalized the unknown option. Within-example deltas (intervened − base) canceled the length bias because length is constant per example — so `stereotype_preference_delta` etc. were OK. But `predicted_base`, `correct_base`, `prediction_changed`, and `accuracy_delta` used `argmax` over raw summed logprobs and were length-biased. Baseline accuracy and any accuracy-change metric were contaminated.
 
-### 2.5 [MAJOR] Selection-induced bias ("winner's curse") in feature effect sizes (FIX LANDED 2026-05-28 — BBQ half; identity-screen holdout column remains)
+### 2.5 [MAJOR] Selection-induced bias ("winner's curse") in feature effect sizes (FIX LANDED 2026-05-28 — all halves closed)
 
-**Status:** Identity-prompt selectivity prefilter closed in commit `4481445`. The BBQ winner's-curse half (`analyze_bbq_feature_level_causal_effects.py`) closed in commit `b5150ec` 2026-05-28 (part 2/3 of the analyzer inference rework, alongside 2.6/2.7). The remaining piece is the smaller enhancement of adding a held-out confirmation **column** to the identity-prompt screen's `feature_selectivity.csv`, which is bundled with audit 2.1's held-out reconstruction math (tracked under 2.1, not here).
+**Status:** Three pieces, all closed. (1) Identity-prompt selectivity prefilter — commit `4481445` (compute d/AUC for ALL features, no pre-screen). (2) BBQ winner's-curse on rankings/candidates — commit `b5150ec` 2026-05-28 (held-out selection/confirmation split; part 2/3 of the analyzer inference rework with 2.6/2.7). (3) Identity-screen held-out feature *selection* — commit `304ddb6` 2026-05-28, the leave-one-family-out held-out reconstruction (features re-selected per fold on train rows, reconstruction evaluated on the held-out family); see the 2.1 entry for details. The per-feature Cohen's d in `feature_selectivity.csv` remains an in-sample *descriptive* screen statistic by design; the held-out generalization evidence is `direction_reconstruction_holdout_summary.csv`.
 
 **What landed (BBQ half, commit `b5150ec`):**
 - `assign_holdout_split()` deterministically partitions BBQ examples into a **selection** and a **confirmation** set, keyed on `bbq_uid` (an example is in the same half for every feature, so the halves are disjoint example sets) and salted by `--holdout_seed`; ~`--holdout_frac` (default 0.5) per axis, with the realized per-axis balance logged.
@@ -670,9 +671,9 @@ Ordered by what most threatens a defensible result.
 
 **Tier 2 — required for the numbers to be honest**
 
-7. Held-out split for feature selection vs. effect estimation (2.5 — FIX LANDED 2026-05-28: BBQ winner's-curse half closed in commit `b5150ec` — rank on selection, report CIs/q on a disjoint per-axis confirmation half; identity-prompt selectivity prefilter closed earlier in `4481445`; only the identity-screen held-out *column* remains, bundled with 2.1).
+7. Held-out split for feature selection vs. effect estimation (2.5 — FIX LANDED 2026-05-28, all halves: BBQ winner's-curse via held-out selection/confirmation split `b5150ec`; identity-prompt prefilter `4481445`; identity-screen held-out feature selection via leave-one-family-out reconstruction `304ddb6`).
 8. Null models for geometry probes and the shared-subspace spectrum (2.2).
-9. Make held-out (cross-family/cross-template) AUC the headline; demote in-sample AUC (2.1).
+9. Make held-out (cross-family/cross-template) AUC the headline; demote in-sample AUC (2.1 — FIX LANDED 2026-05-27/28: geometry + subspace `e15e62f`/`51aa571`; SAE-features held-out reconstruction `304ddb6`).
 10. Fix answer scoring: score the letter A/B/C, or length-normalize `answer_logprob` (1.3 — FIX LANDED 2026-05-28 commit `2829417`: `--scoring_mode letter` is the new default; 2.4 — FIX LANDED 2026-05-28 commit `8ef171c`: `row_metrics` length-normalizes argmax under `answer_logprob`; both close).
 11. Restrict headline steering to `exact` contrast mapping; stratify by mapping confidence (3.4 — FIX LANDED 2026-05-27, commit `56a5f7e`).
 12. Audit every contrast/alias identity ID against the dataset; make missing-ID skips loud (4.1).
